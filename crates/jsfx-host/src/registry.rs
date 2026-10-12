@@ -33,9 +33,10 @@ fn scanned(st: &mut State) -> &[(PathBuf, JsfxEntry)] {
     if st.found.is_none() {
         let mut all: Vec<(PathBuf, JsfxEntry)> = Vec::new();
         for root in &st.dirs {
-            for e in scan_dir(root) {
+            for mut e in scan_dir(root) {
                 // An earlier folder wins when two hold the same relative path.
                 if !all.iter().any(|(_, x)| x.id == e.id) {
+                    e.unsupported = JsfxPlugin::check_file(root, &e.path).err().map(|x| x.to_string());
                     all.push((root.clone(), e));
                 }
             }
@@ -77,7 +78,12 @@ pub fn create(id: &str) -> Option<Box<dyn Plugin>> {
     parse_id(id)?;
     let (root, path) = {
         let mut st = state();
-        scanned(&mut st).iter().find(|(_, e)| e.id == id).map(|(r, e)| (r.clone(), e.path.clone()))?
+        let (r, e) = scanned(&mut st).iter().find(|(_, e)| e.id == id)?;
+        if let Some(why) = &e.unsupported {
+            log::warn!("cannot load {id}: {why}");
+            return None;
+        }
+        (r.clone(), e.path.clone())
     };
     match JsfxPlugin::from_file(&root, &path) {
         Ok(mut p) => {

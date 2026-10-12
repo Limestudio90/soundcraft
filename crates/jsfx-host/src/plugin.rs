@@ -152,6 +152,12 @@ impl JsfxPlugin {
 
     /// Like [`JsfxPlugin::from_source`], resolving `import` lines through `loader`.
     pub fn from_source_with(id: &str, text: &str, loader: Option<ImportLoader>) -> Result<Self, JsfxError> {
+        Self::build(id, text, loader, true)?.ok_or_else(|| JsfxError::Io("no instance was built".into()))
+    }
+
+    /// Compiles `text`; builds the instance only when `instantiate` (a check needs no memory and
+    /// leaks no `PluginInfo`).
+    fn build(id: &str, text: &str, loader: Option<ImportLoader>, instantiate: bool) -> Result<Option<Self>, JsfxError> {
         let mut src = parse_source(text)?;
         src.sliders.sort_by_key(|s| s.index);
         let mut names = Names::new();
@@ -173,10 +179,13 @@ impl JsfxPlugin {
             _ => Some(Expr::Seq(init_parts)),
         };
         let code = Sections { init, slider: sec(&src.slider)?, block: sec(&src.block)?, sample: sec(&src.sample)? };
+        if !instantiate {
+            return Ok(None);
+        }
         let mem = src.maxmem.map_or(DEFAULT_MEM, |m| m.clamp(1 << 10, MAX_MEM));
         let info = info_for(id, text, &src);
         let m = Machine::new(names.len(), mem).with_strings(std::mem::take(&mut names.strings));
-        Ok(Self {
+        Ok(Some(Self {
             info,
             code,
             funcs: std::mem::take(&mut names.funcs),
@@ -189,11 +198,21 @@ impl JsfxPlugin {
             max_block: 512,
             channels: 2,
             latency: 0,
-        })
+        }))
     }
 
     /// Loads a JSFX file; `root` is the Effects folder the plugin id is made relative to.
     pub fn from_file(root: &Path, path: &Path) -> Result<Self, JsfxError> {
+        Self::load_file(root, path, true)?.ok_or_else(|| JsfxError::Io("no instance was built".into()))
+    }
+
+    /// Whether the file compiles with this host, without building an instance: `Err` says what
+    /// is missing (an unsupported function, an import that cannot be found, ...).
+    pub fn check_file(root: &Path, path: &Path) -> Result<(), JsfxError> {
+        Self::load_file(root, path, false).map(drop)
+    }
+
+    fn load_file(root: &Path, path: &Path, instantiate: bool) -> Result<Option<Self>, JsfxError> {
         let io = |e: std::io::Error| JsfxError::Io(format!("{}: {e}", path.display()));
         if std::fs::metadata(path).map_err(io)?.len() > MAX_FILE {
             return Err(JsfxError::Io(format!("{}: file too large", path.display())));
@@ -219,7 +238,7 @@ impl JsfxPlugin {
                 std::fs::read(&p).ok().map(|b| String::from_utf8_lossy(&b).into_owned())
             })
         };
-        Self::from_source_with(&format!("{ID_PREFIX}{rel}"), &text, Some(&loader))
+        Self::build(&format!("{ID_PREFIX}{rel}"), &text, Some(&loader), instantiate)
     }
 
     /// `true` once a section ran out of its budget; the effect then passes audio through untouched.

@@ -20,6 +20,9 @@ pub struct JsfxEntry {
     pub vendor: String,
     /// Always `false`: JSFX instruments are not offered as instruments yet.
     pub is_instrument: bool,
+    /// Why this host cannot run the effect (an unsupported function, a missing import, ...), set by
+    /// the registry's scan; `None` when it compiles.
+    pub unsupported: Option<String>,
     pub path: PathBuf,
 }
 
@@ -113,7 +116,7 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<JsfxEntry>) {
             let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
             let name = if desc.is_empty() { name } else { desc };
             let vendor = rel.split_once('/').map(|(v, _)| v.to_string()).unwrap_or_default();
-            out.push(JsfxEntry { id: format!("{ID_PREFIX}{rel}"), name, vendor, is_instrument: false, path });
+            out.push(JsfxEntry { id: format!("{ID_PREFIX}{rel}"), name, vendor, is_instrument: false, unsupported: None, path });
         }
     }
 }

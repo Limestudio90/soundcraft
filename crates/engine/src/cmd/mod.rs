@@ -26,6 +26,7 @@ mod more_util;
 mod options;
 mod plugin_state;
 mod query;
+mod reapack;
 pub(crate) mod sampler;
 mod setup_more;
 mod surround;
@@ -132,6 +133,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(clap::specs());
         v.extend(vst3::specs());
         v.extend(jsfx::specs());
+        v.extend(reapack::specs());
         v.extend(surround::specs());
         v.extend(plugin_state::specs());
         v.extend(instrument::specs());

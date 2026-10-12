@@ -44,6 +44,7 @@ fn jsfx_is_listed_and_inserts_by_id() {
     let list = e.execute("engine.jsfx_plugins", &json!({})).unwrap();
     let entry = list.as_array().unwrap().iter().find(|d| d["id"] == ID).expect("the test effect is listed");
     assert_eq!((entry["name"].as_str(), entry["vendor"].as_str()), (Some("Test Gain"), Some("test")));
+    assert!(entry["unsupported"].is_null(), "it compiles, so no reason is given");
 }
 
 #[test]

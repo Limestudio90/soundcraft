@@ -855,11 +855,19 @@ fn hosted_menus(ui: &mut Ui, instruments: bool) -> Option<String> {
     // JSFX are effects only; vendors are the top-level folders of the Effects folder.
     if !instruments {
         ui.menu_button("JSFX", |ui| {
-            let list = soundcraft_jsfx_host::scan();
-            if let Some(p) =
-                vendor_menus(ui, list.into_iter().map(|d| MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }).collect(), "No JSFX found")
-            {
+            // Only effects this host can run are offered; the rest are counted, not listed.
+            let (usable, unusable): (Vec<_>, Vec<_>) = soundcraft_jsfx_host::scan().into_iter().partition(|d| d.unsupported.is_none());
+            let list = usable.into_iter().map(|d| MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }).collect();
+            if let Some(p) = vendor_menus(ui, list, "No JSFX found") {
                 picked = Some(p);
+            }
+            ui.separator();
+            if ui.button("Browse JSFX Repositories…").clicked() {
+                crate::jsfx_browser::request_open(ui.ctx());
+                ui.close();
+            }
+            if !unusable.is_empty() {
+                ui.weak(format!("{} more use features SoundCraft does not support yet", unusable.len()));
             }
         });
     }
