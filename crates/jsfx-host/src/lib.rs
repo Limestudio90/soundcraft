@@ -1,0 +1,47 @@
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+//! SoundCraft's JSFX host.
+//!
+//! Loads REAPER-style JS effects (`.jsfx` text files, usually extension-less) and exposes each as a
+//! [`soundcraft_dsp::Plugin`], so the mix engine treats them like the built-in processors. Plugin
+//! ids are `jsfx:<path relative to the Effects folder>`; parameter ids are `slider1`..`slider64`.
+//!
+//! The EEL2 language is implemented from scratch (clean-room): a lexer, a precedence-climbing parser
+//! producing a small expression tree with resolved variable slots, and a tree-walking interpreter.
+//! Hostile scripts cannot hang or crash the host: every loop draws on a per-section fuel budget
+//! (a section that exhausts it faults the effect, which then passes audio through), memory accesses
+//! are bounds-checked, nesting depth is capped at parse time and the interpreter never allocates
+//! while processing.
+//!
+//! Supported today: the `desc`/`sliderN`/`in_pin`/`out_pin`/`options` header, the `@init`,
+//! `@slider`, `@block` and `@sample` sections, operators, `mem[]`/`gmem[]` (gmem is per instance),
+//! `loop`/`while`/`if` and the common math builtins. Not yet: user-defined `function`s, `import`,
+//! `@serialize`, `@gfx`, MIDI, FFT/convolution and string functions. Scripts that need them fail to
+//! load with [`JsfxError::Unsupported`] naming the missing feature.
+//!
+//! `PluginInfo` must be `&'static`: one `PluginInfo` is leaked per distinct effect source and cached,
+//! so the leak is bounded by the number of different effects actually loaded.
+
+mod ast;
+mod header;
+mod lex;
+mod parse;
+mod plugin;
+pub mod scan;
+mod vm;
+
+pub use plugin::JsfxPlugin;
+
+/// Prefix of every hosted-JSFX plugin id.
+pub const ID_PREFIX: &str = "jsfx:";
+
+/// Why a JSFX operation failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum JsfxError {
+    #[error("syntax error: {0}")]
+    Syntax(String),
+    /// The script uses a language feature this host does not implement yet.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
+    #[error("i/o error: {0}")]
+    Io(String),
+}

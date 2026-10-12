@@ -3673,6 +3673,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "soundcraft-jsfx-host"
+version = "0.6.0"
+dependencies = [
+ "log",
+ "serde",
+ "soundcraft-dsp",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "soundcraft-midi"
 version = "0.6.1"
 dependencies = [
