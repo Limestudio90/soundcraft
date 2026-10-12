@@ -31,11 +31,12 @@ mod parse;
 mod plugin;
 mod registry;
 pub mod scan;
+mod strfmt;
 mod vm;
 
 pub use plugin::{ImportLoader, JsfxPlugin};
 pub use registry::{add_search_dir, create, parse_id, plugin_info, rescan, scan};
-pub use scan::JsfxEntry;
+pub use scan::{JsfxEntry, soundcraft_data_dir, soundcraft_effects_dir};
 
 /// Prefix of every hosted-JSFX plugin id.
 pub const ID_PREFIX: &str = "jsfx:";

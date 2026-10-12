@@ -71,6 +71,22 @@ pub(crate) enum Builtin {
     Ifft,
     FftPermute,
     FftIpermute,
+    // Strings are numeric handles into the machine's string table.
+    StrCpy,
+    StrCat,
+    StrLen,
+    StrCmp,
+    StrICmp,
+    StrNCmp,
+    StrNICmp,
+    StrNCpy,
+    StrNCat,
+    StrGetChar,
+    StrSetChar,
+    StrCpySubstr,
+    StrCpyFrom,
+    /// `sprintf(dest, format, ...)`: variable arguments.
+    Sprintf,
 }
 
 /// A compiled user-defined function instance (one per function and namespace).
@@ -78,12 +94,16 @@ pub(crate) enum Builtin {
 pub(crate) struct Func {
     /// Variable slots the arguments are copied into.
     pub params: Vec<usize>,
+    /// Parameters declared `name*`: their final value is copied back into the caller's variable.
+    pub refs: Vec<bool>,
     pub body: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Expr {
     Num(f64),
+    /// A string (`#name`, `#`, or a literal): evaluates to its handle; `#s = x` copies into it.
+    StrRef(usize),
     Var(usize),
     /// `spl(i)` / `slider(i)`: variable `base + (i - first)`, with `i` clamped to `first..=last`.
     VarIdx {

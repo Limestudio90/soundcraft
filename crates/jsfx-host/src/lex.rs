@@ -6,7 +6,7 @@ use crate::JsfxError;
 pub(crate) enum Tok {
     Num(f64),
     Ident(String),
-    Str,
+    Str(String),
     P(&'static str),
     Eof,
 }
@@ -127,14 +127,16 @@ pub(crate) fn lex(src: &str, first_line: u32) -> Result<Vec<Lexed>, JsfxError> {
         }
         if ch == '"' {
             i += 1;
-            while c.get(i).is_some_and(|&x| x != '"') {
-                if c.get(i) == Some(&'\n') {
+            let mut text = String::new();
+            while let Some(&x) = c.get(i).filter(|&&x| x != '"') {
+                if x == '\n' {
                     line += 1;
                 }
+                text.push(x);
                 i += 1;
             }
             i += 1;
-            out.push(Lexed { tok: Tok::Str, line });
+            out.push(Lexed { tok: Tok::Str(text), line });
             continue;
         }
         if ch == '\'' {

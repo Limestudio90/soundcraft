@@ -2,7 +2,7 @@
 //! `JSFX_PATH` folders and any added with [`add_search_dir`], then cached. Lookups by plugin id
 //! (`jsfx:<path relative to its Effects folder>`) create instances from the files on disk.
 
-use crate::scan::{JsfxEntry, default_effects_dirs, scan as scan_dir};
+use crate::scan::{JsfxEntry, default_effects_dirs, scan as scan_dir, soundcraft_effects_dir};
 use crate::{ID_PREFIX, JsfxPlugin};
 use soundcraft_dsp::{Plugin, PluginInfo};
 use std::path::{Path, PathBuf};
@@ -17,7 +17,10 @@ struct State {
 fn state() -> MutexGuard<'static, State> {
     static STATE: OnceLock<Mutex<State>> = OnceLock::new();
     let m = STATE.get_or_init(|| {
-        let mut dirs = default_effects_dirs();
+        // SoundCraft's own folder comes first (it may not exist yet: installs create it), so what
+        // was installed from a repository wins over a same-named file in REAPER's folder.
+        let mut dirs: Vec<PathBuf> = soundcraft_effects_dir().into_iter().collect();
+        dirs.extend(default_effects_dirs());
         if let Some(extra) = std::env::var_os("JSFX_PATH") {
             dirs.extend(std::env::split_paths(&extra).filter(|d| d.is_dir()));
         }

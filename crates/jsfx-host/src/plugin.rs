@@ -175,7 +175,7 @@ impl JsfxPlugin {
         let code = Sections { init, slider: sec(&src.slider)?, block: sec(&src.block)?, sample: sec(&src.sample)? };
         let mem = src.maxmem.map_or(DEFAULT_MEM, |m| m.clamp(1 << 10, MAX_MEM));
         let info = info_for(id, text, &src);
-        let m = Machine::new(names.len(), mem);
+        let m = Machine::new(names.len(), mem).with_strings(std::mem::take(&mut names.strings));
         Ok(Self {
             info,
             code,
@@ -203,13 +203,15 @@ impl JsfxPlugin {
         let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/");
         // Imports are looked up next to the effect, then in the Effects folder. Names that climb out of
         // those folders (absolute paths, `..`) are refused: effects are untrusted input.
-        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        // The effect's own folder, each parent folder up to the Effects folder, then the Effects folder.
         let root = root.to_path_buf();
+        let bases: Vec<std::path::PathBuf> =
+            path.parent().into_iter().flat_map(Path::ancestors).take_while(|a| a.starts_with(&root)).map(Path::to_path_buf).collect();
         let loader = move |name: &str| -> Option<String> {
             if !Path::new(name).components().all(|c| matches!(c, Component::Normal(_))) {
                 return None;
             }
-            [&dir, &root].into_iter().find_map(|base| {
+            bases.iter().chain(std::iter::once(&root)).find_map(|base| {
                 let p = base.join(name);
                 if std::fs::metadata(&p).ok()?.len() > MAX_FILE {
                     return None;
@@ -462,7 +464,7 @@ mod tests {
 
     #[test]
     fn unsupported_features_fail_to_load_with_a_reason() {
-        let Err(e) = JsfxPlugin::from_source("jsfx:x", "desc:x\n@init\nx = strlen(y);\n") else { panic!("should not load") };
+        let Err(e) = JsfxPlugin::from_source("jsfx:x", "desc:x\n@init\nx = file_open(y);\n") else { panic!("should not load") };
         assert!(matches!(e, JsfxError::Unsupported(_)), "{e}");
         assert!(JsfxPlugin::from_source("jsfx:x", "desc:x\n@sample\nspl0 = ;\n").is_err());
     }

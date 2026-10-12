@@ -23,6 +23,28 @@ pub struct JsfxEntry {
     pub path: PathBuf,
 }
 
+/// SoundCraft's per-user data folder (`SOUNDCRAFT_DATA_DIR` overrides it): `%APPDATA%\SoundCraft`,
+/// `~/Library/Application Support/SoundCraft` or `$XDG_DATA_HOME/soundcraft`.
+pub fn soundcraft_data_dir() -> Option<PathBuf> {
+    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    if let Some(d) = env("SOUNDCRAFT_DATA_DIR") {
+        return Some(d);
+    }
+    if cfg!(target_os = "windows") {
+        env("APPDATA").map(|p| p.join("SoundCraft"))
+    } else if cfg!(target_os = "macos") {
+        env("HOME").map(|p| p.join("Library/Application Support/SoundCraft"))
+    } else {
+        env("XDG_DATA_HOME").or_else(|| env("HOME").map(|p| p.join(".local/share"))).map(|p| p.join("soundcraft"))
+    }
+}
+
+/// The Effects folder SoundCraft owns: JSFX installed from repositories go here, so REAPER's own
+/// folder is never modified. It is always part of the search path.
+pub fn soundcraft_effects_dir() -> Option<PathBuf> {
+    soundcraft_data_dir().map(|d| d.join("Effects"))
+}
+
 /// REAPER's per-user Effects folder for this OS, if its location can be worked out.
 pub fn default_effects_dirs() -> Vec<PathBuf> {
     let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);

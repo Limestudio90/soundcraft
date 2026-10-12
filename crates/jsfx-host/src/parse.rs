@@ -45,6 +45,8 @@ const MAX_CHAIN: u32 = 500;
 /// A parsed `function` definition, kept as tokens until it is instantiated by a call.
 pub(crate) struct FnDef {
     params: Vec<String>,
+    /// Which parameters were written `name*` (passed by reference).
+    refs: Vec<bool>,
     instance: HashSet<String>,
     globals: HashSet<String>,
     body: Vec<Lexed>,
@@ -54,11 +56,17 @@ pub(crate) struct FnDef {
 pub(crate) struct Names {
     map: HashMap<String, usize>,
     next: usize,
-    defs: HashMap<String, Rc<FnDef>>,
+    /// Each function name with its overloads (one per parameter count).
+    defs: HashMap<String, Vec<Rc<FnDef>>>,
     instances: HashMap<String, usize>,
     in_progress: HashSet<String>,
     /// Compiled function instances, indexed by `Expr::UserCall`.
     pub funcs: Vec<Func>,
+    /// Initial contents of every string (named `#x`, literals, anonymous `#`); a string's handle is
+    /// its index.
+    pub strings: Vec<Vec<u8>>,
+    string_names: HashMap<String, usize>,
+    literals: HashMap<String, usize>,
 }
 
 impl Names {
@@ -91,7 +99,47 @@ impl Names {
         for (n, s) in fixed {
             map.insert(n.to_string(), s);
         }
-        Self { map, next: FIRST_USER, defs: HashMap::new(), instances: HashMap::new(), in_progress: HashSet::new(), funcs: Vec::new() }
+        Self {
+            map,
+            next: FIRST_USER,
+            defs: HashMap::new(),
+            instances: HashMap::new(),
+            in_progress: HashSet::new(),
+            funcs: Vec::new(),
+            strings: Vec::new(),
+            string_names: HashMap::new(),
+            literals: HashMap::new(),
+        }
+    }
+
+    fn new_string(&mut self, init: &[u8]) -> usize {
+        self.strings.push(init.to_vec());
+        self.strings.len() - 1
+    }
+
+    /// The handle of the named string `#name` (created empty on first use).
+    pub fn string(&mut self, name: &str) -> usize {
+        if let Some(&h) = self.string_names.get(name) {
+            return h;
+        }
+        let h = self.new_string(b"");
+        self.string_names.insert(name.to_string(), h);
+        h
+    }
+
+    /// The handle of a string literal (equal literals share one).
+    pub fn literal(&mut self, text: &str) -> usize {
+        if let Some(&h) = self.literals.get(text) {
+            return h;
+        }
+        let h = self.new_string(text.as_bytes());
+        self.literals.insert(text.to_string(), h);
+        h
+    }
+
+    /// A new anonymous string (each bare `#` is its own).
+    pub fn fresh_string(&mut self) -> usize {
+        self.new_string(b"")
     }
 
     pub fn slot(&mut self, name: &str) -> usize {
@@ -137,7 +185,7 @@ fn builtin(name: &str) -> Option<(Builtin, usize, usize)> {
         "floor" => (Floor, 1, 1),
         "ceil" => (Ceil, 1, 1),
         "int" => (Int, 1, 1),
-        "rand" => (Rand, 1, 1),
+        "rand" => (Rand, 0, 1),
         "invsqrt" => (Invsqrt, 1, 1),
         "memset" => (Memset, 3, 3),
         "memcpy" => (Memcpy, 3, 3),
@@ -147,6 +195,8 @@ fn builtin(name: &str) -> Option<(Builtin, usize, usize)> {
         "slider_automate" => (Ignored, 0, 2),
         "slider_next_chg" => (Ignored, 2, 2),
         "time" | "time_precise" => (Ignored, 0, 1),
+        // Where the host puts the effect (track, chain position): not known here.
+        "get_host_placement" => (Ignored, 0, 2),
         // This host has no MIDI output: sends are accepted and dropped.
         "midisend" => (Ignored, 3, 4),
         "midisend_buf" | "midirecv_buf" => (Ignored, 3, 3),
@@ -155,6 +205,22 @@ fn builtin(name: &str) -> Option<(Builtin, usize, usize)> {
         "ifft" => (Ifft, 2, 2),
         "fft_permute" => (FftPermute, 2, 2),
         "fft_ipermute" => (FftIpermute, 2, 2),
+        "strcpy" => (StrCpy, 2, 2),
+        "strcat" => (StrCat, 2, 2),
+        "strlen" => (StrLen, 1, 1),
+        "strcmp" => (StrCmp, 2, 2),
+        "stricmp" => (StrICmp, 2, 2),
+        "strncmp" => (StrNCmp, 3, 3),
+        "strnicmp" => (StrNICmp, 3, 3),
+        "strncpy" => (StrNCpy, 3, 3),
+        "strncat" => (StrNCat, 3, 3),
+        "str_getchar" => (StrGetChar, 2, 3),
+        "str_setchar" => (StrSetChar, 3, 4),
+        "strcpy_substr" => (StrCpySubstr, 3, 4),
+        "strcpy_from" => (StrCpyFrom, 3, 3),
+        "sprintf" => (Sprintf, 2, MAX_ARGS),
+        // Printing has nowhere to go here.
+        "printf" => (Ignored, 1, MAX_ARGS),
         _ => return None,
     })
 }
@@ -314,6 +380,17 @@ impl Parser<'_> {
         self.enter()?;
         let lhs = self.parse_ternary()?;
         let out = if let Some(op) = self.assign_op() {
+            if matches!(lhs, Expr::StrRef(_)) {
+                // `#s = x;` copies into the string, `#s += x;` appends.
+                let f = match op {
+                    None => Builtin::StrCpy,
+                    Some(BinOp::Add) => Builtin::StrCat,
+                    Some(_) => return Err(self.err("only = and += work on strings")),
+                };
+                let rhs = self.parse_assign()?;
+                self.depth -= 1;
+                return Ok(Expr::Call(f, vec![lhs, rhs]));
+            }
             if !lhs.is_place() {
                 return Err(self.err("cannot assign to this expression"));
             }
@@ -387,9 +464,7 @@ impl Parser<'_> {
                 }
                 Ok(Expr::Num(n))
             }
-            // String literals are only used by string functions, which are rejected as unknown
-            // functions; as a plain value they are a harmless 0.
-            Tok::Str => Ok(Expr::Num(0.0)),
+            Tok::Str(s) => Ok(Expr::StrRef(self.names.literal(&s))),
             Tok::P("(") => {
                 let e = self.parse_seq(Some(")"))?;
                 self.expect_p(")")?;
@@ -416,7 +491,9 @@ impl Parser<'_> {
 
     fn ident(&mut self, name: &str) -> R<Expr> {
         if name.starts_with('#') {
-            return Err(JsfxError::Unsupported("string variables".into()));
+            // A string is a number: the handle of an entry in the machine's string table.
+            let h = if name == "#" { self.names.fresh_string() } else { self.names.string(name) };
+            return Ok(Expr::StrRef(h));
         }
         if name == "function" && matches!(self.peek(), Tok::Ident(_)) {
             return self.parse_function_def();
@@ -446,9 +523,11 @@ impl Parser<'_> {
         self.pos += 1;
         self.expect_p("(")?;
         let mut params = Vec::new();
+        let mut refs = Vec::new();
         while let Tok::Ident(p) = self.peek().clone() {
             params.push(p);
             self.pos += 1;
+            refs.push(self.eat_p("*"));
             self.eat_p(",");
         }
         self.expect_p(")")?;
@@ -497,7 +576,12 @@ impl Parser<'_> {
         let mut body = self.toks.get(start..self.pos).unwrap_or(&[]).to_vec();
         body.push(Lexed { tok: Tok::Eof, line });
         self.pos += 1; // the closing ')'
-        self.names.defs.insert(name, Rc::new(FnDef { params, instance, globals, body }));
+        let def = Rc::new(FnDef { params, refs, instance, globals, body });
+        let overloads = self.names.defs.entry(name).or_default();
+        match overloads.iter_mut().find(|d| d.params.len() == def.params.len()) {
+            Some(slot) => *slot = def,
+            None => overloads.push(def),
+        }
         self.just_defined = true;
         Ok(Expr::Num(0.0))
     }
@@ -539,17 +623,24 @@ impl Parser<'_> {
     }
 
     fn user_call(&mut self, fname: &str, ns: String, args: Vec<Expr>) -> R<Expr> {
-        let Some(def) = self.names.defs.get(fname).cloned() else {
+        let Some(overloads) = self.names.defs.get(fname) else {
             return Err(JsfxError::Unsupported(format!("function `{fname}`")));
         };
-        // Missing trailing arguments are allowed (the parameters become 0); extra ones are not.
-        if args.len() > def.params.len() {
-            return Err(self.err(&format!("`{fname}` takes {} argument(s)", def.params.len())));
-        }
+        // Overloads differ by parameter count: take the exact match, else the one with the fewest
+        // parameters that still fits (missing trailing arguments become 0; extra ones are an error).
+        let Some(def) = overloads
+            .iter()
+            .find(|d| d.params.len() == args.len())
+            .or_else(|| overloads.iter().filter(|d| d.params.len() > args.len()).min_by_key(|d| d.params.len()))
+            .cloned()
+        else {
+            let most = overloads.iter().map(|d| d.params.len()).max().unwrap_or(0);
+            return Err(self.err(&format!("`{fname}` takes {most} argument(s)")));
+        };
         if def.params.len() > MAX_ARGS {
             return Err(JsfxError::Unsupported(format!("`{fname}` has more than {MAX_ARGS} parameters")));
         }
-        let key = format!("{fname}@{ns}");
+        let key = format!("{fname}/{}@{ns}", def.params.len());
         if let Some(&id) = self.names.instances.get(&key) {
             return Ok(Expr::UserCall(id, args));
         }
@@ -574,7 +665,7 @@ impl Parser<'_> {
         };
         self.names.in_progress.remove(&key);
         let id = self.names.funcs.len();
-        self.names.funcs.push(Func { params, body });
+        self.names.funcs.push(Func { params, refs: def.refs.clone(), body });
         self.names.instances.insert(key, id);
         Ok(Expr::UserCall(id, args))
     }
@@ -667,8 +758,8 @@ mod tests {
 
     #[test]
     fn unsupported_things_are_named() {
-        assert_eq!(parse("x = strlen(y);"), Err(JsfxError::Unsupported("function `strlen`".into())));
-        assert_eq!(parse("x = #name;"), Err(JsfxError::Unsupported("string variables".into())));
+        assert_eq!(parse("x = file_open(y);"), Err(JsfxError::Unsupported("function `file_open`".into())));
+        assert_eq!(parse("x = mdct(y, 2);"), Err(JsfxError::Unsupported("function `mdct`".into())));
     }
 
     #[test]

@@ -5,13 +5,14 @@
 use crate::ast::{BinOp, Builtin, Expr, Func, UnOp};
 use crate::fft;
 use crate::parse::{MAX_SLIDERS, SLIDER1};
+use crate::strfmt::{STR_MAX, format_into};
 
 /// EEL2 treats values closer to zero than this as false and equal.
 const EPS: f64 = 1e-5;
 /// EEL2 caps `loop` counts and `while` iterations at this many.
 const MAX_ITER: usize = 1 << 20;
 /// Most arguments a user function call can carry.
-pub(crate) const MAX_ARGS: usize = 32;
+pub(crate) const MAX_ARGS: usize = 64;
 /// Pending MIDI events kept per block; extra events are dropped.
 const MIDI_CAP: usize = 1024;
 
@@ -106,6 +107,12 @@ pub(crate) struct Machine {
     changed: u64,
     midi: Vec<MidiEvent>,
     midi_head: usize,
+    /// The string table (handles are indices) and the contents `reset` restores.
+    strings: Vec<Vec<u8>>,
+    str_init: Vec<Vec<u8>>,
+    /// Scratch buffers for string functions; sized once so steady-state use does not allocate.
+    sbuf: Vec<u8>,
+    body: Vec<u8>,
 }
 
 impl Machine {
@@ -120,7 +127,56 @@ impl Machine {
             changed: u64::MAX,
             midi: Vec::with_capacity(MIDI_CAP),
             midi_head: 0,
+            strings: Vec::new(),
+            str_init: Vec::new(),
+            sbuf: Vec::with_capacity(2 * STR_MAX),
+            body: Vec::with_capacity(STR_MAX),
         }
+    }
+
+    /// Installs the string table (`init[h]` is the starting content of handle `h`).
+    pub fn with_strings(mut self, init: Vec<Vec<u8>>) -> Self {
+        self.strings = init
+            .iter()
+            .map(|s| {
+                let mut v = Vec::with_capacity(STR_MAX);
+                v.extend_from_slice(s.get(..s.len().min(STR_MAX)).unwrap_or(&[]));
+                v
+            })
+            .collect();
+        self.str_init = init;
+        self
+    }
+
+    fn string_index(&self, h: f64) -> Option<usize> {
+        (h.is_finite() && h >= 0.0 && (h as usize) < self.strings.len()).then_some(h as usize)
+    }
+
+    /// Replaces string `dst` with the scratch buffer's contents (capped).
+    fn store_scratch(&mut self, dst: f64) {
+        if let Some(i) = self.string_index(dst)
+            && let Some(s) = self.strings.get_mut(i)
+        {
+            s.clear();
+            s.extend_from_slice(self.sbuf.get(..self.sbuf.len().min(STR_MAX)).unwrap_or(&[]));
+        }
+    }
+
+    /// `sbuf = dst[..] + src[..n]` (`dst` empty when `append` is false).
+    fn build(&mut self, dst: f64, src: f64, n: usize, offset: usize, append: bool) {
+        self.sbuf.clear();
+        if append && let Some(d) = self.string_index(dst).and_then(|i| self.strings.get(i)) {
+            self.sbuf.extend_from_slice(d);
+        }
+        if let Some(s) = self.string_index(src).and_then(|i| self.strings.get(i)) {
+            let from = offset.min(s.len());
+            let to = from.saturating_add(n).min(s.len());
+            self.sbuf.extend_from_slice(s.get(from..to).unwrap_or(&[]));
+        }
+    }
+
+    fn string_bytes(&self, h: f64) -> &[u8] {
+        self.string_index(h).and_then(|i| self.strings.get(i)).map_or(&[], Vec::as_slice)
     }
 
     /// Zeroes all variables and memory (memory is reallocated zeroed, which the OS provides lazily).
@@ -130,6 +186,10 @@ impl Machine {
         self.gmem.fill(0.0);
         self.changed = u64::MAX;
         self.clear_midi();
+        for (s, init) in self.strings.iter_mut().zip(&self.str_init) {
+            s.clear();
+            s.extend_from_slice(init.get(..init.len().min(STR_MAX)).unwrap_or(&[]));
+        }
     }
 
     pub fn var(&self, slot: usize) -> f64 {
@@ -234,6 +294,7 @@ impl Machine {
     fn eval(&mut self, e: &Expr, f: &[Func]) -> f64 {
         match e {
             Expr::Num(n) => *n,
+            Expr::StrRef(h) => *h as f64,
             Expr::Var(s) => self.var(*s),
             Expr::VarIdx { .. } | Expr::Mem(_) | Expr::GMem(_) => {
                 let loc = self.locate(e, f);
@@ -281,7 +342,16 @@ impl Machine {
                 for (slot, v) in func.params.iter().zip(tmp) {
                     self.set_var(*slot, v);
                 }
-                self.eval(&func.body, f)
+                let ret = self.eval(&func.body, f);
+                // By-reference parameters (`name*`) hand their final value back to the caller.
+                for ((slot, by_ref), arg) in func.params.iter().zip(&func.refs).zip(args) {
+                    if *by_ref && arg.is_place() {
+                        let v = self.var(*slot);
+                        let loc = self.locate(arg, f);
+                        self.save(loc, v);
+                    }
+                }
+                ret
             }
             Expr::Loop(n, body) => {
                 let n = self.eval(n, f);
@@ -346,12 +416,96 @@ impl Machine {
                 }
                 return 1.0;
             }
+            Builtin::Sprintf => {
+                let mut vals = [0.0f64; MAX_ARGS];
+                let (mut dst, mut fmt) = (0.0, 0.0);
+                for (i, a) in args.iter().enumerate() {
+                    let v = self.eval(a, f);
+                    match i {
+                        0 => dst = v,
+                        1 => fmt = v,
+                        _ => {
+                            if let Some(slot) = vals.get_mut(i - 2) {
+                                *slot = v;
+                            }
+                        }
+                    }
+                }
+                let n = args.len().saturating_sub(2).min(MAX_ARGS);
+                let fmt_bytes = self.string_index(fmt).and_then(|i| self.strings.get(i)).map_or(&[][..], Vec::as_slice);
+                format_into(&mut self.sbuf, &mut self.body, fmt_bytes, vals.get(..n).unwrap_or(&[]), &self.strings);
+                self.store_scratch(dst);
+                return dst;
+            }
             _ => {}
         }
         let a0 = args.first().map_or(0.0, |e| self.eval(e, f));
         let a1 = args.get(1).map_or(0.0, |e| self.eval(e, f));
         let a2 = args.get(2).map_or(0.0, |e| self.eval(e, f));
+        let a3 = args.get(3).map_or(0.0, |e| self.eval(e, f));
+        let count = |v: f64| if v >= 1.0 { v as usize } else { 0 };
         match b {
+            Builtin::StrCpy => {
+                self.build(a0, a1, usize::MAX, 0, false);
+                self.store_scratch(a0);
+                a0
+            }
+            Builtin::StrCat => {
+                self.build(a0, a1, usize::MAX, 0, true);
+                self.store_scratch(a0);
+                a0
+            }
+            Builtin::StrNCpy => {
+                self.build(a0, a1, count(a2), 0, false);
+                self.store_scratch(a0);
+                a0
+            }
+            Builtin::StrNCat => {
+                self.build(a0, a1, count(a2), 0, true);
+                self.store_scratch(a0);
+                a0
+            }
+            Builtin::StrCpyFrom | Builtin::StrCpySubstr => {
+                let len = self.string_bytes(a1).len() as i64;
+                let off = to_i(a2);
+                let off = if off < 0 { (len + off).max(0) } else { off.min(len) } as usize;
+                let n = if b == Builtin::StrCpySubstr && args.len() >= 4 { count(a3) } else { usize::MAX };
+                self.build(a0, a1, n, off, false);
+                self.store_scratch(a0);
+                a0
+            }
+            Builtin::StrLen => self.string_bytes(a0).len() as f64,
+            Builtin::StrCmp | Builtin::StrICmp | Builtin::StrNCmp | Builtin::StrNICmp => {
+                let fold = matches!(b, Builtin::StrICmp | Builtin::StrNICmp);
+                let limit = if matches!(b, Builtin::StrNCmp | Builtin::StrNICmp) { count(a2) } else { usize::MAX };
+                let (x, y) = (self.string_bytes(a0), self.string_bytes(a1));
+                // Compared byte by byte, folding case on the fly (no copies).
+                let fold_c = |c: &u8| if fold { c.to_ascii_lowercase() } else { *c };
+                let ord = x.iter().take(limit).map(fold_c).cmp(y.iter().take(limit).map(fold_c));
+                f64::from(ord as i8)
+            }
+            Builtin::StrGetChar => {
+                let s = self.string_bytes(a0);
+                let off = to_i(a1);
+                let i = if off < 0 { s.len() as i64 + off } else { off };
+                usize::try_from(i).ok().and_then(|i| s.get(i)).map_or(0.0, |c| f64::from(*c))
+            }
+            Builtin::StrSetChar => {
+                if let Some(s) = self.string_index(a0).and_then(|i| self.strings.get_mut(i)) {
+                    let off = to_i(a1);
+                    let i = if off < 0 { s.len() as i64 + off } else { off };
+                    if let Ok(i) = usize::try_from(i) {
+                        if i < s.len() {
+                            if let Some(c) = s.get_mut(i) {
+                                *c = a2 as i64 as u8;
+                            }
+                        } else if i == s.len() && s.len() < STR_MAX {
+                            s.push(a2 as i64 as u8);
+                        }
+                    }
+                }
+                a2
+            }
             Builtin::Sin => a0.sin(),
             Builtin::Cos => a0.cos(),
             Builtin::Tan => a0.tan(),
@@ -380,7 +534,10 @@ impl Machine {
             Builtin::Floor => a0.floor(),
             Builtin::Ceil => a0.ceil(),
             Builtin::Int => a0.trunc(),
-            Builtin::Rand => a0 * self.rand01(),
+            Builtin::Rand => {
+                let range = if args.is_empty() { 1.0 } else { a0 };
+                range * self.rand01()
+            }
             Builtin::Invsqrt => {
                 if a0 > 0.0 {
                     1.0 / a0.sqrt()
@@ -427,7 +584,7 @@ impl Machine {
                 0.0
             }
             // Handled before the arguments are evaluated.
-            Builtin::SliderChange | Builtin::MidiRecv => 0.0,
+            Builtin::SliderChange | Builtin::MidiRecv | Builtin::Sprintf => 0.0,
         }
     }
 }
@@ -440,9 +597,73 @@ mod tests {
     fn run(src: &str) -> (Machine, Names) {
         let mut names = Names::new();
         let e = compile(src, 1, &mut names).unwrap();
-        let mut m = Machine::new(names.len(), 1024);
+        let mut m = Machine::new(names.len(), 1024).with_strings(names.strings.clone());
         m.run(&e, &names.funcs, 1_000_000);
         (m, names)
+    }
+
+    /// Runs `src` and returns the contents of the named string `#name`.
+    fn text(src: &str, name: &str) -> String {
+        let (m, mut names) = run(src);
+        let h = names.string(name);
+        String::from_utf8_lossy(m.string_bytes(h as f64)).into_owned()
+    }
+
+    #[test]
+    fn strings_copy_concatenate_and_measure() {
+        assert_eq!(text(r##"strcpy(#a, "hello"); strcat(#a, " world");"##, "#a"), "hello world");
+        assert_eq!(val(r##"strcpy(#a, "hello"); x = strlen(#a);"##, "x"), 5.0);
+        assert_eq!(text(r##"strcpy(#a, "abcdef"); strncpy(#b, #a, 3); strncat(#b, "XYZ", 1);"##, "#b"), "abcX");
+        assert_eq!(text(r##"strcpy(#a, "abcdef"); strcpy_substr(#b, #a, 2, 3);"##, "#b"), "cde");
+        assert_eq!(text(r##"strcpy(#a, "abcdef"); strcpy_substr(#b, #a, -2);"##, "#b"), "ef");
+        assert_eq!(text(r##"strcpy(#a, "abcdef"); strcpy_from(#b, #a, 4);"##, "#b"), "ef");
+        // Copying a string onto itself, and an unknown handle, are harmless.
+        assert_eq!(text(r##"strcpy(#a, "xy"); strcat(#a, #a);"##, "#a"), "xyxy");
+        assert_eq!(val("x = strlen(999); strcpy(999, 0);", "x"), 0.0);
+    }
+
+    #[test]
+    fn assigning_to_a_string_copies_or_appends() {
+        assert_eq!(text(r##"#a = "foo"; #a += "bar";"##, "#a"), "foobar");
+        assert_eq!(text(r##"#a = "x"; #b = #a; #a = "y";"##, "#b"), "x", "a copy, not an alias");
+        assert_eq!(val(r##"#a = "hello"; n = strlen(#a = "hi");"##, "n"), 2.0);
+        let mut names = Names::new();
+        assert!(compile(r##"#a *= 2;"##, 1, &mut names).is_err());
+    }
+
+    #[test]
+    fn string_chars_and_comparison() {
+        assert_eq!(val(r##"strcpy(#a, "ABC"); x = str_getchar(#a, 1); y = str_getchar(#a, -1);"##, "x"), 66.0);
+        assert_eq!(val(r##"strcpy(#a, "ABC"); y = str_getchar(#a, -1);"##, "y"), 67.0);
+        assert_eq!(text(r##"strcpy(#a, "ABC"); str_setchar(#a, 1, 'x'); str_setchar(#a, 3, 'D'); str_setchar(#a, 99, 'Z');"##, "#a"), "AxCD");
+        assert_eq!(val(r##"x = strcmp("a", "b");"##, "x"), -1.0);
+        assert_eq!(val(r##"x = strcmp("b", "a");"##, "x"), 1.0);
+        assert_eq!(val(r##"x = strcmp("abc", "abc");"##, "x"), 0.0);
+        assert_eq!(val(r##"x = stricmp("ABC", "abc");"##, "x"), 0.0);
+        assert_eq!(val(r##"x = strncmp("abcX", "abcY", 3);"##, "x"), 0.0);
+        assert_eq!(val(r##"x = strnicmp("ABx", "aby", 2);"##, "x"), 0.0);
+    }
+
+    #[test]
+    fn sprintf_builds_strings_from_numbers_and_strings() {
+        assert_eq!(text(r##"sprintf(#out, "%d dB at %.1f Hz (%s)", 3, 440.25, "peak");"##, "#out"), "3 dB at 440.2 Hz (peak)");
+        assert_eq!(text(r##"strcpy(#fmt, "%03d"); sprintf(#out, #fmt, 7);"##, "#out"), "007");
+        // Literals are shared, and an anonymous `#` is a fresh string each time.
+        assert_eq!(val(r##"x = "same" == "same"; y = # == #;"##, "x"), 1.0);
+        assert_eq!(val(r##"y = # == #;"##, "y"), 0.0);
+    }
+
+    #[test]
+    fn string_state_is_restored_by_reset() {
+        let mut names = Names::new();
+        let e = compile(r##"strcat(#a, "x");"##, 1, &mut names).unwrap();
+        let mut m = Machine::new(names.len(), 16).with_strings(names.strings.clone());
+        m.run(&e, &names.funcs, 100);
+        m.run(&e, &names.funcs, 100);
+        let h = names.string("#a") as f64;
+        assert_eq!(m.string_bytes(h), b"xx");
+        m.reset();
+        assert_eq!(m.string_bytes(h), b"");
     }
 
     fn val(src: &str, var: &str) -> f64 {
@@ -521,6 +742,30 @@ mod tests {
         assert_eq!(val("function f(a, b) ( a * 10 + b; ); x = f(f(1, 2), f(3, 4));", "x"), 154.0);
         // Calling again reuses the instance; later definitions can call earlier ones.
         assert_eq!(val("function a(x) ( x + 1; ); function b(x) ( a(a(x)); ); y = b(5) + b(0);", "y"), 9.0);
+    }
+
+    #[test]
+    fn star_parameters_write_back_to_the_callers_variables() {
+        let src = "function split(l, r, mid*, side*) ( mid = (l + r) * 0.5; side = (l - r) * 0.5; ); split(3, 1, m, s);";
+        assert_eq!(val(src, "m"), 2.0);
+        assert_eq!(val(src, "s"), 1.0);
+        // Works on memory cells too, and a plain parameter does not write back.
+        assert_eq!(val("function f(a, b*) ( a = 9; b = 7; ); x = 1; f(x, buf[2]); y = buf[2];", "y"), 7.0);
+        assert_eq!(val("function f(a, b*) ( a = 9; b = 7; ); x = 1; f(x, z);", "x"), 1.0);
+        // A constant for a by-reference parameter is accepted and simply not written back.
+        assert_eq!(val("function f(b*) ( b = 5; b + 1; ); x = f(2);", "x"), 6.0);
+    }
+
+    #[test]
+    fn functions_can_be_overloaded_by_parameter_count() {
+        let defs = "function f(a b c) ( 300 + a + b + c; ); function f(a b) ( 200 + a + b; ); ";
+        assert_eq!(val(&format!("{defs} x = f(1, 2, 3);"), "x"), 306.0);
+        assert_eq!(val(&format!("{defs} x = f(1, 2);"), "x"), 203.0);
+        // One argument: the smallest overload that fits, the missing one reads 0.
+        assert_eq!(val(&format!("{defs} x = f(1);"), "x"), 201.0);
+        let mut names = Names::new();
+        assert!(compile(&format!("{defs} x = f(1, 2, 3, 4);"), 1, &mut names).is_err());
+        assert!(val("x = rand();", "x") < 1.0);
     }
 
     #[test]
