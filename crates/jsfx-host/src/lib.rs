@@ -29,10 +29,13 @@ mod header;
 mod lex;
 mod parse;
 mod plugin;
+mod registry;
 pub mod scan;
 mod vm;
 
-pub use plugin::JsfxPlugin;
+pub use plugin::{ImportLoader, JsfxPlugin};
+pub use registry::{add_search_dir, create, parse_id, plugin_info, rescan, scan};
+pub use scan::JsfxEntry;
 
 /// Prefix of every hosted-JSFX plugin id.
 pub const ID_PREFIX: &str = "jsfx:";

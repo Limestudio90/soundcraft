@@ -836,8 +836,8 @@ struct MenuPlugin {
     vendor: String,
 }
 
-/// The CLAP, VST3 and (on macOS) Audio Units submenus, of effects or of instruments; returns the
-/// id picked. Each format is scanned the first time its submenu opens, then cached by its host.
+/// The CLAP, VST3, JSFX (effects only) and (on macOS) Audio Units submenus, of effects or of
+/// instruments; returns the id picked. Each format is scanned the first time its submenu opens, then cached by its host.
 fn hosted_menus(ui: &mut Ui, instruments: bool) -> Option<String> {
     let mut picked = None;
     ui.menu_button("CLAP", |ui| {
@@ -852,6 +852,17 @@ fn hosted_menus(ui: &mut Ui, instruments: bool) -> Option<String> {
             picked = Some(p);
         }
     });
+    // JSFX are effects only; vendors are the top-level folders of the Effects folder.
+    if !instruments {
+        ui.menu_button("JSFX", |ui| {
+            let list = soundcraft_jsfx_host::scan();
+            if let Some(p) =
+                vendor_menus(ui, list.into_iter().map(|d| MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }).collect(), "No JSFX found")
+            {
+                picked = Some(p);
+            }
+        });
+    }
     if cfg!(target_os = "macos") {
         ui.menu_button("Audio Units", |ui| {
             let list = soundcraft_au_host::scan().into_iter().filter(|d| d.is_instrument == instruments);
@@ -898,6 +909,7 @@ pub fn plugin_info(id: &str) -> Option<&'static soundcraft_dsp::PluginInfo> {
     soundcraft_dsp::plugin_info(id)
         .or_else(|| soundcraft_clap_host::plugin_info(id))
         .or_else(|| soundcraft_vst3_host::plugin_info(id))
+        .or_else(|| soundcraft_jsfx_host::plugin_info(id))
         .or_else(|| soundcraft_au_host::plugin_info(id))
 }
 

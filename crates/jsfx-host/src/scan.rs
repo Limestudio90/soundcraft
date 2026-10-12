@@ -16,6 +16,10 @@ pub struct JsfxEntry {
     pub id: String,
     /// The `desc:` line (or the file name when there is none).
     pub name: String,
+    /// The top-level folder it lives in ("" for files directly in the root); menus group by it.
+    pub vendor: String,
+    /// Always `false`: JSFX instruments are not offered as instruments yet.
+    pub is_instrument: bool,
     pub path: PathBuf,
 }
 
@@ -86,7 +90,8 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<JsfxEntry>) {
             let Some(desc) = sniff(&path) else { continue };
             let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
             let name = if desc.is_empty() { name } else { desc };
-            out.push(JsfxEntry { id: format!("{ID_PREFIX}{rel}"), name, path });
+            let vendor = rel.split_once('/').map(|(v, _)| v.to_string()).unwrap_or_default();
+            out.push(JsfxEntry { id: format!("{ID_PREFIX}{rel}"), name, vendor, is_instrument: false, path });
         }
     }
 }
@@ -110,6 +115,7 @@ mod tests {
         let ids: Vec<_> = found.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["jsfx:dynamics/comp", "jsfx:plain.jsfx"]);
         assert_eq!(found[0].name, "My Comp");
+        assert_eq!((found[0].vendor.as_str(), found[1].vendor.as_str()), ("dynamics", ""));
         let p = crate::JsfxPlugin::from_file(&root, &found[0].path).unwrap();
         assert_eq!(soundcraft_dsp::Plugin::info(&p).id, "jsfx:dynamics/comp");
         let _ = std::fs::remove_dir_all(&root);
