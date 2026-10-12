@@ -3739,6 +3739,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "soundcraft-reapack"
+version = "0.6.0"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+ "soundcraft-dsp",
+ "soundcraft-jsfx-host",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "soundcraft-time"
 version = "0.6.1"
 dependencies = [
