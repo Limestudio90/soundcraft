@@ -247,7 +247,7 @@ pub fn tracks_required(e: &Engine, cmd: &str, p: &Value) -> Result<Vec<TrackId>>
 }
 
 /// Fills a new insert's or instrument's parameter map with the plugin's defaults. A hosted plugin
-/// (CLAP, VST3, Audio Unit, JSFX) keeps its settings in its own state, so its map starts empty:
+/// (CLAP, VST3, Audio Unit) keeps its settings in its own state, so its map starts empty:
 /// the defaults it reports are often 0, and pushing them would overwrite what it loads by itself
 /// (Rhapsody came up with its volume and pan at minimum).
 pub(super) fn fill_default_params(ins: &mut soundcraft_model::Insert, info: &soundcraft_dsp::PluginInfo) {
