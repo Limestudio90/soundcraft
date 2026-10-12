@@ -83,7 +83,7 @@ impl JsfxBrowser {
                     failed.join("; ")
                 }
             }
-            Msg::Installed(Ok(rec)) => format!("Installed {} {} — find it in Insert ▸ JSFX", rec.package, rec.version),
+            Msg::Installed(Ok(rec)) => format!("Installed {} {} — find it in Insert › JSFX", rec.package, rec.version),
             Msg::RepoAdded(Ok(repo)) => format!("Added {}", repo.name),
             Msg::Refreshed(Err(e)) | Msg::Installed(Err(e)) | Msg::RepoAdded(Err(e)) => e,
         };
