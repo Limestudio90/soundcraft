@@ -13,7 +13,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(
             "midi.new_clip",
             "New MIDI Clip",
-            [],
+            ["Clip"],
             None,
             "{track, start?, end?|length?} (default: the edit selection, or 1 bar)",
             has_tracks,

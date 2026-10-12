@@ -200,6 +200,8 @@ pub fn tree() -> Vec<MenuNode> {
         insert_path(&mut roots, line);
     }
     insert_path(&mut roots, "Window > Reset Panel Layout");
+    // SoundCraft's own entry: an empty MIDI or instrument track had no way to get a clip.
+    insert_path(&mut roots, "Clip > New MIDI Clip");
     for (path, _) in MENU_WINDOWS {
         insert_path(&mut roots, path);
     }
@@ -677,5 +679,19 @@ mod tests {
         assert!(app.dialogs.open.is_none());
         assert!(!app.engine.is_dirty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clip_menu_creates_an_empty_midi_clip_on_an_instrument_track() {
+        let clip = tree().into_iter().find(|n| n.label == "Clip").unwrap();
+        assert!(clip.children.iter().any(|c| c.label == "New MIDI Clip"));
+        assert_eq!(command_for_path("Clip > New MIDI Clip", &ui_aliases()).as_deref(), Some("midi.new_clip"));
+
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
+        app.run("track.new", json!({"kind": "instrument"})).unwrap();
+        let track = app.engine.session().tracks.iter().find(|t| t.instrument.is_some()).map(|t| t.id).unwrap();
+        assert!(app.engine.session().track(track).unwrap().clips().is_empty());
+        invoke_menu(&mut app, "midi.new_clip", "Clip > New MIDI Clip");
+        assert_eq!(app.engine.session().track(track).unwrap().clips().len(), 1);
     }
 }
