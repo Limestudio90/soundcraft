@@ -40,6 +40,8 @@ pub(crate) struct JsfxSource {
     pub sample: Section,
     /// Sections present in the file that this host skips (`serialize`, `gfx`, ...).
     pub ignored: Vec<String>,
+    /// `import <file>` lines, in order.
+    pub imports: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -159,8 +161,11 @@ pub(crate) fn parse_source(text: &str) -> Result<JsfxSource, JsfxError> {
 
 fn header_line(src: &mut JsfxSource, raw: &str, in_set: &mut bool, out_set: &mut bool) {
     let line = raw.trim();
-    if line.starts_with("import ") || line == "import" {
-        src.ignored.push("import".into());
+    if let Some(name) = line.strip_prefix("import ") {
+        let name = name.trim();
+        if !name.is_empty() {
+            src.imports.push(name.to_string());
+        }
         return;
     }
     let Some((key, value)) = line.split_once(':') else { return };

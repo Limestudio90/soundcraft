@@ -1,10 +1,20 @@
 //! EEL2 parser: precedence climbing over the token stream, producing [`Expr`] with variable names
 //! already resolved to slots.
+//!
+//! User-defined functions follow EEL2's rules. Parameters and any variable the body does not
+//! declare are private to the function; `global(...)` names are shared with the rest of the
+//! script; `instance(...)` names live in a namespace chosen by the caller (`a.method()` uses the
+//! namespace `a`, so the variable is `a.name`; `this.name` names it explicitly; an unqualified call
+//! from inside a method keeps the caller's namespace). Each function is compiled once per
+//! namespace it is called with, so storage is static and no allocation happens at run time.
+//! Functions must be defined before they are called, which also rules out recursion.
 
 use crate::JsfxError;
-use crate::ast::{BinOp, Builtin, Expr, UnOp};
+use crate::ast::{BinOp, Builtin, Expr, Func, UnOp};
 use crate::lex::{Lexed, Tok, lex};
-use std::collections::HashMap;
+use crate::vm::MAX_ARGS;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 /// Reserved variable slots shared by the interpreter and the plugin wrapper.
 pub(crate) const SPL0: usize = 0;
@@ -32,10 +42,23 @@ const FIRST_USER: usize = 144;
 const MAX_DEPTH: u32 = 100;
 const MAX_CHAIN: u32 = 500;
 
-/// Variable name → slot table, shared by every section of one effect.
+/// A parsed `function` definition, kept as tokens until it is instantiated by a call.
+pub(crate) struct FnDef {
+    params: Vec<String>,
+    instance: HashSet<String>,
+    globals: HashSet<String>,
+    body: Vec<Lexed>,
+}
+
+/// Variable name → slot table and function registry, shared by every section of one effect.
 pub(crate) struct Names {
     map: HashMap<String, usize>,
     next: usize,
+    defs: HashMap<String, Rc<FnDef>>,
+    instances: HashMap<String, usize>,
+    in_progress: HashSet<String>,
+    /// Compiled function instances, indexed by `Expr::UserCall`.
+    pub funcs: Vec<Func>,
 }
 
 impl Names {
@@ -68,7 +91,7 @@ impl Names {
         for (n, s) in fixed {
             map.insert(n.to_string(), s);
         }
-        Self { map, next: FIRST_USER }
+        Self { map, next: FIRST_USER, defs: HashMap::new(), instances: HashMap::new(), in_progress: HashSet::new(), funcs: Vec::new() }
     }
 
     pub fn slot(&mut self, name: &str) -> usize {
@@ -120,6 +143,18 @@ fn builtin(name: &str) -> Option<(Builtin, usize, usize)> {
         "memcpy" => (Memcpy, 3, 3),
         "__memtop" => (MemTop, 0, 0),
         "freembuf" => (FreeMBuf, 1, 1),
+        "sliderchange" => (SliderChange, 1, 1),
+        "slider_automate" => (Ignored, 0, 2),
+        "slider_next_chg" => (Ignored, 2, 2),
+        "time" | "time_precise" => (Ignored, 0, 1),
+        // This host has no MIDI output: sends are accepted and dropped.
+        "midisend" => (Ignored, 3, 4),
+        "midisend_buf" | "midirecv_buf" => (Ignored, 3, 3),
+        "midirecv" => (MidiRecv, 3, 4),
+        "fft" => (Fft, 2, 2),
+        "ifft" => (Ifft, 2, 2),
+        "fft_permute" => (FftPermute, 2, 2),
+        "fft_ipermute" => (FftIpermute, 2, 2),
         _ => return None,
     })
 }
@@ -151,7 +186,7 @@ type R<T> = Result<T, JsfxError>;
 /// Compiles one section's source. `first_line` is the file line of its first line (for errors).
 pub(crate) fn compile(src: &str, first_line: u32, names: &mut Names) -> R<Expr> {
     let toks = lex(src, first_line)?;
-    let mut p = Parser { toks, pos: 0, names, depth: 0 };
+    let mut p = Parser { toks, pos: 0, names, depth: 0, scope: None, just_defined: false };
     let e = p.parse_seq(None)?;
     if !matches!(p.peek(), Tok::Eof) {
         return Err(p.err("unexpected token"));
@@ -159,14 +194,28 @@ pub(crate) fn compile(src: &str, first_line: u32, names: &mut Names) -> R<Expr> 
     Ok(e)
 }
 
+/// The function instance whose body is being parsed.
+struct Scope {
+    def: Rc<FnDef>,
+    ns: String,
+    key: String,
+}
+
 struct Parser<'a> {
     toks: Vec<Lexed>,
     pos: usize,
     names: &'a mut Names,
     depth: u32,
+    scope: Option<Scope>,
+    /// The statement just parsed was a `function` definition (which needs no trailing `;`).
+    just_defined: bool,
 }
 
 static EOF: Tok = Tok::Eof;
+
+fn qualify(ns: &str, name: &str) -> String {
+    if ns.is_empty() { name.to_string() } else { format!("{ns}.{name}") }
+}
 
 impl Parser<'_> {
     fn peek(&self) -> &Tok {
@@ -206,6 +255,25 @@ impl Parser<'_> {
         matches!(self.peek(), Tok::Eof) || close.is_some_and(|c| self.is_p(c))
     }
 
+    /// Resolves a variable name to its slot in the current scope.
+    fn var_slot(&mut self, name: &str) -> usize {
+        let full = match &self.scope {
+            None => name.to_string(),
+            Some(sc) => {
+                if let Some(rest) = name.strip_prefix("this.") {
+                    qualify(&sc.ns, rest)
+                } else if sc.def.instance.contains(name) {
+                    qualify(&sc.ns, name)
+                } else if sc.def.globals.contains(name) || name.contains('.') {
+                    name.to_string()
+                } else {
+                    format!("{}|{name}", sc.key)
+                }
+            }
+        };
+        self.names.slot(&full)
+    }
+
     fn parse_seq(&mut self, close: Option<&str>) -> R<Expr> {
         let mut v = Vec::new();
         loop {
@@ -213,8 +281,9 @@ impl Parser<'_> {
             if self.at_end(close) {
                 break;
             }
+            self.just_defined = false;
             v.push(self.parse_assign()?);
-            if !(self.is_p(";") || self.at_end(close)) {
+            if !(self.is_p(";") || self.at_end(close) || self.just_defined) {
                 return Err(self.err("expected ';'"));
             }
         }
@@ -245,7 +314,7 @@ impl Parser<'_> {
         self.enter()?;
         let lhs = self.parse_ternary()?;
         let out = if let Some(op) = self.assign_op() {
-            if !matches!(lhs, Expr::Var(_) | Expr::Mem(_) | Expr::GMem(_)) {
+            if !lhs.is_place() {
                 return Err(self.err("cannot assign to this expression"));
             }
             let rhs = self.parse_assign()?;
@@ -309,13 +378,27 @@ impl Parser<'_> {
         let tok = self.peek().clone();
         self.pos += 1;
         match tok {
-            Tok::Num(n) => Ok(Expr::Num(n)),
+            Tok::Num(n) => {
+                if self.eat_p("[") {
+                    // `0[i]` is `mem[0 + i]`.
+                    let idx = if self.is_p("]") { Expr::Num(0.0) } else { self.parse_assign()? };
+                    self.expect_p("]")?;
+                    return Ok(Expr::Mem(Box::new(Expr::Bin(BinOp::Add, Box::new(Expr::Num(n)), Box::new(idx)))));
+                }
+                Ok(Expr::Num(n))
+            }
             // String literals are only used by string functions, which are rejected as unknown
             // functions; as a plain value they are a harmless 0.
             Tok::Str => Ok(Expr::Num(0.0)),
             Tok::P("(") => {
                 let e = self.parse_seq(Some(")"))?;
                 self.expect_p(")")?;
+                if self.eat_p("[") {
+                    // `(base)[offset]` is `mem[base + offset]`.
+                    let idx = if self.is_p("]") { Expr::Num(0.0) } else { self.parse_assign()? };
+                    self.expect_p("]")?;
+                    return Ok(Expr::Mem(Box::new(Expr::Bin(BinOp::Add, Box::new(e), Box::new(idx)))));
+                }
                 Ok(e)
             }
             Tok::P("[") => {
@@ -335,8 +418,8 @@ impl Parser<'_> {
         if name.starts_with('#') {
             return Err(JsfxError::Unsupported("string variables".into()));
         }
-        if name == "function" {
-            return Err(JsfxError::Unsupported("user-defined functions".into()));
+        if name == "function" && matches!(self.peek(), Tok::Ident(_)) {
+            return self.parse_function_def();
         }
         if self.is_p("(") {
             self.pos += 1;
@@ -348,10 +431,152 @@ impl Parser<'_> {
             if name == "gmem" {
                 return Ok(Expr::GMem(Box::new(idx)));
             }
-            let base = Expr::Var(self.names.slot(name));
+            let base = Expr::Var(self.var_slot(name));
             return Ok(Expr::Mem(Box::new(Expr::Bin(BinOp::Add, Box::new(base), Box::new(idx)))));
         }
-        Ok(Expr::Var(self.names.slot(name)))
+        Ok(Expr::Var(self.var_slot(name)))
+    }
+
+    /// `function name(params) [local(..)] [instance(..)] [global(..)] ( body )`
+    fn parse_function_def(&mut self) -> R<Expr> {
+        if self.scope.is_some() {
+            return Err(JsfxError::Unsupported("function definitions inside functions".into()));
+        }
+        let Tok::Ident(name) = self.peek().clone() else { return Err(self.err("expected a function name")) };
+        self.pos += 1;
+        self.expect_p("(")?;
+        let mut params = Vec::new();
+        while let Tok::Ident(p) = self.peek().clone() {
+            params.push(p);
+            self.pos += 1;
+            self.eat_p(",");
+        }
+        self.expect_p(")")?;
+        let mut instance = HashSet::new();
+        let mut globals = HashSet::new();
+        while let Tok::Ident(kw) = self.peek().clone() {
+            if !matches!(kw.as_str(), "local" | "instance" | "global" | "globals") {
+                break;
+            }
+            self.pos += 1;
+            self.expect_p("(")?;
+            let mut list = Vec::new();
+            while let Tok::Ident(n) = self.peek().clone() {
+                list.push(n);
+                self.pos += 1;
+                self.eat_p(",");
+            }
+            self.expect_p(")")?;
+            match kw.as_str() {
+                "instance" => instance.extend(list),
+                "global" | "globals" => globals.extend(list),
+                _ => {}
+            }
+        }
+        self.expect_p("(")?;
+        let start = self.pos;
+        let mut depth = 1u32;
+        while let Some(l) = self.toks.get(self.pos) {
+            match &l.tok {
+                Tok::P("(") => depth += 1,
+                Tok::P(")") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Tok::Eof => break,
+                _ => {}
+            }
+            self.pos += 1;
+        }
+        if depth != 0 {
+            return Err(self.err("unclosed function body"));
+        }
+        let line = self.line();
+        let mut body = self.toks.get(start..self.pos).unwrap_or(&[]).to_vec();
+        body.push(Lexed { tok: Tok::Eof, line });
+        self.pos += 1; // the closing ')'
+        self.names.defs.insert(name, Rc::new(FnDef { params, instance, globals, body }));
+        self.just_defined = true;
+        Ok(Expr::Num(0.0))
+    }
+
+    /// The user function a call refers to and the namespace it runs in.
+    fn find_fn(&self, name: &str) -> Option<(String, String)> {
+        let cur = self.scope.as_ref().map(|s| s.ns.as_str()).unwrap_or("");
+        if self.names.defs.contains_key(name) {
+            return Some((name.to_string(), cur.to_string()));
+        }
+        // `a.b.method` may be the namespace `a.b` and function `method`, or namespace `a` and a
+        // function that is itself named `b.method`: take the longest function name that exists.
+        name.match_indices('.').find_map(|(i, _)| {
+            let (prefix, f) = (name.get(..i)?, name.get(i + 1..)?);
+            if !self.names.defs.contains_key(f) {
+                return None;
+            }
+            let ns = match prefix.strip_prefix("this.") {
+                Some(rest) => qualify(cur, rest),
+                None if prefix == "this" => cur.to_string(),
+                None => prefix.to_string(),
+            };
+            Some((f.to_string(), ns))
+        })
+    }
+
+    fn parse_args(&mut self) -> R<Vec<Expr>> {
+        let mut args = Vec::new();
+        if !self.is_p(")") {
+            loop {
+                args.push(self.parse_assign()?);
+                if !self.eat_p(",") {
+                    break;
+                }
+            }
+        }
+        self.expect_p(")")?;
+        Ok(args)
+    }
+
+    fn user_call(&mut self, fname: &str, ns: String, args: Vec<Expr>) -> R<Expr> {
+        let Some(def) = self.names.defs.get(fname).cloned() else {
+            return Err(JsfxError::Unsupported(format!("function `{fname}`")));
+        };
+        // Missing trailing arguments are allowed (the parameters become 0); extra ones are not.
+        if args.len() > def.params.len() {
+            return Err(self.err(&format!("`{fname}` takes {} argument(s)", def.params.len())));
+        }
+        if def.params.len() > MAX_ARGS {
+            return Err(JsfxError::Unsupported(format!("`{fname}` has more than {MAX_ARGS} parameters")));
+        }
+        let key = format!("{fname}@{ns}");
+        if let Some(&id) = self.names.instances.get(&key) {
+            return Ok(Expr::UserCall(id, args));
+        }
+        if !self.names.in_progress.insert(key.clone()) {
+            return Err(JsfxError::Unsupported(format!("recursive function `{fname}`")));
+        }
+        let params: Vec<usize> = def.params.iter().map(|p| self.names.slot(&format!("{key}|{p}"))).collect();
+        let body = {
+            let mut child = Parser {
+                toks: def.body.clone(),
+                pos: 0,
+                names: &mut *self.names,
+                depth: self.depth,
+                scope: Some(Scope { def: Rc::clone(&def), ns, key: key.clone() }),
+                just_defined: false,
+            };
+            let body = child.parse_seq(None)?;
+            if !matches!(child.peek(), Tok::Eof) {
+                return Err(child.err("unexpected token in function body"));
+            }
+            body
+        };
+        self.names.in_progress.remove(&key);
+        let id = self.names.funcs.len();
+        self.names.funcs.push(Func { params, body });
+        self.names.instances.insert(key, id);
+        Ok(Expr::UserCall(id, args))
     }
 
     fn call(&mut self, name: &str) -> R<Expr> {
@@ -361,62 +586,64 @@ impl Parser<'_> {
                 self.expect_p(",")?;
                 let body = self.parse_seq(Some(")"))?;
                 self.expect_p(")")?;
-                Ok(Expr::Loop(Box::new(n), Box::new(body)))
+                return Ok(Expr::Loop(Box::new(n), Box::new(body)));
             }
             "while" => {
                 let cond = self.parse_seq(Some(")"))?;
                 self.expect_p(")")?;
-                if self.eat_p("(") {
+                return if self.eat_p("(") {
                     let body = self.parse_seq(Some(")"))?;
                     self.expect_p(")")?;
                     Ok(Expr::WhileBody(Box::new(cond), Box::new(body)))
                 } else {
                     Ok(Expr::While(Box::new(cond)))
-                }
-            }
-            "if" => {
-                let cond = self.parse_assign()?;
-                if self.eat_p(",") {
-                    let then = self.parse_assign()?;
-                    let other = if self.eat_p(",") { Some(Box::new(self.parse_assign()?)) } else { None };
-                    self.expect_p(")")?;
-                    return Ok(Expr::Cond(Box::new(cond), Box::new(then), other));
-                }
-                self.expect_p(")")?;
-                self.expect_p("(")?;
-                let then = self.parse_seq(Some(")"))?;
-                self.expect_p(")")?;
-                let other = if matches!(self.peek(), Tok::Ident(s) if s == "else") {
-                    self.pos += 1;
-                    self.expect_p("(")?;
-                    let e = self.parse_seq(Some(")"))?;
-                    self.expect_p(")")?;
-                    Some(Box::new(e))
-                } else {
-                    None
                 };
-                Ok(Expr::Cond(Box::new(cond), Box::new(then), other))
             }
-            _ => {
-                let Some((b, min, max)) = builtin(name) else {
-                    return Err(JsfxError::Unsupported(format!("function `{name}`")));
-                };
-                let mut args = Vec::new();
-                if !self.is_p(")") {
-                    loop {
-                        args.push(self.parse_assign()?);
-                        if !self.eat_p(",") {
-                            break;
-                        }
-                    }
-                }
+            "if" => return self.parse_if(),
+            "spl" | "slider" if self.find_fn(name).is_none() => {
+                let idx = self.parse_assign()?;
                 self.expect_p(")")?;
-                if args.len() < min || args.len() > max {
-                    return Err(self.err(&format!("`{name}` takes {min} argument(s)")));
-                }
-                Ok(Expr::Call(b, args))
+                let (base, first, last) = if name == "spl" { (SPL0, 0, MAX_CH as i64 - 1) } else { (SLIDER1, 1, MAX_SLIDERS as i64) };
+                return Ok(Expr::VarIdx { base, first, last, idx: Box::new(idx) });
             }
+            _ => {}
         }
+        if let Some((fname, ns)) = self.find_fn(name) {
+            let args = self.parse_args()?;
+            return self.user_call(&fname, ns, args);
+        }
+        let Some((b, min, max)) = builtin(name) else {
+            return Err(JsfxError::Unsupported(format!("function `{name}`")));
+        };
+        let args = self.parse_args()?;
+        if args.len() < min || args.len() > max {
+            return Err(self.err(&format!("`{name}` takes {min} argument(s)")));
+        }
+        Ok(Expr::Call(b, args))
+    }
+
+    fn parse_if(&mut self) -> R<Expr> {
+        let cond = self.parse_assign()?;
+        if self.eat_p(",") {
+            let then = self.parse_assign()?;
+            let other = if self.eat_p(",") { Some(Box::new(self.parse_assign()?)) } else { None };
+            self.expect_p(")")?;
+            return Ok(Expr::Cond(Box::new(cond), Box::new(then), other));
+        }
+        self.expect_p(")")?;
+        self.expect_p("(")?;
+        let then = self.parse_seq(Some(")"))?;
+        self.expect_p(")")?;
+        let other = if matches!(self.peek(), Tok::Ident(s) if s == "else") {
+            self.pos += 1;
+            self.expect_p("(")?;
+            let e = self.parse_seq(Some(")"))?;
+            self.expect_p(")")?;
+            Some(Box::new(e))
+        } else {
+            None
+        };
+        Ok(Expr::Cond(Box::new(cond), Box::new(then), other))
     }
 }
 
@@ -441,7 +668,7 @@ mod tests {
     #[test]
     fn unsupported_things_are_named() {
         assert_eq!(parse("x = strlen(y);"), Err(JsfxError::Unsupported("function `strlen`".into())));
-        assert!(matches!(parse("function f(x) ( x );"), Err(JsfxError::Unsupported(_))));
+        assert_eq!(parse("x = #name;"), Err(JsfxError::Unsupported("string variables".into())));
     }
 
     #[test]
@@ -460,5 +687,14 @@ mod tests {
     fn loops_and_conditionals_parse() {
         assert!(parse("loop(4, a += 1; b += 2;); while(i < 3) ( i += 1; ); x ? y = 1 : z = 2;").is_ok());
         assert!(parse("if (x) ( y = 1; ) else ( y = 2; );").is_ok());
+    }
+
+    #[test]
+    fn function_definitions_need_no_trailing_semicolon() {
+        assert!(parse("function f(a) ( a; )\nfunction g() local(x) instance(y) global(z) ( x = 1; )\nq = f(1);").is_ok());
+        // Space-separated declaration lists are accepted.
+        assert!(parse("function h() local(a b c) ( a = 1; ); h();").is_ok());
+        // Definitions may follow their callers' text only if they come first.
+        assert!(parse("h(); function h() ( 1; );").is_err());
     }
 }

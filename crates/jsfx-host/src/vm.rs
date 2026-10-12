@@ -2,12 +2,18 @@
 //! bounds-checked (out-of-range reads give 0, writes are dropped) and every loop iteration draws on
 //! a fuel budget so a runaway script is cut off instead of hanging the audio thread.
 
-use crate::ast::{BinOp, Builtin, Expr, UnOp};
+use crate::ast::{BinOp, Builtin, Expr, Func, UnOp};
+use crate::fft;
+use crate::parse::{MAX_SLIDERS, SLIDER1};
 
 /// EEL2 treats values closer to zero than this as false and equal.
 const EPS: f64 = 1e-5;
 /// EEL2 caps `loop` counts and `while` iterations at this many.
 const MAX_ITER: usize = 1 << 20;
+/// Most arguments a user function call can carry.
+pub(crate) const MAX_ARGS: usize = 32;
+/// Pending MIDI events kept per block; extra events are dropped.
+const MIDI_CAP: usize = 1024;
 
 pub(crate) fn truthy(x: f64) -> bool {
     x.abs() > EPS
@@ -74,6 +80,21 @@ fn index(v: f64, len: usize) -> Option<usize> {
     if i >= 0.0 && i < len as f64 { Some(i as usize) } else { None }
 }
 
+/// Where an assignment lands.
+#[derive(Clone, Copy)]
+enum Loc {
+    Var(usize),
+    Mem(usize),
+    GMem(usize),
+    Nowhere,
+}
+
+#[derive(Clone, Copy, Default)]
+struct MidiEvent {
+    offset: u32,
+    msg: [u8; 3],
+}
+
 pub(crate) struct Machine {
     pub vars: Vec<f64>,
     mem: Vec<f64>,
@@ -81,11 +102,25 @@ pub(crate) struct Machine {
     rng: u64,
     fuel: u64,
     out_of_fuel: bool,
+    /// Sliders changed since `sliderchange` last looked (bit n-1 for slider n).
+    changed: u64,
+    midi: Vec<MidiEvent>,
+    midi_head: usize,
 }
 
 impl Machine {
     pub fn new(nvars: usize, mem_len: usize) -> Self {
-        Self { vars: vec![0.0; nvars], mem: vec![0.0; mem_len], gmem: vec![0.0; 1 << 16], rng: 0x9E37_79B9_7F4A_7C15, fuel: 0, out_of_fuel: false }
+        Self {
+            vars: vec![0.0; nvars],
+            mem: vec![0.0; mem_len],
+            gmem: vec![0.0; 1 << 16],
+            rng: 0x9E37_79B9_7F4A_7C15,
+            fuel: 0,
+            out_of_fuel: false,
+            changed: u64::MAX,
+            midi: Vec::with_capacity(MIDI_CAP),
+            midi_head: 0,
+        }
     }
 
     /// Zeroes all variables and memory (memory is reallocated zeroed, which the OS provides lazily).
@@ -93,6 +128,8 @@ impl Machine {
         self.vars.fill(0.0);
         self.mem = vec![0.0; self.mem.len()];
         self.gmem.fill(0.0);
+        self.changed = u64::MAX;
+        self.clear_midi();
     }
 
     pub fn var(&self, slot: usize) -> f64 {
@@ -105,11 +142,30 @@ impl Machine {
         }
     }
 
+    /// Notes that slider `n` (1-based) changed, for `sliderchange`.
+    pub fn mark_slider_changed(&mut self, n: usize) {
+        if (1..=MAX_SLIDERS).contains(&n) {
+            self.changed |= 1u64 << (n - 1);
+        }
+    }
+
+    /// Queues a MIDI event for `midirecv`; dropped when the block's queue is full.
+    pub fn push_midi(&mut self, offset: usize, status: u8, d1: u8, d2: u8) {
+        if self.midi.len() < MIDI_CAP {
+            self.midi.push(MidiEvent { offset: offset.min(u32::MAX as usize) as u32, msg: [status, d1, d2] });
+        }
+    }
+
+    pub fn clear_midi(&mut self) {
+        self.midi.clear();
+        self.midi_head = 0;
+    }
+
     /// Runs `e` with a budget of `fuel` loop iterations. `false` when the budget ran out.
-    pub fn run(&mut self, e: &Expr, fuel: u64) -> bool {
+    pub fn run(&mut self, e: &Expr, funcs: &[Func], fuel: u64) -> bool {
         self.fuel = fuel;
         self.out_of_fuel = false;
-        self.eval(e);
+        self.eval(e, funcs);
         !self.out_of_fuel
     }
 
@@ -130,77 +186,117 @@ impl Machine {
         (self.rng >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    fn mem_get(&self, i: f64) -> f64 {
-        index(i, self.mem.len()).and_then(|k| self.mem.get(k)).copied().unwrap_or(0.0)
-    }
-
-    fn gmem_get(&self, i: f64) -> f64 {
-        index(i, self.gmem.len()).and_then(|k| self.gmem.get(k)).copied().unwrap_or(0.0)
-    }
-
-    fn store(&mut self, target: &Expr, idx: f64, v: f64) {
-        let slot = match target {
-            Expr::Mem(_) => index(idx, self.mem.len()).and_then(|k| self.mem.get_mut(k)),
-            _ => index(idx, self.gmem.len()).and_then(|k| self.gmem.get_mut(k)),
-        };
-        if let Some(s) = slot {
-            *s = v;
+    fn locate(&mut self, target: &Expr, f: &[Func]) -> Loc {
+        match target {
+            Expr::Var(s) => Loc::Var(*s),
+            Expr::VarIdx { base, first, last, idx } => {
+                let i = to_i(self.eval(idx, f)).clamp(*first, *last);
+                Loc::Var((*base as i64 + (i - first)) as usize)
+            }
+            Expr::Mem(i) => {
+                let i = self.eval(i, f);
+                index(i, self.mem.len()).map_or(Loc::Nowhere, Loc::Mem)
+            }
+            Expr::GMem(i) => {
+                let i = self.eval(i, f);
+                index(i, self.gmem.len()).map_or(Loc::Nowhere, Loc::GMem)
+            }
+            _ => Loc::Nowhere,
         }
     }
 
-    fn eval(&mut self, e: &Expr) -> f64 {
+    fn load(&self, loc: Loc) -> f64 {
+        match loc {
+            Loc::Var(s) => self.var(s),
+            Loc::Mem(k) => self.mem.get(k).copied().unwrap_or(0.0),
+            Loc::GMem(k) => self.gmem.get(k).copied().unwrap_or(0.0),
+            Loc::Nowhere => 0.0,
+        }
+    }
+
+    fn save(&mut self, loc: Loc, v: f64) {
+        match loc {
+            Loc::Var(s) => self.set_var(s, v),
+            Loc::Mem(k) => {
+                if let Some(x) = self.mem.get_mut(k) {
+                    *x = v;
+                }
+            }
+            Loc::GMem(k) => {
+                if let Some(x) = self.gmem.get_mut(k) {
+                    *x = v;
+                }
+            }
+            Loc::Nowhere => {}
+        }
+    }
+
+    fn eval(&mut self, e: &Expr, f: &[Func]) -> f64 {
         match e {
             Expr::Num(n) => *n,
             Expr::Var(s) => self.var(*s),
-            Expr::Mem(i) => {
-                let i = self.eval(i);
-                self.mem_get(i)
+            Expr::VarIdx { .. } | Expr::Mem(_) | Expr::GMem(_) => {
+                let loc = self.locate(e, f);
+                self.load(loc)
             }
-            Expr::GMem(i) => {
-                let i = self.eval(i);
-                self.gmem_get(i)
-            }
-            Expr::Unary(UnOp::Neg, x) => -self.eval(x),
-            Expr::Unary(UnOp::Not, x) => b2f(!truthy(self.eval(x))),
+            Expr::Unary(UnOp::Neg, x) => -self.eval(x, f),
+            Expr::Unary(UnOp::Not, x) => b2f(!truthy(self.eval(x, f))),
             Expr::Bin(op, a, b) => {
-                let a = self.eval(a);
-                let b = self.eval(b);
+                let a = self.eval(a, f);
+                let b = self.eval(b, f);
                 binop(*op, a, b)
             }
-            Expr::LogicAnd(a, b) => b2f(truthy(self.eval(a)) && truthy(self.eval(b))),
-            Expr::LogicOr(a, b) => b2f(truthy(self.eval(a)) || truthy(self.eval(b))),
-            Expr::Cond(c, t, f) => {
-                if truthy(self.eval(c)) {
-                    self.eval(t)
-                } else if let Some(f) = f {
-                    self.eval(f)
+            Expr::LogicAnd(a, b) => b2f(truthy(self.eval(a, f)) && truthy(self.eval(b, f))),
+            Expr::LogicOr(a, b) => b2f(truthy(self.eval(a, f)) || truthy(self.eval(b, f))),
+            Expr::Cond(c, t, o) => {
+                if truthy(self.eval(c, f)) {
+                    self.eval(t, f)
+                } else if let Some(o) = o {
+                    self.eval(o, f)
                 } else {
                     0.0
                 }
             }
-            Expr::Assign(target, op, rhs) => self.assign(target, *op, rhs),
+            Expr::Assign(target, op, rhs) => {
+                let r = self.eval(rhs, f);
+                let loc = self.locate(target, f);
+                let v = op.map_or(r, |o| binop(o, self.load(loc), r));
+                self.save(loc, v);
+                v
+            }
             Expr::Seq(v) => {
                 let mut last = 0.0;
                 for x in v {
-                    last = self.eval(x);
+                    last = self.eval(x, f);
                 }
                 last
             }
-            Expr::Call(b, args) => self.call(*b, args),
+            Expr::Call(b, args) => self.call(*b, args, f),
+            Expr::UserCall(id, args) => {
+                let mut tmp = [0.0f64; MAX_ARGS];
+                for (slot, a) in tmp.iter_mut().zip(args) {
+                    *slot = self.eval(a, f);
+                }
+                let Some(func) = f.get(*id) else { return 0.0 };
+                for (slot, v) in func.params.iter().zip(tmp) {
+                    self.set_var(*slot, v);
+                }
+                self.eval(&func.body, f)
+            }
             Expr::Loop(n, body) => {
-                let n = self.eval(n);
+                let n = self.eval(n, f);
                 let n = if n >= 1.0 { (n as usize).min(MAX_ITER) } else { 0 };
                 for _ in 0..n {
                     if !self.tick() {
                         break;
                     }
-                    self.eval(body);
+                    self.eval(body, f);
                 }
                 0.0
             }
             Expr::While(cond) => {
                 for _ in 0..MAX_ITER {
-                    if !self.tick() || !truthy(self.eval(cond)) {
+                    if !self.tick() || !truthy(self.eval(cond, f)) {
                         break;
                     }
                 }
@@ -208,45 +304,53 @@ impl Machine {
             }
             Expr::WhileBody(cond, body) => {
                 for _ in 0..MAX_ITER {
-                    if !self.tick() || !truthy(self.eval(cond)) {
+                    if !self.tick() || !truthy(self.eval(cond, f)) {
                         break;
                     }
-                    self.eval(body);
+                    self.eval(body, f);
                 }
                 0.0
             }
         }
     }
 
-    fn assign(&mut self, target: &Expr, op: Option<BinOp>, rhs: &Expr) -> f64 {
-        match target {
-            Expr::Var(s) => {
-                let r = self.eval(rhs);
-                let v = op.map_or(r, |o| binop(o, self.var(*s), r));
-                self.set_var(*s, v);
-                v
-            }
-            Expr::Mem(i) | Expr::GMem(i) => {
-                let idx = self.eval(i);
-                let r = self.eval(rhs);
-                let v = match op {
-                    None => r,
-                    Some(o) => {
-                        let cur = if matches!(target, Expr::Mem(_)) { self.mem_get(idx) } else { self.gmem_get(idx) };
-                        binop(o, cur, r)
-                    }
-                };
-                self.store(target, idx, v);
-                v
-            }
-            _ => 0.0,
-        }
+    /// The complex buffer `fft`-style functions work on: `n` points starting at `start`.
+    fn fft_buffer(&mut self, start: f64, n: f64) -> Option<&mut [f64]> {
+        let n = fft::points(n)?;
+        let s = index(start, self.mem.len())?;
+        self.mem.get_mut(s..s.checked_add(2 * n)?)
     }
 
-    fn call(&mut self, b: Builtin, args: &[Expr]) -> f64 {
-        let a0 = args.first().map_or(0.0, |e| self.eval(e));
-        let a1 = args.get(1).map_or(0.0, |e| self.eval(e));
-        let a2 = args.get(2).map_or(0.0, |e| self.eval(e));
+    fn call(&mut self, b: Builtin, args: &[Expr], f: &[Func]) -> f64 {
+        match b {
+            Builtin::SliderChange => {
+                let mask = match args.first() {
+                    Some(Expr::Var(s)) if (SLIDER1..SLIDER1 + MAX_SLIDERS).contains(s) => 1u64 << (s - SLIDER1),
+                    Some(a) => to_i(self.eval(a, f)) as u64,
+                    None => 0,
+                };
+                let hit = self.changed & mask != 0;
+                self.changed &= !mask;
+                return b2f(hit);
+            }
+            Builtin::MidiRecv => {
+                let Some(ev) = self.midi.get(self.midi_head).copied() else { return 0.0 };
+                self.midi_head += 1;
+                let off = f64::from(ev.offset);
+                let [status, d1, d2] = ev.msg.map(f64::from);
+                // The 3-argument form packs both data bytes into one value: `msg23 = d1 + d2 * 256`.
+                let vals = if args.len() == 3 { [off, status, d1 + d2 * 256.0, 0.0] } else { [off, status, d1, d2] };
+                for (a, v) in args.iter().zip(vals) {
+                    let loc = self.locate(a, f);
+                    self.save(loc, v);
+                }
+                return 1.0;
+            }
+            _ => {}
+        }
+        let a0 = args.first().map_or(0.0, |e| self.eval(e, f));
+        let a1 = args.get(1).map_or(0.0, |e| self.eval(e, f));
+        let a2 = args.get(2).map_or(0.0, |e| self.eval(e, f));
         match b {
             Builtin::Sin => a0.sin(),
             Builtin::Cos => a0.cos(),
@@ -303,7 +407,27 @@ impl Machine {
                 a0
             }
             Builtin::MemTop => self.mem.len() as f64,
-            Builtin::FreeMBuf => 0.0,
+            Builtin::FreeMBuf | Builtin::Ignored => 0.0,
+            Builtin::Fft => {
+                if let Some(buf) = self.fft_buffer(a0, a1) {
+                    fft::fft(buf);
+                }
+                0.0
+            }
+            Builtin::Ifft => {
+                if let Some(buf) = self.fft_buffer(a0, a1) {
+                    fft::ifft(buf);
+                }
+                0.0
+            }
+            Builtin::FftPermute | Builtin::FftIpermute => {
+                if let Some(buf) = self.fft_buffer(a0, a1) {
+                    fft::permute(buf);
+                }
+                0.0
+            }
+            // Handled before the arguments are evaluated.
+            Builtin::SliderChange | Builtin::MidiRecv => 0.0,
         }
     }
 }
@@ -317,7 +441,7 @@ mod tests {
         let mut names = Names::new();
         let e = compile(src, 1, &mut names).unwrap();
         let mut m = Machine::new(names.len(), 1024);
-        m.run(&e, 1_000_000);
+        m.run(&e, &names.funcs, 1_000_000);
         (m, names)
     }
 
@@ -360,6 +484,7 @@ mod tests {
         assert_eq!(val("buf = 10; buf[0] = 1; buf[1] = 2; memcpy(buf + 5, buf, 2); x = buf[6];", "x"), 2.0);
         assert_eq!(val("memset(0, 3, 4); x = mem[0] + mem[3] + mem[4];", "x"), 6.0);
         assert_eq!(val("gmem[2] = 5; x = gmem[2];", "x"), 5.0);
+        assert_eq!(val("buf[2] += 4; buf[2] *= 3; x = buf[2];", "x"), 12.0);
     }
 
     #[test]
@@ -374,9 +499,9 @@ mod tests {
         let mut names = Names::new();
         let e = compile("while(1) ( x += 1; );", 1, &mut names).unwrap();
         let mut m = Machine::new(names.len(), 16);
-        assert!(!m.run(&e, 1000));
+        assert!(!m.run(&e, &names.funcs, 1000));
         let e = compile("loop(1e9, loop(1e9, x += 1;););", 1, &mut names).unwrap();
-        assert!(!m.run(&e, 5000));
+        assert!(!m.run(&e, &names.funcs, 5000));
     }
 
     #[test]
@@ -386,5 +511,96 @@ mod tests {
         assert_eq!(val("x = sign(-3) + int(2.9) + floor(-0.5);", "x"), 0.0);
         assert_eq!(val("x = sqrt(-4);", "x"), 2.0);
         assert!(val("x = rand(1);", "x") < 1.0);
+    }
+
+    #[test]
+    fn user_functions_have_params_locals_and_a_return_value() {
+        assert_eq!(val("function sq(a) ( a * a; ); x = sq(7);", "x"), 49.0);
+        assert_eq!(val("function f(a, b) local(t) ( t = a - b; t * 2; ); x = f(10, 4);", "x"), 12.0);
+        // Arguments are evaluated before any parameter is written, so nesting a call is safe.
+        assert_eq!(val("function f(a, b) ( a * 10 + b; ); x = f(f(1, 2), f(3, 4));", "x"), 154.0);
+        // Calling again reuses the instance; later definitions can call earlier ones.
+        assert_eq!(val("function a(x) ( x + 1; ); function b(x) ( a(a(x)); ); y = b(5) + b(0);", "y"), 9.0);
+    }
+
+    #[test]
+    fn function_variables_are_local_unless_declared_global() {
+        assert_eq!(val("function f() ( g = 5; ); f(); x = g;", "x"), 0.0);
+        assert_eq!(val("function f() global(g) ( g = 5; ); f(); x = g;", "x"), 5.0);
+        // Locals keep per-function storage, separate from a global of the same name.
+        assert_eq!(val("t = 3; function f() local(t) ( t = 99; ); f(); x = t;", "x"), 3.0);
+    }
+
+    #[test]
+    fn instance_variables_live_in_a_namespace() {
+        let src = "function inc() instance(n) ( n += 1; ); a.inc(); a.inc(); b.inc(); x = a.n; y = b.n;";
+        assert_eq!(val(src, "x"), 2.0);
+        assert_eq!(val(src, "y"), 1.0);
+        let src = "function add(v) instance(sum) ( this.sum += v; ); p.add(3); p.add(4); x = p.sum;";
+        assert_eq!(val(src, "x"), 7.0);
+        let src = "function inner() instance(k) ( k += 10; ); function outer() instance(j) ( inner(); j += 1; ); q.outer(); x = q.k + q.j;";
+        assert_eq!(val(src, "x"), 11.0);
+    }
+
+    #[test]
+    fn recursion_and_unknown_calls_are_compile_errors() {
+        let mut names = Names::new();
+        assert!(compile("function f(x) ( f(x); ); f(1);", 1, &mut names).is_err());
+        assert!(compile("function g(x) ( x ); g(1, 2);", 1, &mut names).is_err());
+    }
+
+    #[test]
+    fn char_constants_parenthesised_indexing_and_short_calls() {
+        assert_eq!(val("x = 'b'; y = $'b';", "x"), 98.0);
+        assert_eq!(val("x = 'ab';", "x"), (97 * 256 + 98) as f64);
+        assert_eq!(val("mem[7] = 3; n = 4; x = ((n + 1) * 1)[2];", "x"), 3.0);
+        // A call with fewer arguments than parameters zeroes the missing ones.
+        assert_eq!(val("function f(a, b) ( a + b + 100; ); x = f(1);", "x"), 101.0);
+        // A function named with a dot is reachable through a namespace.
+        assert_eq!(val("function m.set(v) instance(s) ( s = v; ); p.m.set(5); x = p.s;", "x"), 5.0);
+    }
+
+    #[test]
+    fn spl_and_slider_functions_are_places() {
+        assert_eq!(val("spl(3) = 5; x = spl3;", "x"), 5.0);
+        assert_eq!(val("slider2 = 8; x = slider(2);", "x"), 8.0);
+        assert_eq!(val("spl(999) = 1; x = spl63;", "x"), 1.0);
+    }
+
+    #[test]
+    fn sliderchange_reports_each_change_once() {
+        let mut names = Names::new();
+        let e = compile("a = sliderchange(slider2); b = sliderchange(slider2); c = sliderchange(1);", 1, &mut names).unwrap();
+        let mut m = Machine::new(names.len(), 16);
+        m.changed = 0;
+        m.mark_slider_changed(2);
+        m.run(&e, &names.funcs, 1000);
+        assert_eq!((m.var(names.slot("a")), m.var(names.slot("b")), m.var(names.slot("c"))), (1.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn midirecv_pops_queued_events_into_its_arguments() {
+        let mut names = Names::new();
+        let e = compile("while (midirecv(t, m1, m2, m3)) ( n += 1; sum += m2; last = m1; );", 1, &mut names).unwrap();
+        let mut m = Machine::new(names.len(), 16);
+        m.push_midi(4, 0x90, 60, 100);
+        m.push_midi(9, 0x80, 61, 0);
+        m.run(&e, &names.funcs, 1000);
+        assert_eq!((m.var(names.slot("n")), m.var(names.slot("sum")), m.var(names.slot("last"))), (2.0, 121.0, 128.0));
+        m.clear_midi();
+        m.run(&e, &names.funcs, 1000);
+        assert_eq!(m.var(names.slot("n")), 2.0);
+    }
+
+    #[test]
+    fn fft_round_trips_through_memory() {
+        let src = "i = 0; loop(16, buf[i*2] = i; i += 1;); fft(0, 16); fft_permute(0, 16); dc = buf[0]; ifft(0, 16);";
+        let mut names = Names::new();
+        // fft_permute after fft makes natural order; ifft then expects permuted order again.
+        let e = compile(&src.replace("ifft(0, 16);", "fft_ipermute(0, 16); ifft(0, 16); back = buf[10];"), 1, &mut names).unwrap();
+        let mut m = Machine::new(names.len(), 256);
+        m.run(&e, &names.funcs, 100_000);
+        assert_eq!(m.var(names.slot("dc")), 120.0);
+        assert!((m.var(names.slot("back")) / 16.0 - 5.0).abs() < 1e-9);
     }
 }

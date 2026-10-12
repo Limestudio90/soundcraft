@@ -12,16 +12,19 @@
 //! are bounds-checked, nesting depth is capped at parse time and the interpreter never allocates
 //! while processing.
 //!
-//! Supported today: the `desc`/`sliderN`/`in_pin`/`out_pin`/`options` header, the `@init`,
+//! Supported today: the `desc`/`sliderN`/`in_pin`/`out_pin`/`options`/`import` header, the `@init`,
 //! `@slider`, `@block` and `@sample` sections, operators, `mem[]`/`gmem[]` (gmem is per instance),
-//! `loop`/`while`/`if` and the common math builtins. Not yet: user-defined `function`s, `import`,
-//! `@serialize`, `@gfx`, MIDI, FFT/convolution and string functions. Scripts that need them fail to
-//! load with [`JsfxError::Unsupported`] naming the missing feature.
+//! `loop`/`while`/`if`, user-defined functions (parameters, `local`, `instance`, `global`, `this.`,
+//! `ns.method()`), `spl()`/`slider()`, `sliderchange`, MIDI input (`midirecv`, fed by note events),
+//! `fft`/`ifft`/`fft_permute`/`fft_ipermute` and the common math builtins. Not yet: `@serialize`,
+//! `@gfx`, MIDI output (sends are dropped), `mdct`/convolution, string and file functions. Scripts
+//! that need them fail to load with [`JsfxError::Unsupported`] naming the missing feature.
 //!
 //! `PluginInfo` must be `&'static`: one `PluginInfo` is leaked per distinct effect source and cached,
 //! so the leak is bounded by the number of different effects actually loaded.
 
 mod ast;
+mod fft;
 mod header;
 mod lex;
 mod parse;

@@ -137,6 +137,24 @@ pub(crate) fn lex(src: &str, first_line: u32) -> Result<Vec<Lexed>, JsfxError> {
             out.push(Lexed { tok: Tok::Str, line });
             continue;
         }
+        if ch == '\'' {
+            // Character constant: up to four characters packed big-endian, e.g. 'b' or 'abcd'.
+            let mut j = i + 1;
+            let mut v: u64 = 0;
+            while let Some(&x) = c.get(j).filter(|&&x| x != '\'' && x != '\n') {
+                v = (v << 8) | (u64::from(u32::from(x)) & 0xff);
+                j += 1;
+                if j - i > 5 {
+                    return Err(err(line, "character constant too long"));
+                }
+            }
+            if c.get(j) != Some(&'\'') {
+                return Err(err(line, "unterminated character constant"));
+            }
+            out.push(Lexed { tok: Tok::Num(v as f64), line });
+            i = j + 1;
+            continue;
+        }
         if ch == '$' {
             if c.get(i + 1) == Some(&'\'') && c.get(i + 3) == Some(&'\'') {
                 let v = c.get(i + 2).map_or(0, |&x| x as u32);
