@@ -290,7 +290,7 @@ pub(super) fn cut_all_automation(e: &mut Engine, p: &Value) -> Result<Value> {
 fn auto_copy(e: &mut Engine, p: &Value, which: Lanes, cut: bool, id: &str) -> Result<Value> {
     let tracks = tracks_required(e, id, p)?;
     let r = nonempty_range(e, p, id)?;
-    let mut cb = Clipboard { length: r.len(), ..Clipboard::default() };
+    let mut cb = Clipboard { automation_only: true, ..Clipboard::of_range(e.session(), r) };
     let mut lanes_n = 0;
     for t in &tracks {
         cb.tracks.push(Vec::new());
@@ -551,12 +551,13 @@ fn duplicate_extend(e: &mut Engine, p: &Value) -> Result<Value> {
     let id = "edit.duplicate_extend";
     let tracks = tracks_required(e, id, p)?;
     let r = nonempty_range(e, p, id)?;
+    let (sh, follow) = (shuffle(e.session()), e.session().edit.automation_follows_edit);
     let s = e.session_mut();
     let mut n = 0;
     for t in &tracks {
         let clips = ops::copy_range(s, *t, r);
-        n += ops::paste(s, *t, r.end, &clips, r.len(), false).len();
-        if let Some(tr) = s.track_mut(*t) {
+        n += ops::paste(s, *t, r.end, &clips, r.len(), sh).map_err(|why| bad(id, why))?.len();
+        if follow && let Some(tr) = s.track_mut(*t) {
             for l in &mut tr.automation {
                 let pts: Vec<_> = l.points.iter().filter(|pt| r.contains(pt.at)).copied().collect();
                 for pt in pts {
@@ -683,7 +684,7 @@ fn snap(e: &mut Engine, p: &Value, next: bool) -> Result<Value> {
             others.iter().filter(|x| x.end() <= c.start).map(Clip::end).max().map(|en| en - c.start)
         };
         if let Some(d) = delta.filter(|d| *d != 0) {
-            moved += ops::move_clips(s, &[id], d, None);
+            moved += ops::move_clips(s, &[id], d, &[]);
         }
     }
     Ok(json!({"moved": moved}))

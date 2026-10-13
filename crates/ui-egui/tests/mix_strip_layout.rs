@@ -85,3 +85,30 @@ fn stereo_strips_line_up_with_mono_strips() {
     let (top, bottom) = solo_keys.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &y| (lo.min(y), hi.max(y)));
     assert!(bottom - top < 0.5, "solo keys span {top}..{bottom}");
 }
+
+#[test]
+fn the_meter_starts_level_with_the_top_of_the_faders_travel() {
+    let _palette = PALETTE.lock().unwrap_or_else(|e| e.into_inner());
+    let harness = mix(ThemeMode::Dark);
+    let numbers: Vec<_> = texts(harness.output(), |t| t.galley.job.sections[0].format.font_id.size == 8.0)
+        .map(|t| (t.galley.job.text.as_str(), t.galley.rect.translate(t.pos.to_vec2())))
+        .collect();
+    let fader_tops: Vec<_> = numbers.iter().filter(|(text, _)| *text == "12").map(|(_, r)| *r).collect();
+    assert!(fader_tops.len() >= 6, "found {} fader scales", fader_tops.len());
+    for top in fader_tops {
+        let meter_top = numbers.iter().find(|(text, r)| *text == "0" && r.min.x > top.max.x + 16.0 && r.min.x < top.max.x + 60.0);
+        assert!(meter_top.is_some_and(|(_, r)| (r.center().y - top.center().y).abs() < 0.5), "meter scale beside {top:?}: {meter_top:?}");
+    }
+}
+
+#[test]
+fn narrow_strips_show_ticks_without_numbers() {
+    let _palette = PALETTE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut harness = mix(ThemeMode::Dark);
+    harness.state_mut().ui.narrow_mix = true;
+    for _ in 0..3 {
+        harness.step();
+    }
+    let numbers = texts(harness.output(), |t| t.galley.job.sections[0].format.font_id.size == 8.0 && SCALE.contains(&t.galley.job.text.as_str()));
+    assert_eq!(numbers.count(), 0);
+}

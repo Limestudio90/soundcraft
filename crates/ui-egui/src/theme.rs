@@ -419,20 +419,18 @@ pub fn track_backgrounds(color: [u8; 3], selected: bool, tint: f32) -> (Color32,
 /// Track colours tinted for clip bodies.
 pub fn clip_colors(rgb: [u8; 3], selected: bool) -> (Color32, Color32, Color32) {
     let [r, g, b] = rgb;
-    let k = if selected { 0.95 } else { 0.62 };
-    let body = Color32::from_rgb((f32::from(r) * k) as u8, (f32::from(g) * k) as u8, (f32::from(b) * k) as u8);
-    let bar = Color32::from_rgb((f32::from(r) * 0.9) as u8, (f32::from(g) * 0.9) as u8, (f32::from(b) * 0.9) as u8);
+    let shade = |k: f32| Color32::from_rgb((f32::from(r) * k) as u8, (f32::from(g) * k) as u8, (f32::from(b) * k) as u8);
+    let tint = |k: f32| {
+        let t = |c: u8| (f32::from(c) + (255.0 - f32::from(c)) * k) as u8;
+        Color32::from_rgb(t(r), t(g), t(b))
+    };
+    let bar = shade(0.9);
     if is_light() {
         // A paler body and a waveform in a deep shade of the clip's own colour.
-        let tint = |c: u8, k: f32| (f32::from(c) + (255.0 - f32::from(c)) * k) as u8;
-        let k = if selected { 0.2 } else { 0.45 };
-        let body = Color32::from_rgb(tint(r, k), tint(g, k), tint(b, k));
-        let d = if selected { 0.22 } else { 0.32 };
-        let wave = Color32::from_rgb((f32::from(r) * d) as u8, (f32::from(g) * d) as u8, (f32::from(b) * d) as u8);
-        return (body, bar, wave);
+        return if selected { (tint(0.2), bar, shade(0.22)) } else { (tint(0.45), bar, shade(0.32)) };
     }
-    let wave = if selected { Color32::from_rgb(20, 20, 24) } else { Color32::from_rgb(12, 12, 14) };
-    (body, bar, wave)
+    // A dark body and a light waveform in the clip's own colour; selection inverts them.
+    if selected { (shade(0.7), bar, Color32::from_rgb(16, 16, 18)) } else { (shade(0.34), bar, tint(0.35)) }
 }
 
 pub fn rgb(c: [u8; 3]) -> Color32 {
@@ -504,7 +502,8 @@ mod tests {
         drop(inner);
         drop(outer);
         drop(app);
-        assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "the palette lock must be released when every holder drops it");
+        // Other tests compete for the lock too, and some hold it for seconds: allow for a queue.
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(120)).is_ok(), "the palette lock must be released when every holder drops it");
     }
 
     #[test]

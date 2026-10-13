@@ -141,7 +141,13 @@ impl GridValue {
     pub fn line_at_or_before(&self, pos: Samples, sr: SampleRate, map: &TempoMap, rate: FrameRate) -> Samples {
         match *self {
             GridValue::Note { value, dotted, triplet } => {
-                let t = map.samples_to_ticks_f(pos, sr).floor() as i64;
+                // Float ticks can land a hair either side of a line's own tick.
+                let mut t = map.samples_to_ticks_f(pos, sr).floor() as i64;
+                if map.tick_to_samples(t, sr) > pos {
+                    t = t.saturating_sub(1);
+                } else if map.tick_to_samples(t.saturating_add(1), sr) <= pos {
+                    t = t.saturating_add(1);
+                }
                 // Grid lines restart at each bar line so odd meters stay aligned.
                 let bb = map.bar_beat_at_tick(t);
                 let bar_tick = map.bar_start_tick(bb.bar);
@@ -151,7 +157,7 @@ impl GridValue {
             }
             _ => {
                 let step = self.step_samples(pos, sr, map, rate);
-                pos.div_euclid(step) * step
+                pos.div_euclid(step).saturating_mul(step)
             }
         }
     }
@@ -184,6 +190,19 @@ impl GridValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grid_lines_are_their_own_line_at_odd_tempos() {
+        let (g, sr, rate) = (GridValue::default(), SampleRate::HZ_48000, FrameRate::Fps30);
+        for bpm in [90.0, 95.0, 110.0, 130.0, 140.0] {
+            let map = TempoMap::new(bpm, 4, 4).unwrap();
+            let mut line = 0;
+            for _ in 0..64 {
+                assert_eq!(g.line_at_or_before(line, sr, &map, rate), line, "{bpm} bpm");
+                line = g.next_line(line, sr, &map, rate);
+            }
+        }
+    }
 
     #[test]
     fn sixteenth_grid_at_120() {

@@ -5,10 +5,9 @@ use super::more_util::{set_text, store_value, text, toggle_flag, values_with_pre
 use super::*;
 use crate::cmd;
 use serde_json::json;
-use soundcraft_model::{BusId, ChannelFormat, ClipContent, OutputPath, Route, Session, Source, SourceAudio, SourceId, TrackId, TrackKind};
+use soundcraft_model::{BusId, ChannelFormat, ClipContent, OutputPath, Route, Session, SourceId, TrackId, TrackKind};
 use soundcraft_time::Timecode;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 macro_rules! option {
     ($id:literal, $label:literal, $flag:literal) => {
@@ -403,18 +402,6 @@ fn midi_inputs(e: &mut Engine, p: &Value) -> Result<Value> {
     Ok(json!({"enabled": enabled}))
 }
 
-/// Decode a source file of another session (paths relative to that session's folder).
-fn load_source(dir: &Path, src: &Source, sr: u32) -> Option<soundcraft_audio_io::AudioBuffer> {
-    let p = if Path::new(&src.path).is_absolute() { PathBuf::from(&src.path) } else { dir.join(&src.path) };
-    let bytes = crate::io::read_file(&p).ok()?;
-    let (_, mut buf) = soundcraft_audio_io::decode(&bytes, p.extension().and_then(|x| x.to_str())).ok()?;
-    if buf.sample_rate != sr && buf.sample_rate > 0 {
-        buf.channels = soundcraft_dsp::offline::resample(&buf.channels, buf.sample_rate, sr);
-        buf.sample_rate = sr;
-    }
-    Some(buf)
-}
-
 fn import_session_data(e: &mut Engine, p: &Value) -> Result<Value> {
     let id = "file.import_session_data";
     let path = str_param(p, "path").filter(|x| !x.trim().is_empty()).ok_or_else(|| bad(id, "`path` required"))?.to_string();
@@ -443,31 +430,29 @@ fn import_session_data(e: &mut Engine, p: &Value) -> Result<Value> {
     needed.sort_by_key(|x| x.0);
     needed.dedup();
     let sr = e.session().sample_rate.hz();
-    let decoded: Vec<(Source, Option<soundcraft_audio_io::AudioBuffer>)> =
-        needed.iter().filter_map(|sid| other.source(*sid).cloned()).map(|src| (src.clone(), load_source(&dir, &src, sr))).collect();
     let s = e.session_mut();
+    let mut files = crate::io::DecodedFiles::new();
     let mut map: std::collections::BTreeMap<u64, SourceId> = Default::default();
     let mut missing = Vec::new();
-    for (src, buf) in decoded {
-        let nid = SourceId(s.alloc());
+    for src in needed.iter().filter_map(|sid| other.source(*sid)) {
         let abs = if Path::new(&src.path).is_absolute() { PathBuf::from(&src.path) } else { dir.join(&src.path) };
         let mut ns = src.clone();
-        ns.id = nid;
+        ns.id = SourceId(s.alloc());
         ns.path = abs.to_string_lossy().into_owned();
-        match buf {
-            Some(b) => {
-                ns.frames = b.frames() as u64;
+        match crate::io::decode_file(&mut files, &abs, sr) {
+            Ok(audio) => {
+                ns.frames = audio.buffer.frames() as u64;
                 ns.sample_rate = sr;
                 ns.unsaved = true;
-                s.pool.insert(nid, Arc::new(SourceAudio::new(b)));
+                s.pool.insert(ns.id, audio);
             }
-            None => {
+            Err(_) => {
                 ns.unsaved = false;
                 missing.push(ns.path.clone());
             }
         }
+        map.insert(src.id.0, ns.id);
         s.sources.push(ns);
-        map.insert(src.id.0, nid);
     }
     let mut out = Vec::new();
     for mut tr in picked {

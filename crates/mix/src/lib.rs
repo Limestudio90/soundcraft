@@ -39,9 +39,8 @@
 //!
 //! An instance starts from its stored state; the insert's parameter values are then applied on
 //! top before the first block (the session's values are kept in step with the plugin, including
-//! edits made in its own editor, so both agree; the state carries everything else).
-//! [`MixEngine::capture_states`] reads every live instance's state back (for saving the session);
-//! it calls into the plugins and allocates, so a realtime host runs it only on request.
+//! edits made in its own editor, so both agree; the state carries everything else). A host reads
+//! states back for saving through each instance's [`Plugin::state_reader`], on its UI thread.
 //!
 //! A built-in instrument's parameter values are applied the same way. A sample-playing
 //! instrument (the Sampler) is handed the decoded audio of its insert's
@@ -52,11 +51,12 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use soundcraft_dsp::pan::{PanLaw, SpeakerPos, SurroundParams, gains};
-use soundcraft_dsp::{Plugin, SampleSource, db_to_gain};
+use soundcraft_dsp::{Plugin, SampleSource, Transport, db_to_gain};
+use soundcraft_midi::CtrlKind;
 use soundcraft_model::{
     AutoParam, BusId, ChannelFormat, Clip, ClipContent, Route, Session, SourceAudio, Speaker, SurroundPan, Track, TrackId, TrackKind,
 };
-use soundcraft_time::{Range, Samples};
+use soundcraft_time::{Range, Samples, TICKS_PER_QUARTER};
 use std::collections::HashMap;
 use std::ops::Bound;
 use std::sync::Arc;
@@ -72,8 +72,8 @@ pub fn main_channels(s: &Session) -> usize {
     s.main_format().channels().clamp(MAIN_CHANNELS, MAX_CHANNELS)
 }
 
-/// Slot index used for a track's instrument plugin in [`InstanceSpec`], [`PreparedInstance`] and
-/// [`MixEngine::capture_states`] (insert slots use their index).
+/// Slot index used for a track's instrument plugin in [`InstanceSpec`] and [`PreparedInstance`]
+/// (insert slots use their index).
 pub const INSTRUMENT_SLOT: usize = usize::MAX;
 
 /// Hosted third-party plugin ids (CLAP or VST3): created off the audio thread in realtime use.
@@ -129,17 +129,23 @@ pub fn instance_specs(s: &Session) -> Vec<InstanceSpec> {
     out
 }
 
+/// A plugin made by [`create_instance`].
+pub struct NewInstance {
+    pub plugin: Box<dyn Plugin>,
+    /// The plugin refused the stored state and starts from its defaults.
+    pub refused_state: bool,
+}
+
 /// Creates a plugin (built-in or hosted), restores `state` (if any) and prepares it. Expensive
 /// for third-party plugins: in realtime use, call it on the control thread.
-pub fn create_instance(id: &str, state: Option<&[u8]>, sample_rate: f32, max_block: usize, ch: usize) -> Option<Box<dyn Plugin>> {
-    let mut p = create_plugin(id)?;
-    if let Some(st) = state
-        && !p.load_state(st)
-    {
+pub fn create_instance(id: &str, state: Option<&[u8]>, sample_rate: f32, max_block: usize, ch: usize) -> Option<NewInstance> {
+    let mut plugin = create_plugin(id)?;
+    let refused_state = state.is_some_and(|st| !plugin.load_state(st));
+    if refused_state {
         log::warn!("{id}: the plugin did not accept its stored state");
     }
-    p.prepare(sample_rate, max_block, ch);
-    Some(p)
+    plugin.prepare(sample_rate, max_block, ch);
+    Some(NewInstance { plugin, refused_state })
 }
 
 /// Peak meter values for one strip (linear, per channel, max over the last block).
@@ -151,6 +157,24 @@ pub struct StripMeter {
     pub peaks: Vec<f32>,
     /// Gain reduction of the first dynamics insert, dB.
     pub gain_reduction_db: f32,
+    pub plugin_failures: PluginFailures,
+}
+
+/// How often a strip's plugins were taken out of the signal path for putting out NaN or infinity.
+/// Each stays out until the engine is next reset (playback starts or stops).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PluginFailures {
+    /// It only grows.
+    pub count: u32,
+    /// The slot of the latest: an insert index or [`INSTRUMENT_SLOT`].
+    pub last: usize,
+}
+
+impl PluginFailures {
+    fn record(&mut self, slot: usize) {
+        self.count = self.count.wrapping_add(1);
+        self.last = slot;
+    }
 }
 
 impl StripMeter {
@@ -159,6 +183,7 @@ impl StripMeter {
         self.peak = o.peak;
         self.peaks.clone_from(&o.peaks);
         self.gain_reduction_db = o.gain_reduction_db;
+        self.plugin_failures = o.plugin_failures;
     }
 
     fn measure(&mut self, bufs: &[Vec<f32>], frames: usize, gr: f32) {
@@ -187,6 +212,7 @@ struct PluginSlot {
     plugin: Box<dyn Plugin>,
     /// Last values pushed to the plugin, in the insert's parameter-map order.
     applied: Vec<f32>,
+    failed: bool,
 }
 
 struct Strip {
@@ -200,6 +226,8 @@ struct Strip {
     sample: Option<Arc<SourceAudio>>,
     /// MIDI notes currently sounding on the instrument (pitch), for note-offs at stops/seek.
     held: Vec<u8>,
+    /// The instrument's next block starts somewhere new: send it the controllers in effect there.
+    chase: bool,
     muted: bool,
     gr: f32,
     /// Per-clip effect chains (Clip Effects) and a scratch buffer to render clips into.
@@ -213,7 +241,12 @@ struct Strip {
     align_pre: DelayLine,
     out_extra: DelayLine,
     outbuf: Vec<Vec<f32>>,
+    failures: PluginFailures,
 }
+
+/// Most latency delay compensation handles: 2^20 samples, about 22 s at 48 kHz. A strip reports
+/// at most this, whatever its plugins claim, so a bogus value can't stall offline renders.
+const MAX_LATENCY: usize = 1 << 20;
 
 /// A multichannel delay line (samples), resized only when the delay changes.
 #[derive(Default)]
@@ -225,7 +258,7 @@ struct DelayLine {
 
 impl DelayLine {
     fn set(&mut self, len: usize, ch: usize) {
-        let len = len.min(1 << 20);
+        let len = len.min(MAX_LATENCY);
         if len != self.len || self.bufs.len() != ch {
             self.len = len;
             self.idx = 0;
@@ -277,6 +310,7 @@ impl Strip {
             instrument: None,
             sample: None,
             held: Vec::new(),
+            chase: true,
             muted: false,
             gr: 0.0,
             clip_fx: HashMap::new(),
@@ -286,6 +320,7 @@ impl Strip {
             align_pre: DelayLine::default(),
             out_extra: DelayLine::default(),
             outbuf: Vec::new(),
+            failures: PluginFailures::default(),
         }
     }
 }
@@ -306,13 +341,18 @@ pub struct MixEngine {
     /// Snapshot key of the session the strips/order were synced to.
     synced: (usize, usize, usize),
     order: Vec<usize>,
-    /// Current total compensation delay (samples) of the mix.
+    /// Current total compensation delay (samples) of the main mix: the slowest track and aux
+    /// returns, and the master faders' inserts.
     pub latency: usize,
     /// Delay already applied to audio written onto busses: the slowest track insert.
     /// A bus render drops this so the bus lines up with the timeline. The extra delay
     /// that lines direct outputs up with aux returns stays in `latency` and is removed
     /// only from the main mix.
     track_latency: usize,
+    /// Busses an aux returns onto, and the latency of the slowest aux return: audio written onto
+    /// such a bus waits for it, so a bounce of the bus drops it as well.
+    aux_fed: Vec<BusId>,
+    aux_latency: usize,
     /// Live input for the next block (planar), set by the audio host for input monitoring.
     pub input: Vec<Vec<f32>>,
     /// Transport stopped: only monitored inputs sound (no clips).
@@ -369,9 +409,9 @@ impl SlotCtx<'_> {
             }
         } else {
             let state = if third { ins.state_bytes() } else { None };
-            create_instance(&ins.plugin, state.as_deref(), self.sr, self.mb, ch)
+            create_instance(&ins.plugin, state.as_deref(), self.sr, self.mb, ch).map(|n| n.plugin)
         }?;
-        Some(PluginSlot { id: ins.plugin.clone(), ch, plugin, applied: Vec::new() })
+        Some(PluginSlot { id: ins.plugin.clone(), ch, plugin, applied: Vec::new(), failed: false })
     }
 }
 
@@ -393,6 +433,8 @@ impl MixEngine {
             order: Vec::new(),
             latency: 0,
             track_latency: 0,
+            aux_fed: Vec::new(),
+            aux_latency: 0,
             input: Vec::new(),
             monitor_only: false,
             recording: false,
@@ -442,24 +484,6 @@ impl MixEngine {
         out
     }
 
-    /// The state of every live plugin that has one (third-party plugins), as
-    /// `(track, slot or INSTRUMENT_SLOT, state)`. Calls into the plugins and allocates.
-    pub fn capture_states(&mut self) -> Vec<(TrackId, usize, Vec<u8>)> {
-        let mut out = Vec::new();
-        for (tid, st) in self.strips.iter_mut() {
-            for (i, slot) in st.plugins.iter_mut().enumerate() {
-                if let Some(data) = slot.as_mut().and_then(|s| s.plugin.save_state()) {
-                    out.push((*tid, i, data));
-                }
-            }
-            if let Some(data) = st.instrument.as_mut().and_then(|s| s.plugin.save_state()) {
-                out.push((*tid, INSTRUMENT_SLOT, data));
-            }
-        }
-        out.sort_by_key(|(t, s, _)| (*t, *s));
-        out
-    }
-
     pub fn max_block(&self) -> usize {
         self.max_block
     }
@@ -486,12 +510,15 @@ impl MixEngine {
         for s in self.strips.values_mut() {
             for p in s.plugins.iter_mut().flatten() {
                 p.plugin.reset();
+                p.failed = false;
             }
             if let Some(i) = &mut s.instrument {
                 i.plugin.all_notes_off();
                 i.plugin.reset();
+                i.failed = false;
             }
             s.held.clear();
+            s.chase = true;
             s.align.clear();
             s.align_pre.clear();
             s.out_extra.clear();
@@ -600,6 +627,7 @@ impl MixEngine {
                     i.plugin.all_notes_off();
                 }
                 st.held.clear();
+                st.chase = true;
             }
         }
         self.last_end = pos.saturating_add(frames as i64);
@@ -649,11 +677,35 @@ impl MixEngine {
                 }
             }
         }
+        // The master faders' inserts delay the whole main mix, so their latency is part of the
+        // mix's too (the faders run one after the other: it adds up).
+        let mut lmax_m = 0usize;
+        if pdc {
+            for t in s.tracks.iter().filter(|t| t.kind == TrackKind::Master && !t.inactive) {
+                if let Some(st) = self.strips.get_mut(&t.id) {
+                    note_insert_latency(t, st, pos);
+                    lmax_m = lmax_m.saturating_add(st.latency);
+                }
+            }
+        }
         let lmax_t = if pdc { work.iter().map(|(_, st)| st.latency).max().unwrap_or(0) } else { 0 };
         let lmax_a =
             if pdc { self.strips.iter().filter(|(id, _)| s.track(**id).is_some_and(is_aux)).map(|(_, st)| st.latency).max().unwrap_or(0) } else { 0 };
         self.track_latency = lmax_t;
-        self.latency = lmax_t + lmax_a;
+        self.latency = lmax_t + lmax_a + lmax_m;
+        // An aux that returns onto a bus delays it by the slowest aux return, so the tracks routed
+        // to that bus wait as well (as the ones routed to the main mix do) and the bus lines up.
+        self.aux_latency = lmax_a;
+        self.aux_fed.clear();
+        if pdc {
+            for t in s.tracks.iter().filter(|t| is_aux(t) && live(t)) {
+                if let Route::Bus(b) = &t.mixer.output
+                    && !self.aux_fed.contains(b)
+                {
+                    self.aux_fed.push(*b);
+                }
+            }
+        }
         for (i, st) in work.iter_mut() {
             let Some(t) = s.tracks.get(*i) else { continue };
             let ch = st.buf.len();
@@ -663,7 +715,12 @@ impl MixEngine {
                 st.align_pre.set(lmax_t.saturating_sub(st.latency), ch);
                 st.align_pre.process(&mut st.pre, frames);
             }
-            st.out_extra.set(if t.mixer.output == Route::Main { lmax_a } else { 0 }, ch);
+            let waits = match &t.mixer.output {
+                Route::Main => true,
+                Route::Bus(b) => self.aux_fed.contains(b),
+                _ => false,
+            };
+            st.out_extra.set(if waits { lmax_a } else { 0 }, ch);
         }
         for (i, st) in work.iter_mut() {
             if let Some(t) = s.tracks.get(*i) {
@@ -694,6 +751,7 @@ impl MixEngine {
         }
         self.order = order;
         // Master faders process the main mix.
+        let transport = transport_at(s, pos, !self.monitor_only, self.recording);
         for t in s.tracks.iter().filter(|t| t.kind == TrackKind::Master && !t.inactive) {
             if let Some(strip) = self.strips.get_mut(&t.id) {
                 for (dst, src) in strip.buf.iter_mut().zip(self.main.iter()) {
@@ -705,9 +763,14 @@ impl MixEngine {
                     if let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i))
                         && ins.active
                         && !ins.bypass
+                        && !slot.failed
                     {
                         apply_params(slot, ins, t, i, pos);
+                        slot.plugin.set_transport(&transport);
                         slot.plugin.process(&mut strip.buf, frames);
+                        if contain_failure(slot, &mut strip.buf, frames) {
+                            strip.failures.record(i);
+                        }
                     }
                 }
                 let v0 = volume_db_at(t, pos);
@@ -722,7 +785,9 @@ impl MixEngine {
                         }
                     }
                 }
-                self.meters.entry(t.id).or_default().measure(&self.main, frames, 0.0);
+                let m = self.meters.entry(t.id).or_default();
+                m.measure(&self.main, frames, 0.0);
+                m.plugin_failures = strip.failures;
             }
         }
         // Metronome: summed after the master fader, so it reaches the speakers without passing
@@ -745,6 +810,12 @@ impl MixEngine {
         self.main_meter.measure(&self.main, frames, 0.0);
     }
 
+    /// The delay-compensation latency written onto `bus`: the slowest track insert, plus the
+    /// slowest aux return when an aux returns onto this bus.
+    fn bus_latency(&self, bus: BusId) -> usize {
+        self.track_latency + if self.aux_fed.contains(&bus) { self.aux_latency } else { 0 }
+    }
+
     /// Copy one rendered block of `bus` into `out`. A missing bus stays silent.
     fn copy_bus(&self, bus: BusId, frames: usize, out: &mut [Vec<f32>]) {
         for o in out.iter_mut() {
@@ -765,7 +836,9 @@ impl MixEngine {
 
     /// Send, meter and pan a processed strip into the busses / main mix.
     fn route_strip(&mut self, t: &Track, strip: &mut Strip, pos: Samples, frames: usize) {
-        self.meters.entry(t.id).or_default().measure(&strip.buf, frames, strip.gr);
+        let m = self.meters.entry(t.id).or_default();
+        m.measure(&strip.buf, frames, strip.gr);
+        m.plugin_failures = strip.failures;
         let src_fmt = strip_format(t, strip.buf.len());
         let law = self.pan_law;
         for (i, snd) in t.mixer.sends.iter().enumerate() {
@@ -788,7 +861,7 @@ impl MixEngine {
             apply_matrix(src, frames, &mut dst.buf, &m, gain);
         }
         let src: &[Vec<f32>] = match &t.mixer.output {
-            Route::Main if strip.out_extra.len > 0 => {
+            Route::Main | Route::Bus(_) if strip.out_extra.len > 0 => {
                 if strip.outbuf.len() != strip.buf.len() {
                     strip.outbuf = vec![Vec::new(); strip.buf.len()];
                 }
@@ -842,6 +915,7 @@ fn process_strip(
     for c in strip.buf.iter_mut() {
         c.iter_mut().take(frames).for_each(|x| *x = 0.0);
     }
+    let transport = transport_at(s, pos, !live.monitor_only, live.recording);
     match t.kind {
         TrackKind::Audio if !live.input.is_empty() && (t.mixer.input_monitor || (t.mixer.record_arm && (live.monitor_only || live.recording))) => {
             // Input monitoring: the track hears its hardware input instead of its clips.
@@ -912,7 +986,7 @@ fn process_strip(
             }
         }
         TrackKind::Instrument | TrackKind::Midi => {
-            if let Some(inst) = &mut strip.instrument {
+            if let Some(inst) = strip.instrument.as_mut().filter(|i| !i.failed) {
                 // #152: push the instrument's stored parameter values into the live plugin
                 // before processing, the same way inserts do below. Without this, the values
                 // loaded from a session (or set via `mix.insert_state`) never reach the plugin
@@ -921,8 +995,12 @@ fn process_strip(
                 if let Some(ins) = &t.instrument {
                     apply_params(inst, ins, t, INSTRUMENT_SLOT, pos);
                 }
+                inst.plugin.set_transport(&transport);
                 // Stopped: no clips, but the instrument still plays auditioned notes.
                 if !live.monitor_only {
+                    if std::mem::take(&mut strip.chase) {
+                        chase_controllers(s, t, pos, inst);
+                    }
                     schedule_notes(s, t, pos, frames, inst, &mut strip.held);
                 }
                 if strip.buf.len() >= 2 {
@@ -938,6 +1016,9 @@ fn process_strip(
                         *x = 0.5 * (*x + *y);
                     }
                 }
+                if contain_failure(inst, &mut strip.buf, frames) {
+                    strip.failures.record(INSTRUMENT_SLOT);
+                }
             }
         }
         _ => {}
@@ -952,18 +1033,23 @@ fn process_strip(
     let mut latency = 0usize;
     for (i, ins) in t.mixer.inserts.iter().enumerate() {
         let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i)) else { continue };
-        if !ins.active || ins.bypass {
+        if !ins.active || ins.bypass || slot.failed {
             continue;
         }
         apply_params(slot, ins, t, i, pos);
+        slot.plugin.set_transport(&transport);
         slot.plugin.process(&mut strip.buf, frames);
+        if contain_failure(slot, &mut strip.buf, frames) {
+            strip.failures.record(i);
+            continue;
+        }
         latency = latency.saturating_add(slot.plugin.latency());
         if gr == 0.0 {
             gr = slot.plugin.gain_reduction_db();
         }
     }
     strip.gr = gr;
-    strip.latency = latency;
+    strip.latency = latency.min(MAX_LATENCY);
     let auto_mute = t.mixer.automation_mode.reads() && t.lane(&AutoParam::Mute).is_some_and(|l| l.value_at(pos, 0.0) >= 0.5);
     let soloed_out = any_solo && !t.mixer.solo && !t.mixer.solo_safe && !receives_solo(s, t);
     strip.muted = t.mixer.mute || auto_mute || soloed_out;
@@ -1007,6 +1093,20 @@ fn process_strip(
             }
         }
     }
+}
+
+/// Silences a block the plugin filled with NaN or infinity and takes the plugin out until the
+/// next [`MixEngine::reset`]. True then.
+fn contain_failure(slot: &mut PluginSlot, buf: &mut [Vec<f32>], frames: usize) -> bool {
+    // A branch-free fold vectorizes; `all` runs about 8 times slower here.
+    if buf.iter().all(|c| c.get(..frames).unwrap_or(c).iter().fold(true, |ok, x| ok & x.is_finite())) {
+        return false;
+    }
+    for c in buf.iter_mut() {
+        c.iter_mut().take(frames).for_each(|x| *x = 0.0);
+    }
+    slot.failed = true;
+    true
 }
 
 /// Clip-effect parameters of a clip, or None when it has none or they are bypassed.
@@ -1379,7 +1479,7 @@ fn midi_offset(s: &Session, t: &Track) -> i64 {
         .map_or(0, |v| v as i64)
 }
 
-/// Send note on/offs for MIDI clips overlapping the block.
+/// Send note on/offs and controllers for MIDI clips overlapping the block.
 fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mut PluginSlot, held: &mut Vec<u8>) {
     let sr = s.sample_rate;
     // MIDI Track Offsets: the track's notes sound `offset` samples later (earlier if negative), so
@@ -1430,6 +1530,82 @@ fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mu
                 held.retain(|p| *p != n.pitch);
             }
         }
+        let near = s.tempo.samples_to_ticks(pos, sr).saturating_sub(base).saturating_sub(1)
+            ..=s.tempo.samples_to_ticks(end, sr).saturating_sub(base).saturating_add(1);
+        // Events before tick 0 are what a start trim hid: they don't play.
+        for c in sequence.ctrls.iter().filter(|c| c.tick >= 0) {
+            let tick = c.tick.saturating_add(delay).max(0);
+            if !near.contains(&tick) {
+                continue;
+            }
+            let at = s.tempo.tick_to_samples(base.saturating_add(tick), sr);
+            if at >= pos && at < end && at < clip.end() {
+                inst.plugin.midi(usize::try_from(at - pos).unwrap_or(0), ctrl_message(c.kind, c.value, dp));
+            }
+        }
+    }
+}
+
+/// A controller event as a MIDI 1.0 message on channel 1 (where the notes go), with `transpose`
+/// applied to a poly-pressure key.
+fn ctrl_message(kind: CtrlKind, value: i32, transpose: i64) -> [u8; 3] {
+    let v7 = value.clamp(0, 127) as u8;
+    match kind {
+        CtrlKind::Cc(n) => [0xB0, n & 0x7F, v7],
+        CtrlKind::PitchBend => {
+            let v = value.saturating_add(8192).clamp(0, 16383);
+            [0xE0, (v & 0x7F) as u8, (v >> 7) as u8]
+        }
+        CtrlKind::ChannelPressure => [0xD0, v7, 0],
+        CtrlKind::PolyPressure(k) => [0xA0, (i64::from(k) + transpose).clamp(0, 127) as u8, v7],
+        CtrlKind::Program => [0xC0, v7, 0],
+    }
+}
+
+/// Before an instrument plays from `pos`: reset its controllers, then send each one the last value
+/// it had on this track before `pos`.
+fn chase_controllers(s: &Session, t: &Track, pos: Samples, inst: &mut PluginSlot) {
+    inst.plugin.midi(0, [0xB0, 121, 0]);
+    let pos = pos.saturating_sub(midi_offset(s, t));
+    const BEND: usize = 128;
+    const PRESSURE: usize = 129;
+    const PROGRAM: usize = 130;
+    let mut last = [(i64::MIN, 0i32); 131];
+    let sr = s.sample_rate;
+    for clip in t.clips() {
+        let ClipContent::Midi { sequence } = &clip.content else { continue };
+        if clip.muted || clip.start >= pos {
+            continue;
+        }
+        let base = s.tempo.samples_to_ticks(clip.start, sr);
+        let until = pos.min(clip.end());
+        for c in sequence.ctrls.iter().filter(|c| c.tick >= 0) {
+            let slot = match c.kind {
+                CtrlKind::Cc(n) => usize::from(n & 0x7F),
+                CtrlKind::PitchBend => BEND,
+                CtrlKind::ChannelPressure => PRESSURE,
+                CtrlKind::Program => PROGRAM,
+                CtrlKind::PolyPressure(_) => continue,
+            };
+            let at = s.tempo.tick_to_samples(base.saturating_add(c.tick), sr);
+            if at < until
+                && let Some(l) = last.get_mut(slot)
+                && at >= l.0
+            {
+                *l = (at, c.value);
+            }
+        }
+    }
+    for (slot, &(at, value)) in last.iter().enumerate() {
+        let kind = match slot {
+            BEND => CtrlKind::PitchBend,
+            PRESSURE => CtrlKind::ChannelPressure,
+            PROGRAM => CtrlKind::Program,
+            n => CtrlKind::Cc(u8::try_from(n).unwrap_or(0)),
+        };
+        if at != i64::MIN {
+            inst.plugin.midi(0, ctrl_message(kind, value, 0));
+        }
     }
 }
 
@@ -1478,7 +1654,7 @@ fn note_insert_latency(t: &Track, strip: &mut Strip, pos: Samples) {
         apply_params(slot, ins, t, i, pos);
         latency = latency.saturating_add(slot.plugin.latency());
     }
-    strip.latency = latency;
+    strip.latency = latency.min(MAX_LATENCY);
 }
 
 fn apply_params(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, t: &Track, i: usize, pos: Samples) {
@@ -1511,6 +1687,27 @@ fn apply_values(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, value: im
             slot.plugin.set_param(k, val);
             *last = val;
         }
+    }
+}
+
+fn transport_at(s: &Session, pos: Samples, playing: bool, recording: bool) -> Transport {
+    let sr = s.sample_rate;
+    let ticks = Some(s.tempo.samples_to_ticks_f(pos, sr)).filter(|t| t.is_finite()).unwrap_or(0.0);
+    let tick = ticks.floor() as i64;
+    let meter = s.tempo.meter_at_tick(tick);
+    let bar = s.tempo.bar_beat_at_tick(tick).bar;
+    let q = TICKS_PER_QUARTER as f64;
+    Transport {
+        playing,
+        recording,
+        tempo: s.tempo.tempo_at_tick(tick),
+        numerator: meter.numerator,
+        denominator: meter.denominator,
+        samples: pos,
+        seconds: pos as f64 / sr.as_f64().max(1.0),
+        quarters: ticks / q,
+        bar_start: s.tempo.bar_start_tick(bar) as f64 / q,
+        bar: bar - 1,
     }
 }
 
@@ -1834,86 +2031,103 @@ fn apply_matrix_span(src: &[Vec<f32>], span: std::ops::Range<usize>, dst: &mut [
     }
 }
 
-/// Ceiling on one offline render (samples summed over channels): 2^29 f32 = 2 GiB, about 93
-/// minutes of stereo at 48 kHz. Longer requests are truncated rather than exhausting memory.
+/// Ceiling on one in-memory offline render (samples summed over channels): 2^29 f32 = 2 GiB, about
+/// 93 minutes of stereo at 48 kHz. Longer requests are truncated rather than exhausting memory;
+/// [`RangeRender`] streams any length.
 pub const MAX_RENDER_SAMPLES: usize = 1 << 29;
 
 /// Offline render of the main mix over `range` (planar, [`main_channels`] channels in SMPTE/WAV
 /// order). The mix's delay-compensation latency is removed, so the result lines up with the
 /// timeline.
 pub fn render_range(s: &Session, range: Range, block: usize) -> Vec<Vec<f32>> {
-    let nch = main_channels(s);
+    render_in_memory(s, None, range, block)
+}
+
+/// Offline render of one bus over `range` (planar, the bus format's channel count).
+/// The compensation delay written onto the bus is removed (track inserts, and the aux returns
+/// when an aux returns onto it), so the bus lines up with the timeline. An unknown bus is silent.
+pub fn render_bus(s: &Session, bus: BusId, range: Range, block: usize) -> Vec<Vec<f32>> {
+    render_in_memory(s, Some(bus), range, block)
+}
+
+fn render_in_memory(s: &Session, bus: Option<BusId>, range: Range, block: usize) -> Vec<Vec<f32>> {
+    let nch = source_channels(s, bus);
     let len = usize::try_from(range.len().max(0)).unwrap_or(0).min(MAX_RENDER_SAMPLES / nch.max(1));
-    // Probe the latency with one block, then render `len + latency` and drop the head.
-    let latency = {
-        let mut probe = MixEngine::new(s.sample_rate.as_f64() as f32, block);
-        let b = probe.max_block();
-        let mut tmp = vec![vec![0.0f32; b]; nch];
-        probe.render(s, range.start, b.min(len.max(1)), &mut tmp);
-        probe.latency
-    };
-    let total = len.saturating_add(latency);
-    let mut out = vec![vec![0.0f32; total]; nch];
-    let mut eng = MixEngine::new(s.sample_rate.as_f64() as f32, block);
-    let b = eng.max_block();
-    let mut tmp = vec![vec![0.0f32; b]; nch];
-    let mut done = 0usize;
-    while done < total {
-        let n = (total - done).min(b);
-        eng.render(s, range.start + done as i64, n, &mut tmp);
-        for (o, t) in out.iter_mut().zip(tmp.iter()) {
-            if let (Some(d), Some(sr)) = (o.get_mut(done..done + n), t.get(..n)) {
-                d.copy_from_slice(sr);
-            }
-        }
-        done += n;
-    }
-    if latency > 0 {
-        for c in &mut out {
-            c.drain(..latency.min(c.len()));
+    let mut out: Vec<Vec<f32>> = (0..nch).map(|_| Vec::with_capacity(len)).collect();
+    let mut render = RangeRender::new(s, bus, Range::new(range.start, range.start + len as i64), block);
+    while let Some((chunk, n)) = render.next_block(s) {
+        for (o, c) in out.iter_mut().zip(chunk) {
+            o.extend_from_slice(c.get(..n).unwrap_or_default());
         }
     }
     out
 }
 
-/// Offline render of one bus over `range` (planar, the bus format's channel count).
-/// Track-insert compensation is removed, so a bus fed by tracks lines up with the timeline.
-/// An unknown bus is silent.
-pub fn render_bus(s: &Session, bus: BusId, range: Range, block: usize) -> Vec<Vec<f32>> {
-    let nch = s.bus(bus).map(|b| b.format.channels()).unwrap_or(0);
-    if nch == 0 {
-        return Vec::new();
+/// Channels of the main mix, or of `bus` (none for an unknown bus).
+pub fn source_channels(s: &Session, bus: Option<BusId>) -> usize {
+    match bus {
+        Some(id) => s.bus(id).map_or(0, |b| b.format.channels()),
+        None => main_channels(s),
     }
-    let len = usize::try_from(range.len().max(0)).unwrap_or(0).min(MAX_RENDER_SAMPLES / nch);
-    let latency = {
-        let mut probe = MixEngine::new(s.sample_rate.as_f64() as f32, block);
-        let b = probe.max_block();
-        probe.render(s, range.start, b.min(len.max(1)), &mut []);
-        probe.track_latency
-    };
-    let total = len.saturating_add(latency);
-    let mut out = vec![vec![0.0f32; total]; nch];
-    let mut eng = MixEngine::new(s.sample_rate.as_f64() as f32, block);
-    let b = eng.max_block();
-    let mut tmp = vec![vec![0.0f32; b]; nch];
-    let mut done = 0usize;
-    while done < total {
-        let n = (total - done).min(b);
-        eng.render(s, range.start + done as i64, n, &mut []);
-        eng.copy_bus(bus, n, &mut tmp);
-        for (o, t) in out.iter_mut().zip(tmp.iter()) {
-            if let (Some(d), Some(sr)) = (o.get_mut(done..done + n), t.get(..n)) {
-                d.copy_from_slice(sr);
+}
+
+/// [`render_range`] or [`render_bus`] of any length, a block at a time.
+pub struct RangeRender {
+    eng: MixEngine,
+    bus: Option<BusId>,
+    tmp: Vec<Vec<f32>>,
+    start: Samples,
+    done: usize,
+    total: usize,
+    latency: usize,
+}
+
+impl RangeRender {
+    /// Renders the main mix over `range`, or `bus` when one is named.
+    pub fn new(s: &Session, bus: Option<BusId>, range: Range, block: usize) -> Self {
+        let nch = source_channels(s, bus);
+        let eng = MixEngine::new(s.sample_rate.as_f64() as f32, block);
+        let tmp = vec![vec![0.0f32; eng.max_block()]; nch];
+        let len = if nch == 0 { 0 } else { usize::try_from(range.len().max(0)).unwrap_or(0) };
+        RangeRender { eng, bus, tmp, start: range.start, done: 0, total: len, latency: 0 }
+    }
+
+    fn render(&mut self, s: &Session, pos: Samples, n: usize) {
+        match self.bus {
+            Some(id) => {
+                self.eng.render(s, pos, n, &mut []);
+                self.eng.copy_bus(id, n, &mut self.tmp);
+            }
+            None => self.eng.render(s, pos, n, &mut self.tmp),
+        }
+    }
+
+    /// Renders one more block of the mix of `s` (the session given to [`RangeRender::new`]) and
+    /// returns it as `(channels, n)`: the next `n` samples of the range lead each channel (none
+    /// while the mix's latency is still being skipped). `None` once the range is done.
+    pub fn next_block(&mut self, s: &Session) -> Option<(&[Vec<f32>], usize)> {
+        if self.done >= self.total {
+            return None;
+        }
+        let n = (self.total - self.done).min(self.eng.max_block());
+        self.render(s, self.start + self.done as i64, n);
+        if self.done == 0 {
+            // The first block tells the mix's latency: render that much more and drop the head.
+            self.latency = match self.bus {
+                Some(b) => self.eng.bus_latency(b),
+                None => self.eng.latency,
+            };
+            self.total = self.total.saturating_add(self.latency);
+        }
+        let skip = self.latency.saturating_sub(self.done).min(n);
+        self.done += n;
+        if skip > 0 && skip < n {
+            for c in &mut self.tmp {
+                c.copy_within(skip..n, 0);
             }
         }
-        done += n;
+        Some((&self.tmp, n - skip))
     }
-    if latency > 0 {
-        for c in &mut out {
-            c.drain(..latency.min(c.len()));
-        }
-    }
-    out
 }
 
 /// ITU-R BS.775 stereo fold-down of planar audio in `fmt` (C and surrounds at -3 dB, LFE dropped;
@@ -2142,6 +2356,11 @@ mod tests {
 
     fn session_with_dc(level: f32, frames: usize) -> (Session, TrackId) {
         let mut s = Session::default();
+        let t = add_dc_track(&mut s, level, frames);
+        (s, t)
+    }
+
+    fn add_dc_track(s: &mut Session, level: f32, frames: usize) -> TrackId {
         let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
         let buf = AudioBuffer { sample_rate: 48_000, channels: vec![vec![level; frames]] };
         s.pool.insert(SourceId(900), Arc::new(SourceAudio::new(buf)));
@@ -2149,7 +2368,7 @@ mod tests {
         if let Some(pl) = s.track_mut(t).and_then(|t| t.playlist_mut()) {
             pl.clips.push(Clip::audio(id, "dc", SourceId(900), 0, 0, frames as i64));
         }
-        (s, t)
+        t
     }
 
     #[test]
@@ -2188,6 +2407,34 @@ mod tests {
     }
 
     #[test]
+    fn fade_curvature_reaches_the_rendered_audio() {
+        for fade_in in [true, false] {
+            for curvature in [-0.5, 0.0, 0.5] {
+                let (mut s, t) = session_with_dc(1.0, 8192);
+                s.track_mut(t).unwrap().mixer.pan = vec![-1.0];
+                let fade = soundcraft_model::Fade { len: 8192, shape: soundcraft_model::FadeShape::SCurve, curvature };
+                let c = &mut s.track_mut(t).unwrap().playlist_mut().unwrap().clips[0];
+                if fade_in {
+                    c.fade_in = fade;
+                } else {
+                    c.fade_out = fade;
+                }
+                let out = render_range(&s, Range::new(0, 8192), 512);
+                let expected = if curvature < 0.0 {
+                    0.2
+                } else if curvature > 0.0 {
+                    0.8
+                } else {
+                    0.5
+                };
+                assert!((out[0][4096] - expected).abs() < 1e-5, "{fade_in}, {curvature}: {} vs {expected}", out[0][4096]);
+                assert!(out[1][4096].abs() < 1e-6);
+                assert!(out[0][if fade_in { 0 } else { 8191 }].abs() < 1e-4);
+            }
+        }
+    }
+
+    #[test]
     fn pan_automation_does_not_depend_on_the_block_size() {
         // Bounces render in 1024-frame blocks, playback in whatever its callback asks for (#244).
         let (mut s, t) = session_with_dc(0.5, 4800);
@@ -2208,7 +2455,7 @@ mod tests {
         let (mut s, t) = session_with_dc(1.0, 48_000);
         {
             let c = &mut s.track_mut(t).unwrap().playlist_mut().unwrap().clips[0];
-            c.fade_in = soundcraft_model::Fade { len: 1000, shape: soundcraft_model::FadeShape::Linear };
+            c.fade_in = soundcraft_model::Fade { len: 1000, shape: soundcraft_model::FadeShape::Linear, curvature: 0.0 };
             c.gain_db = -6.0;
         }
         let out = render_range(&s, Range::new(0, 2000), 512);
@@ -2276,7 +2523,7 @@ mod tests {
         let _ = render_range(&s, Range::new(0, 4800), 512);
     }
 
-    /// A built-in gain behind a third-party id, with a state blob and a log of parameter sets.
+    /// A built-in gain behind a third-party id, with a log of parameter sets.
     struct Stateful {
         inner: Box<dyn Plugin>,
         blob: Vec<u8>,
@@ -2303,9 +2550,113 @@ mod tests {
         fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
             self.inner.process(io, frames);
         }
-        fn save_state(&mut self) -> Option<Vec<u8>> {
-            Some(self.blob.clone())
+        fn state_reader(&mut self) -> Option<Box<dyn soundcraft_dsp::PluginStateReader>> {
+            let blob = self.blob.clone();
+            Some(Box::new(move || Some(blob.clone())))
         }
+    }
+
+    struct Clock {
+        inner: Box<dyn Plugin>,
+        seen: Arc<std::sync::Mutex<Vec<Transport>>>,
+    }
+
+    impl Plugin for Clock {
+        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+            self.inner.info()
+        }
+        fn prepare(&mut self, sr: f32, mb: usize, ch: usize) {
+            self.inner.prepare(sr, mb, ch);
+        }
+        fn reset(&mut self) {
+            self.inner.reset();
+        }
+        fn set_param(&mut self, id: &str, v: f32) -> bool {
+            self.inner.set_param(id, v)
+        }
+        fn param(&self, id: &str) -> Option<f32> {
+            self.inner.param(id)
+        }
+        fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+            self.inner.process(io, frames);
+        }
+        fn set_transport(&mut self, t: &Transport) {
+            self.seen.lock().unwrap().push(*t);
+        }
+    }
+
+    #[test]
+    fn plugins_get_the_session_transport() {
+        let (mut s, t) = session_with_dc(0.5, 48_000 * 4);
+        s.tempo.set_tempo(0, 90.0).unwrap();
+        s.tempo.set_meter(0, 3, 4).unwrap();
+        s.track_mut(t).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.clock"));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let clock = Clock { inner: soundcraft_dsp::create("gain").unwrap(), seen: Arc::clone(&seen) };
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.clock".into(), ch: 1, plugin: Box::new(clock) }]);
+        render_block(&mut eng, &s, 96_000);
+        eng.monitor_only = true;
+        render_block(&mut eng, &s, 96_000);
+        let seen = seen.lock().unwrap();
+        let t0 = seen[0];
+        assert!(t0.playing && !t0.recording);
+        assert_eq!((t0.tempo, t0.numerator, t0.denominator, t0.samples, t0.bar), (90.0, 3, 4, 96_000, 1));
+        assert!((t0.seconds - 2.0).abs() < 1e-9 && (t0.quarters - 3.0).abs() < 1e-9 && (t0.bar_start - 3.0).abs() < 1e-9);
+        assert!(!seen[1].playing);
+    }
+
+    struct Ears {
+        inner: Box<dyn Plugin>,
+        heard: Arc<std::sync::Mutex<Vec<(usize, [u8; 3])>>>,
+    }
+
+    impl Plugin for Ears {
+        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+            self.inner.info()
+        }
+        fn prepare(&mut self, sr: f32, mb: usize, ch: usize) {
+            self.inner.prepare(sr, mb, ch);
+        }
+        fn reset(&mut self) {
+            self.inner.reset();
+        }
+        fn set_param(&mut self, id: &str, v: f32) -> bool {
+            self.inner.set_param(id, v)
+        }
+        fn param(&self, id: &str) -> Option<f32> {
+            self.inner.param(id)
+        }
+        fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+            self.inner.process(io, frames);
+        }
+        fn midi(&mut self, offset: usize, msg: [u8; 3]) {
+            self.heard.lock().unwrap().push((offset, msg));
+        }
+    }
+
+    #[test]
+    fn controllers_play_at_their_offsets_and_are_chased_after_a_seek() {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        s.track_mut(t).unwrap().instrument = Some(Insert::new("clap:test.ears"));
+        let cc = |tick, kind, value| soundcraft_midi::CtrlEvent { tick, channel: 0, kind, value };
+        let ctrls = vec![cc(4, CtrlKind::Cc(64), 127), cc(960, CtrlKind::PitchBend, -8192), cc(1920, CtrlKind::Cc(64), 0)];
+        let seq = soundcraft_midi::Sequence { ctrls, ..Default::default() };
+        let cid = s.new_clip_id();
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::midi(cid, "m", 0, 48_000 * 4, seq));
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ears = Ears { inner: soundcraft_dsp::create("gain").unwrap(), heard: Arc::clone(&heard) };
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.ears".into(), ch: 2, plugin: Box::new(ears) }]);
+        render_block(&mut eng, &s, 0);
+        assert_eq!(std::mem::take(&mut *heard.lock().unwrap()), vec![(0, [0xB0, 121, 0]), (100, [0xB0, 64, 127])]);
+        render_block(&mut eng, &s, 36_000);
+        assert_eq!(std::mem::take(&mut *heard.lock().unwrap()), vec![(0, [0xB0, 121, 0]), (0, [0xB0, 64, 127]), (0, [0xE0, 0, 0])]);
+        render_block(&mut eng, &s, 36_512);
+        assert!(heard.lock().unwrap().is_empty());
     }
 
     struct Keys {
@@ -2364,7 +2715,7 @@ mod tests {
     }
 
     #[test]
-    fn external_instances_are_adopted_retired_and_captured() {
+    fn external_instances_are_adopted_and_retired() {
         let (mut s, t) = session_with_dc(0.5, 48_000);
         let mut ins = Insert::new("clap:test.fake");
         ins.params.insert("gain".into(), -6.0);
@@ -2380,7 +2731,7 @@ mod tests {
         let sets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut gain = soundcraft_dsp::create("gain").unwrap();
         gain.prepare(48_000.0, 512, 1);
-        let fake = Stateful { inner: gain, blob: b"live state".to_vec(), sets: Arc::clone(&sets) };
+        let fake = Stateful { inner: gain, blob: Vec::new(), sets: Arc::clone(&sets) };
         // An instance for the wrong channel count is retired, not used.
         let wrong = Stateful { inner: soundcraft_dsp::create("gain").unwrap(), blob: Vec::new(), sets: Arc::clone(&sets) };
         eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.fake".into(), ch: 2, plugin: Box::new(wrong) }]);
@@ -2393,18 +2744,83 @@ mod tests {
         }
         assert!((wet / dry - 0.501).abs() < 0.01, "{wet} vs {dry}");
         assert!(sets.load(std::sync::atomic::Ordering::Relaxed) > 0, "no stored state: session params are pushed");
-        assert_eq!(eng.capture_states(), vec![(t, 0, b"live state".to_vec())]);
         assert!(eng.take_retired().is_empty());
         // Removing the insert retires the instance instead of dropping it here.
         s.track_mut(t).unwrap().mixer.inserts[0] = None;
         render_block(&mut eng, &s, 20 * 512);
         assert_eq!(eng.take_retired().len(), 1);
-        assert!(eng.capture_states().is_empty());
         // Instances nobody claims are retired too; drain_plugins empties the engine.
         eng.adopt(vec![PreparedInstance { track: t, slot: 3, id: "clap:x".into(), ch: 1, plugin: soundcraft_dsp::create("gain").unwrap() }]);
         render_block(&mut eng, &s, 21 * 512);
         assert_eq!(eng.take_retired().len(), 1);
         assert!(eng.drain_plugins().is_empty());
+    }
+
+    struct Nan(Box<dyn Plugin>);
+
+    impl Plugin for Nan {
+        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+            self.0.info()
+        }
+        fn prepare(&mut self, sr: f32, mb: usize, ch: usize) {
+            self.0.prepare(sr, mb, ch);
+        }
+        fn reset(&mut self) {
+            self.0.reset();
+        }
+        fn set_param(&mut self, id: &str, v: f32) -> bool {
+            self.0.set_param(id, v)
+        }
+        fn param(&self, id: &str) -> Option<f32> {
+            self.0.param(id)
+        }
+        fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+            io.iter_mut().for_each(|c| c.iter_mut().take(frames).for_each(|x| *x = f32::NAN));
+        }
+    }
+
+    fn nan(track: TrackId, slot: usize, ch: usize) -> Vec<PreparedInstance> {
+        vec![PreparedInstance { track, slot, id: "clap:test.nan".into(), ch, plugin: Box::new(Nan(soundcraft_dsp::create("gain").unwrap())) }]
+    }
+
+    #[test]
+    fn an_insert_that_puts_out_nan_is_taken_out_until_the_next_reset() {
+        let (mut s, a) = session_with_dc(0.5, 48_000);
+        let b = add_dc_track(&mut s, 0.5, 48_000);
+        s.track_mut(a).unwrap().mixer.inserts[2] = Some(Insert::new("clap:test.nan"));
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        let both = render_block(&mut eng, &s, 0);
+        eng.adopt(nan(a, 2, 1));
+        let only_b = render_block(&mut eng, &s, 512);
+        assert!(only_b > 0.3 && (only_b - both / 2.0).abs() < 1e-6, "{only_b} vs {both}");
+        assert_eq!(eng.meters[&a].plugin_failures, PluginFailures { count: 1, last: 2 });
+        assert_eq!(eng.meters[&b].plugin_failures, PluginFailures::default());
+        assert_eq!(render_block(&mut eng, &s, 1024), both);
+        eng.reset();
+        assert_eq!(render_block(&mut eng, &s, 1536), only_b);
+        assert_eq!(eng.meters[&a].plugin_failures.count, 2);
+    }
+
+    #[test]
+    fn nan_from_an_instrument_or_a_master_insert_is_contained() {
+        let mut s = synth_session(-6.0);
+        let synth = s.tracks[0].id;
+        s.track_mut(synth).unwrap().instrument = Some(Insert::new("clap:test.nan"));
+        let b = add_dc_track(&mut s, 0.5, 48_000);
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        eng.adopt(nan(synth, INSTRUMENT_SLOT, 2));
+        let only_b = render_block(&mut eng, &s, 0);
+        assert!(only_b > 0.3, "{only_b}");
+        assert_eq!(eng.meters[&synth].plugin_failures, PluginFailures { count: 1, last: INSTRUMENT_SLOT });
+        assert_eq!(eng.meters[&b].plugin_failures, PluginFailures::default());
+        let m = s.add_track(TrackKind::Master, ChannelFormat::Stereo, None);
+        s.track_mut(m).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.nan"));
+        eng.adopt(nan(m, 0, 2));
+        assert_eq!(render_block(&mut eng, &s, 512), 0.0);
+        assert_eq!(eng.meters[&m].plugin_failures, PluginFailures { count: 1, last: 0 });
+        assert_eq!(render_block(&mut eng, &s, 1024), only_b);
     }
 
     #[test]
@@ -2425,11 +2841,12 @@ mod tests {
         };
         eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.fake".into(), ch: 1, plugin: make(b"old") }]);
         render_block(&mut eng, &s, 0);
-        assert_eq!(eng.capture_states(), vec![(t, 0, b"old".to_vec())]);
+        assert!(eng.take_retired().is_empty());
         eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.fake".into(), ch: 1, plugin: make(b"new") }]);
         render_block(&mut eng, &s, 512);
-        assert_eq!(eng.capture_states(), vec![(t, 0, b"new".to_vec())]);
-        assert_eq!(eng.take_retired().len(), 1, "the old instance is retired");
+        let mut retired = eng.take_retired();
+        assert_eq!(retired.len(), 1, "the old instance is retired");
+        assert_eq!(retired[0].save_state(), Some(b"old".to_vec()), "the new instance stays");
     }
 
     #[test]
@@ -2567,6 +2984,81 @@ mod tests {
         s.track_mut(aux).unwrap().mixer.inserts[0].as_mut().unwrap().params.insert("lookahead".into(), 0.0);
         let zero = render(&s, 0, n as i64);
         assert_eq!(impulse_at(&zero[0]), impulse_at(&control[0]));
+    }
+
+    #[test]
+    fn offline_renders_line_up_with_the_timeline_in_any_block_size() {
+        let mut s = Session::default();
+        let mut imp = vec![0.0f32; 48_000];
+        imp[1000] = 1.0;
+        s.pool.insert(SourceId(900), Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![imp] })));
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let bus = s.add_bus("Stem", ChannelFormat::Stereo);
+        let cid = s.new_clip_id();
+        let tr = s.track_mut(t).unwrap();
+        tr.playlist_mut().unwrap().clips.push(Clip::audio(cid, "i", SourceId(900), 0, 0, 48_000));
+        tr.mixer.inserts[0] = Some(Insert::new("maximizer"));
+        let mut send = soundcraft_model::SendSlot::new(Route::Bus(bus));
+        send.level_db = 0.0;
+        tr.mixer.sends[0] = Some(send);
+        let latency = soundcraft_dsp::create("maximizer").unwrap().latency();
+        assert!(latency > 16);
+        for source in [None, Some(bus)] {
+            for block in [16, 100, 512] {
+                let mut got = Vec::new();
+                let mut skipped = 0;
+                let mut render = RangeRender::new(&s, source, Range::new(900, 2900), block);
+                while let Some((chunk, n)) = render.next_block(&s) {
+                    assert!(n <= block);
+                    skipped += usize::from(n == 0);
+                    got.extend_from_slice(&chunk[0][..n]);
+                }
+                assert_eq!(got.len(), 2000, "{source:?} block {block}");
+                assert_eq!(skipped, latency / block, "{source:?} block {block}");
+                let peak = got.iter().enumerate().max_by(|a, b| a.1.abs().total_cmp(&b.1.abs())).map(|(i, _)| i);
+                assert_eq!(peak, Some(100), "{source:?} block {block}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_plugins_bogus_latency_is_capped() {
+        struct Latent(Box<dyn Plugin>);
+        impl Plugin for Latent {
+            fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+                self.0.info()
+            }
+            fn prepare(&mut self, sr: f32, mb: usize, ch: usize) {
+                self.0.prepare(sr, mb, ch);
+            }
+            fn reset(&mut self) {
+                self.0.reset();
+            }
+            fn set_param(&mut self, id: &str, v: f32) -> bool {
+                self.0.set_param(id, v)
+            }
+            fn param(&self, id: &str) -> Option<f32> {
+                self.0.param(id)
+            }
+            fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+                self.0.process(io, frames);
+            }
+            fn latency(&self) -> usize {
+                u32::MAX as usize
+            }
+        }
+        let (mut s, t) = session_with_dc(0.5, 48_000);
+        let aux = s.add_track(TrackKind::Aux, ChannelFormat::Mono, None);
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        for track in [t, aux] {
+            s.track_mut(track).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.latent"));
+            let mut gain = soundcraft_dsp::create("gain").unwrap();
+            gain.prepare(48_000.0, 512, 1);
+            eng.adopt(vec![PreparedInstance { track, slot: 0, id: "clap:test.latent".into(), ch: 1, plugin: Box::new(Latent(gain)) }]);
+        }
+        render_block(&mut eng, &s, 0);
+        assert_eq!((eng.track_latency, eng.latency), (MAX_LATENCY, 2 * MAX_LATENCY));
     }
 
     #[test]

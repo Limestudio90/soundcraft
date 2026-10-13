@@ -217,37 +217,63 @@ pub fn pan_text(v: f32) -> String {
     }
 }
 
-/// Vertical LED peak meter with green/yellow/red zones; values are linear peaks.
+/// The dB marks of a meter's scale, also ruled across its bar.
+const METER_MARKS: [f32; 8] = [0.0, -5.0, -10.0, -15.0, -20.0, -30.0, -40.0, -60.0];
+
+/// The bar of a [`meter`] drawn in `r`, below its clip light.
+fn meter_bar(r: Rect) -> Rect {
+    Rect::from_min_max(pos2(r.min.x + 1.0, r.min.y + 5.0), pos2(r.max.x - 1.0, r.max.y - 1.0))
+}
+
+/// The marks that fit on `bar`, at least 9 pt apart from the top down, with their heights.
+fn meter_marks(bar: Rect) -> impl Iterator<Item = (f32, f32)> {
+    let mut last = f32::NEG_INFINITY;
+    METER_MARKS.into_iter().filter_map(move |db| {
+        let y = bar.max.y - bar.height() * meter_pos(db);
+        (y - last >= 9.0).then(|| {
+            last = y;
+            (db, y)
+        })
+    })
+}
+
+/// Vertical peak meter as Pro Tools draws it: a clip light above a bar that lights green, yellow
+/// and red over dark tints of those zones, ruled at the scale's marks. Values are linear peaks.
 pub fn meter(ui: &Ui, r: Rect, level: f32, hold: f32, clip: bool) {
     let t = Tokens::current();
     let p = ui.painter();
-    p.rect_filled(r, 0.0, t.meter_bg);
-    let h = r.height() - 4.0;
-    let inner = Rect::from_min_max(pos2(r.min.x + 1.0, r.min.y + 3.0), pos2(r.max.x - 1.0, r.max.y - 1.0));
-    let lv = level_pos(level);
+    p.rect_filled(Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + 3.0)), 1.0, if clip { t.meter_red } else { t.meter_clip_off });
+    p.rect_filled(Rect::from_min_max(pos2(r.min.x, r.min.y + 4.0), r.max), 0.0, t.meter_bg);
+    let bar = meter_bar(r);
+    let y = |pos: f32| bar.max.y - bar.height() * pos;
     let (amber, red) = (meter_pos(-12.0), meter_pos(-3.0));
-    let mut leds = Mesh::default();
-    for i in 0..(h / 3.0).clamp(0.0, 1000.0) as usize {
-        let y = inner.max.y - i as f32 * 3.0;
-        let f = (i as f32 * 3.0 + 1.0) / h;
-        let zone = if f > red {
-            t.meter_red
-        } else if f > amber {
-            t.meter_yellow
-        } else {
-            t.meter_green
-        };
-        let col = if f <= lv { zone } else { zone.gamma_multiply(0.1) };
-        quad(&mut leds, Rect::from_x_y_ranges(inner.x_range(), y - 2.0..=y), [col; 4]);
+    let zones = [(0.0, amber, t.meter_green), (amber, red, t.meter_yellow), (red, 1.0, t.meter_red)];
+    let lit = level_pos(level);
+    let unlit = if t.meter_bg.intensity() > 0.5 { 0.08 } else { 0.18 };
+    let mut mesh = Mesh::default();
+    for (lo, hi, color) in zones {
+        let top = lit.clamp(lo, hi);
+        quad(&mut mesh, Rect::from_x_y_ranges(bar.x_range(), y(top)..=y(lo)), [color; 4]);
+        quad(&mut mesh, Rect::from_x_y_ranges(bar.x_range(), y(hi)..=y(top)), [color.gamma_multiply(unlit); 4]);
     }
-    p.add(leds);
-    let hv = level_pos(hold);
-    if hv > 0.01 {
-        let y = inner.max.y - h * hv;
-        p.line_segment([pos2(inner.min.x, y), pos2(inner.max.x, y)], Stroke::new(1.0, if hv > red { t.meter_red } else { t.meter_yellow }));
+    p.add(mesh);
+    for (_, at) in meter_marks(bar).skip(1) {
+        p.hline(bar.x_range(), p.round_to_pixel_center(at), Stroke::new(1.0, Color32::from_black_alpha(90)));
     }
-    let clip_r = Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + 2.5));
-    p.rect_filled(clip_r, 0.0, if clip { t.meter_red } else { t.meter_clip_off });
+    let held = level_pos(hold);
+    if held > 0.01 {
+        let color = zones.iter().find(|z| held <= z.1).map_or(t.meter_red, |z| z.2);
+        p.rect_filled(Rect::from_x_y_ranges(bar.x_range(), y(held) - 1.0..=y(held) + 1.0), 0.0, color);
+    }
+}
+
+/// The dB scale of a [`meter`] drawn in `r`, its numbers ending at `x`.
+pub fn meter_scale(p: &Painter, r: Rect, x: f32) {
+    let t = Tokens::current();
+    for (db, y) in meter_marks(meter_bar(r)) {
+        p.text(pos2(x - 3.0, y), Align2::RIGHT_CENTER, format!("{}", db.abs()), regular(8.0), t.text_dim);
+        p.hline(x - 2.0..=x, y, Stroke::new(1.0, t.text_dim.gamma_multiply(0.7)));
+    }
 }
 
 /// A linear peak → 0..1 meter position.
@@ -284,36 +310,48 @@ pub fn clip_gain_to_pos(db: f32) -> f32 {
     if db >= -36.0 { 0.25 + (db + 36.0) / 72.0 * 0.75 } else { (1.0 - ((-36.0 - db) / 108.0).powf(1.0 / 1.5)) * 0.25 }
 }
 
+const FADER_CAP_H: f32 = 40.0;
+
+/// The travel of a [`fader`] drawn in `r`: its cap's centre runs from the bottom (-inf) to the
+/// top (+12 dB).
+pub fn fader_slot(r: Rect) -> Rect {
+    Rect::from_center_size(r.center(), vec2(4.0, r.height() - FADER_CAP_H))
+}
+
 /// A fader: returns the new dB value when dragged. `db` in -144..12.
 pub fn fader(ui: &mut Ui, r: Rect, db: f32, id: egui::Id) -> Option<f32> {
     let t = Tokens::current();
     let resp = ui.interact(r, id, Sense::click_and_drag());
     let p = ui.painter();
-    let cap_size = vec2((r.width() * 0.44).clamp(16.0, 24.0), 34.0);
-    let slot = Rect::from_center_size(r.center(), vec2(5.0, r.height() - cap_size.y));
+    let slot = fader_slot(r);
+    let cap_w = (r.width() * 0.4).clamp(16.0, 18.0);
     p.rect_filled(slot, 2.0, t.fader_track);
     p.vline(slot.min.x + 0.5, slot.min.y + 1.0..=slot.max.y - 1.0, Stroke::new(1.0, Color32::from_black_alpha(120)));
     p.vline(slot.max.x + 0.5, slot.min.y + 2.0..=slot.max.y - 2.0, Stroke::new(1.0, Color32::from_white_alpha(18)));
+    let numbers_x = slot.center().x - cap_w * 0.5 - 1.0;
+    let mut last = f32::NEG_INFINITY;
     for mark in [12.0f32, 6.0, 0.0, -5.0, -10.0, -15.0, -20.0, -30.0, -40.0, -60.0] {
         let y = slot.max.y - slot.height() * soundcraft_model::fader_db_to_pos(mark);
-        let x = p.text(pos2(r.min.x, y), Align2::LEFT_CENTER, format!("{}", mark.abs()), regular(8.0), t.text_dim).max.x + 2.0;
-        if x < slot.min.x - 3.0 {
-            p.hline(x..=slot.min.x - 3.0, y, Stroke::new(1.0, t.text_dim.gamma_multiply(0.7)));
+        p.hline(slot.min.x - 6.0..=slot.min.x - 2.0, y, Stroke::new(1.0, t.text_dim.gamma_multiply(0.7)));
+        if numbers_x - r.min.x >= 10.0 && y - last >= 9.0 {
+            p.text(pos2(numbers_x, y), Align2::RIGHT_CENTER, format!("{}", mark.abs()), regular(8.0), t.text_dim);
+            last = y;
         }
     }
     let pos = soundcraft_model::fader_db_to_pos(db);
     let y = slot.max.y - slot.height() * pos;
-    let cap = Rect::from_center_size(pos2(slot.center().x, y), cap_size);
+    let cap = Rect::from_center_size(pos2(slot.center().x, y), vec2(cap_w, FADER_CAP_H));
     p.rect_filled(cap.translate(vec2(0.0, 2.0)).expand(1.0), 4.0, Color32::from_black_alpha(80));
     let g = Color32::from_gray;
-    vgradient(p, cap.shrink(1.0), g(226), g(146));
-    p.rect_stroke(cap, 3.0, Stroke::new(1.0, g(34)), StrokeKind::Inside);
-    for dy in [-10.0, -7.0, 7.0, 10.0] {
-        let x = cap.min.x + 3.0..=cap.max.x - 3.0;
-        p.hline(x.clone(), cap.center().y + dy, Stroke::new(1.0, Color32::from_black_alpha(50)));
-        p.hline(x, cap.center().y + dy + 1.0, Stroke::new(1.0, Color32::from_white_alpha(90)));
+    p.rect_filled(cap, 3.0, g(34));
+    let face = cap.shrink(1.0);
+    rounded_vgradient(p, face, 2.0, g(236), g(104));
+    vgradient(p, Rect::from_x_y_ranges(face.x_range(), y + 1.0..=face.max.y - 2.0), g(214), g(150));
+    p.hline(face.min.x + 2.0..=face.max.x - 2.0, face.min.y + 1.5, Stroke::new(1.0, Color32::from_white_alpha(110)));
+    p.hline(face.x_range(), y, Stroke::new(2.0, g(30)));
+    for (x, dx) in [(cap.min.x, 2.5), (cap.max.x, -2.5)] {
+        p.add(egui::Shape::convex_polygon(vec![pos2(x, y - 3.0), pos2(x + dx, y), pos2(x, y + 3.0)], g(34), Stroke::NONE));
     }
-    p.hline(cap.min.x + 1.0..=cap.max.x - 1.0, cap.center().y, Stroke::new(2.0, g(24)));
     if resp.double_clicked() || (resp.clicked() && ui.input(|i| i.modifiers.alt)) {
         return Some(0.0);
     }
@@ -461,9 +499,140 @@ pub fn multi_meter(ui: &Ui, r: Rect, levels: &[f32], labels: &[String], clip: bo
     }
 }
 
+/// egui's checkbox, plus drag-to-set (#399): press one box and drag over its neighbours, and each
+/// box the pointer passes takes the state the first one switched to. A click toggles one box.
+pub fn checkbox(ui: &mut Ui, on: &mut bool, label: impl Into<egui::WidgetText>) -> Response {
+    // egui's own toggle works on a copy: `drag_toggle` decides clicks and drags alike.
+    let mut copy = *on;
+    let mut resp = ui.checkbox(&mut copy, label.into()).interact(Sense::drag());
+    if drag_toggle(ui, &resp, on) {
+        resp.mark_changed();
+    }
+    resp
+}
+
+/// The new state lives in the egui context from the first box's drag start until the button is
+/// released. Returns whether `on` changed.
+fn drag_toggle(ui: &Ui, resp: &Response, on: &mut bool) -> bool {
+    let ctx = ui.ctx();
+    let key = egui::Id::new("soundcraft-checkbox-drag-target");
+    if !ctx.input(|i| i.pointer.primary_down()) {
+        ctx.data_mut(|d| d.remove::<bool>(key));
+    }
+    if resp.drag_started_by(egui::PointerButton::Primary) {
+        *on = !*on;
+        ctx.data_mut(|d| d.insert_temp(key, *on));
+        return true;
+    }
+    if resp.clicked() {
+        *on = !*on;
+        return true;
+    }
+    let Some(target) = ctx.data(|d| d.get_temp::<bool>(key)) else { return false };
+    // Clipped and layer-aware: rows scrolled out of view or under another window stay as they are.
+    if ui.rect_contains_pointer(resp.rect) && *on != target {
+        *on = target;
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::{clip_gain_from_pos, clip_gain_to_pos};
+    use egui::{Event, Modifiers, PointerButton, Pos2};
+    use egui_kittest::{Harness, kittest::Queryable};
+
+    fn press(h: &mut Harness<'_, [bool; 4]>, pos: Pos2, pressed: bool) {
+        h.event(Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE });
+        h.run_steps(2);
+    }
+
+    fn boxes() -> (Harness<'static, [bool; 4]>, Vec<Pos2>) {
+        let mut h = Harness::new_ui_state(
+            |ui, s: &mut [bool; 4]| {
+                ui.vertical(|ui| {
+                    for b in s.iter_mut() {
+                        super::checkbox(ui, b, "Box");
+                    }
+                });
+            },
+            [false, true, false, false],
+        );
+        h.run();
+        let at = h.get_all_by_label("Box").map(|n| n.rect().center()).collect();
+        (h, at)
+    }
+
+    /// #399: pressing a box and dragging over its neighbours sets them all to the state the first
+    /// one switched to; the box past the drag stays as it was.
+    #[test]
+    fn dragging_across_checkboxes_sets_them_all_like_the_first() {
+        let (mut h, at) = boxes();
+        assert_eq!(at.len(), 4);
+        h.event(Event::PointerMoved(at[0]));
+        h.run_steps(1);
+        press(&mut h, at[0], true);
+        for p in &at[1..3] {
+            h.event(Event::PointerMoved(*p));
+            h.run_steps(2);
+        }
+        press(&mut h, at[2], false);
+        assert_eq!(*h.state(), [true, true, true, false]);
+    }
+
+    /// Dragging from a checked box unchecks; after release, moving over boxes changes nothing.
+    #[test]
+    fn dragging_from_a_checked_box_unchecks_and_release_ends_it() {
+        let (mut h, at) = boxes();
+        h.state_mut().copy_from_slice(&[true, true, true, true]);
+        h.run();
+        h.event(Event::PointerMoved(at[1]));
+        h.run_steps(1);
+        press(&mut h, at[1], true);
+        h.event(Event::PointerMoved(at[2]));
+        h.run_steps(2);
+        press(&mut h, at[2], false);
+        h.event(Event::PointerMoved(at[3]));
+        h.run_steps(2);
+        assert_eq!(*h.state(), [true, false, false, true]);
+    }
+
+    /// A row scrolled out of view isn't set when the drag passes over the place it would be.
+    #[test]
+    fn dragging_past_a_scroll_area_leaves_hidden_rows_alone() {
+        let mut h = Harness::new_ui_state(
+            |ui, s: &mut [bool; 4]| {
+                egui::ScrollArea::vertical().max_height(30.0).show(ui, |ui| {
+                    for b in s.iter_mut() {
+                        super::checkbox(ui, b, "Box");
+                    }
+                });
+            },
+            [false; 4],
+        );
+        h.run();
+        let at: Vec<Pos2> = h.get_all_by_label("Box").map(|n| n.rect().center()).collect();
+        assert_eq!(at.len(), 4);
+        h.event(Event::PointerMoved(at[0]));
+        h.run_steps(1);
+        press(&mut h, at[0], true);
+        h.event(Event::PointerMoved(at[3]));
+        h.run_steps(2);
+        press(&mut h, at[3], false);
+        assert_eq!(*h.state(), [true, false, false, false]);
+    }
+
+    /// A click still toggles just the one box, once.
+    #[test]
+    fn a_click_toggles_one_checkbox() {
+        let (mut h, at) = boxes();
+        h.event(Event::PointerMoved(at[1]));
+        h.run_steps(1);
+        press(&mut h, at[1], true);
+        press(&mut h, at[1], false);
+        assert_eq!(*h.state(), [false, false, false, false]);
+    }
 
     #[test]
     fn clip_gain_taper_spans_minus_144_to_plus_36_and_round_trips() {

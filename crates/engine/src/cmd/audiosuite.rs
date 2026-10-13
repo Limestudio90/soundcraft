@@ -4,7 +4,7 @@ use super::*;
 use crate::cmd;
 use serde_json::json;
 use soundcraft_audio_io::{AudioBuffer, FileFormat};
-use soundcraft_model::{Clip, ClipContent};
+use soundcraft_model::{Clip, ClipContent, TrackKind};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![cmd!(
@@ -12,7 +12,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "AudioSuite Process",
         [],
         None,
-        "{process: <plugin id> | normalize | reverse | invert | gain | duplicate | time_stretch | pitch_shift | varispeed | signal_generator, params?: {..}, clips?}",
+        "{process: <plugin id> | normalize | reverse | invert | gain | duplicate | time_stretch | pitch_shift | varispeed | signal_generator, params?: {..}, clips?, tracks?, start?, end?} — signal_generator fills start..end (default: the selection) with a new clip on each audio track in `tracks` (default: the selected tracks)",
         has_selection,
         process
     )]
@@ -34,6 +34,12 @@ fn process(e: &mut Engine, p: &Value) -> Result<Value> {
         );
     if !known {
         return Err(bad("audiosuite.process", format!("unknown process `{name}`")));
+    }
+    if soundcraft_dsp::is_generator(&name) && p.get("clips").is_none() && p.get("clip").is_none() {
+        let r = range_param(e, "audiosuite.process", p)?;
+        if !r.is_empty() {
+            return generate(e, p, &name, &params, r);
+        }
     }
     let ids = clip_ids_param(e, p);
     if ids.is_empty() {
@@ -95,12 +101,7 @@ fn process(e: &mut Engine, p: &Value) -> Result<Value> {
             "pitch_shift" => soundcraft_dsp::offline::pitch_shift(&audio, semitones, srf),
             "varispeed" => soundcraft_dsp::offline::resample(&audio, sr.hz(), to),
             plugin => {
-                let Some(mut pl) = soundcraft_dsp::create(plugin) else { return Err(bad("audiosuite.process", format!("cannot create `{plugin}`"))) };
-                pl.prepare(srf, 1024, audio.len().max(1));
-                for (k, v) in &params {
-                    pl.set_param(k, *v);
-                }
-                soundcraft_dsp::offline::apply_plugin(&mut audio, pl.as_mut(), srf);
+                apply(plugin, &params, &mut audio, srf)?;
                 audio
             }
         };
@@ -129,6 +130,46 @@ fn process(e: &mut Engine, p: &Value) -> Result<Value> {
         done += 1;
     }
     Ok(json!({"processed": done, "process": name}))
+}
+
+/// Fill `r` on each selected audio track with a new clip from the generator `name`, over
+/// whatever was there, like Pro Tools' Signal Generator.
+fn generate(e: &mut Engine, p: &Value, name: &str, params: &[(String, f32)], r: Range) -> Result<Value> {
+    let sr = e.session().sample_rate;
+    let tracks = tracks_param(e, "audiosuite.process", p)?;
+    // Refuse before generating anything, rather than cut the clip short.
+    for t in tracks.iter().filter_map(|t| e.session().track(*t)).filter(|t| t.kind == TrackKind::Audio) {
+        crate::io::refuse_longer(e.session(), "audiosuite.process", &t.name, "generate on", r.len(), crate::io::render_limit(t.channels()))?;
+    }
+    let mut clips = Vec::new();
+    for track in tracks {
+        let Some(t) = e.session().track(track).filter(|t| t.kind == TrackKind::Audio) else { continue };
+        let channels = t.channels().max(1);
+        let frames = usize::try_from(r.len()).unwrap_or(0).min(crate::io::render_limit(channels));
+        let clip_name = format!("{}-{}", t.name, short(name));
+        let mut audio = vec![vec![0.0; frames]; channels];
+        apply(name, params, &mut audio, sr.as_f64() as f32)?;
+        let s = e.session_mut();
+        let src = crate::io::add_source(s, &clip_name, AudioBuffer { sample_rate: sr.hz(), channels: audio }, None, FileFormat::Wav);
+        let id = s.new_clip_id();
+        crate::edit::place_clip(s, track, Clip::audio(id, &clip_name, src, 0, r.start, i64::try_from(frames).unwrap_or(0)));
+        clips.push(id.0);
+    }
+    if clips.is_empty() {
+        return Err(bad("audiosuite.process", "select an audio track to generate on"));
+    }
+    Ok(json!({"processed": clips.len(), "process": name, "clips": clips}))
+}
+
+/// Run plugin `id` with `params` over `audio`, in place.
+fn apply(id: &str, params: &[(String, f32)], audio: &mut [Vec<f32>], srf: f32) -> Result<()> {
+    let Some(mut pl) = soundcraft_dsp::create(id) else { return Err(bad("audiosuite.process", format!("cannot create `{id}`"))) };
+    pl.prepare(srf, 1024, audio.len().max(1));
+    for (k, v) in params {
+        pl.set_param(k, *v);
+    }
+    soundcraft_dsp::offline::apply_plugin(audio, pl.as_mut(), srf);
+    Ok(())
 }
 
 fn short(n: &str) -> String {
@@ -173,5 +214,29 @@ mod tests {
         assert_eq!(c.gain_env, vec![(0, 0.0), (32, -12.0)]);
         let sample = e.session().pool.get(c.source().unwrap()).unwrap().buffer.channels[0][0];
         assert!((sample - 0.5).abs() < 1e-3, "duplicate keeps the file level and the clip gain, got {sample}");
+    }
+
+    #[test]
+    fn signal_generator_fills_the_selection_with_a_clip() {
+        let (mut e, _) = gained_clip();
+        let tone = e.session().tracks[0].id;
+        let t = e.session_mut().add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("Empty"));
+        e.execute("edit.select", &json!({"tracks": [t.0], "start": 48_000, "end": 96_000})).unwrap();
+        assert!(matches!(e.execute("audiosuite.process", &json!({"process": "normalize"})), Err(crate::EngineError::BadParams(..))));
+
+        let generator = json!({"process": "signal_generator", "params": {"freq": 440.0, "level": -6.0}});
+        assert_eq!(e.execute("audiosuite.process", &generator).unwrap()["processed"], 1);
+        let c = e.session().tracks[1].clips()[0].clone();
+        assert_eq!((c.start, c.length), (48_000, 48_000));
+        let buf = &e.session().pool.get(c.source().unwrap()).unwrap().buffer;
+        assert_eq!(buf.channels.len(), 2);
+        let peak = buf.channels[1].iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!((peak - 0.5).abs() < 0.01, "-6 dB sine peaks near 0.5, got {peak}");
+
+        // Over existing audio it replaces just the selection.
+        e.execute("edit.select", &json!({"tracks": [tone.0], "start": 32, "end": 96})).unwrap();
+        e.execute("audiosuite.process", &generator).unwrap();
+        let ranges: Vec<_> = e.session().tracks[0].clips().iter().map(|c| (c.start, c.length)).collect();
+        assert_eq!(ranges, vec![(0, 32), (32, 64)]);
     }
 }

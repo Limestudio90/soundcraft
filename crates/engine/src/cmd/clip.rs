@@ -153,8 +153,13 @@ pub fn specs() -> Vec<CommandSpec> {
                     Some(_) => return Err(bad("clip.place_source", "audio files go on audio tracks")),
                     None => s.add_track(soundcraft_model::TrackKind::Audio, soundcraft_model::ChannelFormat::for_channels(chans.min(2)), Some(&name)),
                 };
+                let (sh, len) = (s.edit.edit_mode == soundcraft_model::EditMode::Shuffle, frames.max(1));
+                let at = if sh { crate::edit::shuffle_slot(s, t, at, &[]) } else { at };
+                if sh {
+                    crate::edit::make_room(s, t, at, len).map_err(|why| bad("clip.place_source", why))?;
+                }
                 let id = s.new_clip_id();
-                crate::edit::place_clip(s, t, soundcraft_model::Clip::audio(id, name, src, 0, at, frames.max(1)));
+                crate::edit::place_clip(s, t, soundcraft_model::Clip::audio(id, name, src, 0, at, len));
                 Ok(json!({"clip": id, "track": t}))
             }
         ),
@@ -302,7 +307,7 @@ fn loop_clips(e: &mut Engine, p: &Value) -> Result<Value> {
             copies.push((c.start + c.length * k, nc));
         }
         for (at, nc) in copies {
-            crate::edit::paste(s, tid, at, &[nc], c.length, false);
+            let _ = crate::edit::paste(s, tid, at, &[nc], c.length, false);
             made += 1;
         }
     }
@@ -346,14 +351,11 @@ fn nudge_gain(e: &mut Engine, p: &Value, db: f64) -> Result<Value> {
 fn quantize_to_grid(e: &mut Engine, p: &Value) -> Result<Value> {
     let ids = clip_ids_param(e, p);
     let s = e.session();
-    let moves: Vec<(soundcraft_model::ClipId, i64)> = ids
-        .iter()
-        .filter_map(|id| s.find_clip(*id).map(|(_, c)| (*id, c.start + c.sync_point)))
-        .map(|(id, anchor)| (id, s.edit.grid.snap(anchor, s.sample_rate, &s.tempo, s.frame_rate) - anchor))
-        .collect();
+    let moves: Vec<(soundcraft_model::ClipId, i64)> =
+        ids.iter().filter_map(|id| s.find_clip(*id).map(|(_, c)| (*id, crate::edit::grid_delta(s, c, 0, false)))).collect();
     let s = e.session_mut();
     for (id, d) in &moves {
-        crate::edit::move_clips(s, &[*id], *d, None);
+        crate::edit::move_clips(s, &[*id], *d, &[]);
     }
     Ok(json!({"clips": moves.len()}))
 }

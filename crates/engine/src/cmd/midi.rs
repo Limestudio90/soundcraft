@@ -26,10 +26,6 @@ pub fn specs() -> Vec<CommandSpec> {
     ]
 }
 
-fn clip_id(p: &Value, cmd: &str) -> Result<ClipId> {
-    p.get("clip").and_then(Value::as_u64).map(ClipId).ok_or_else(|| bad(cmd, "`clip` id required"))
-}
-
 fn seq_mut<'a>(e: &'a mut Engine, id: ClipId, cmd: &str) -> Result<&'a mut Sequence> {
     match e.session_mut().find_clip_mut(id).map(|c| &mut c.content) {
         Some(ClipContent::Midi { sequence }) => Ok(sequence),

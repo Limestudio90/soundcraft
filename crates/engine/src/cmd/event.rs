@@ -176,7 +176,8 @@ fn cut_time(e: &mut Engine, p: &Value) -> Result<Value> {
     let s = e.session_mut();
     let ids: Vec<_> = s.tracks.iter().map(|t| t.id).collect();
     for t in ids {
-        crate::edit::clear_range(s, t, r, true);
+        crate::edit::clear_range(s, t, r, false);
+        crate::edit::shift_from(s, t, r.end, -r.len());
         if let Some(tr) = s.track_mut(t) {
             for l in &mut tr.automation {
                 l.clear_range(r.start, r.end);

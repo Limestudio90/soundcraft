@@ -25,13 +25,15 @@
 //! component state is accepted too) and re-reads the parameter values.
 //!
 //! Plugin editors (`IPlugView`): on macOS the view is attached to the content `NSView` of a host
-//! `NSWindow` (titled and closable, floating above the app, resized on `IPlugFrame::resizeView`).
+//! `NSWindow` (titled and closable, floating above the app, resized on `IPlugFrame::resizeView`);
+//! on Windows it is attached to a host `HWND` owned by the app's window (no taskbar button,
+//! closing it hides it until the link tears it down).
 //! [`Plugin::open_editor`] opens it directly; [`Plugin::editor`] returns a handle usable on the
 //! main thread while the instance processes on the audio thread (VST3's own threading model:
 //! the controller and its views live on the UI thread). Parameter edits made in the editor
 //! (`IComponentHandler::performEdit`) are reported by the handle's `idle` so the host can write
-//! them into the session. Windows (HWND) and Linux (X11) editor windows are not hosted yet:
-//! opening reports "unsupported".
+//! them into the session. Linux (X11) editor windows are not hosted yet: opening reports
+//! "unsupported".
 //!
 //! Not hosted yet: `IMessage`/`IAttributeList` creation through the host (plugins that need it
 //! for processor ↔ controller messaging may lose those messages), sidechain (aux buses are kept
@@ -114,6 +116,9 @@ pub enum Vst3Error {
 mod api {
     use super::*;
 
+    pub fn cached() -> Option<Vec<Vst3Descriptor>> {
+        registry::cached()
+    }
     pub fn scan() -> Vec<Vst3Descriptor> {
         registry::scan()
     }
@@ -144,6 +149,9 @@ mod api {
 mod api {
     use super::*;
 
+    pub fn cached() -> Option<Vec<Vst3Descriptor>> {
+        Some(Vec::new())
+    }
     pub fn scan() -> Vec<Vst3Descriptor> {
         Vec::new()
     }
@@ -189,6 +197,11 @@ pub fn add_search_dir(dir: &Path) -> usize {
 /// Scans the given folders without touching the cache.
 pub fn scan_paths(dirs: &[PathBuf]) -> Vec<Vst3Descriptor> {
     api::scan_paths(dirs)
+}
+
+/// The plugins of the last scan, without scanning: `None` until something has scanned.
+pub fn cached() -> Option<Vec<Vst3Descriptor>> {
+    api::cached()
 }
 
 /// Shuts plugin hosting down: runs the module exit of every loaded binary that has no live

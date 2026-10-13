@@ -232,3 +232,30 @@ fn the_piano_roll_leaves_modified_arrows_to_the_shortcuts() {
     frame(&mut app, keys(Key::ArrowUp, Modifiers::NONE));
     assert_eq!(pitch(&app), before + 1);
 }
+
+#[test]
+fn shift_tab_extends_the_selection_and_tab_to_transient_stops_on_hits() {
+    for (os, cmd) in OSES {
+        let (ctx, mut app) = rig(os);
+        let sel = |app: &SoundApp| {
+            let r = app.engine.session().edit.selection;
+            (r.start, r.end)
+        };
+        let clip = app.engine.session().track_by_name("Kick").unwrap().clips()[0].range();
+        let mid = clip.start + clip.len() / 2;
+        app.run("edit.select", json!({"tracks": ["Kick"], "start": mid, "end": mid})).unwrap();
+        press(&ctx, &mut app, Key::Tab, Modifiers::SHIFT);
+        assert_eq!(sel(&app), (mid, clip.end), "{os:?}");
+        let back_extend = if os == OperatingSystem::Mac { ALT_SHIFT } else { Modifiers { shift: true, ..cmd } };
+        press(&ctx, &mut app, Key::Tab, back_extend);
+        assert_eq!(sel(&app), (clip.start, clip.end), "{os:?}");
+
+        press(&ctx, &mut app, Key::Tab, Modifiers { alt: true, ..cmd });
+        app.run("edit.select", json!({"start": clip.start})).unwrap();
+        press(&ctx, &mut app, Key::Tab, Modifiers::NONE);
+        let hit = start(&app);
+        assert!(hit > clip.start + 480 && hit < clip.end, "{os:?}: {hit}");
+        press(&ctx, &mut app, Key::Tab, if os == OperatingSystem::Mac { Modifiers::ALT } else { cmd });
+        assert_eq!(start(&app), clip.start, "{os:?}");
+    }
+}

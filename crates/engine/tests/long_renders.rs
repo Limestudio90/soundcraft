@@ -47,3 +47,11 @@ fn audiosuite_refuses_results_longer_than_one_render() {
         refused(&mut e, "audiosuite.process", &json!({"process": process, "params": params, "clips": [id.0]}));
     }
 }
+
+#[test]
+fn signal_generator_refuses_a_selection_longer_than_one_render() {
+    let (mut e, _) = long_clip(48_000);
+    let end = (MAX_RENDER_SAMPLES / 2 + 1) as i64;
+    e.execute("edit.select", &json!({"tracks": ["Talk"], "start": 0, "end": end})).unwrap();
+    refused(&mut e, "audiosuite.process", &json!({"process": "signal_generator"}));
+}

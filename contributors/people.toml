@@ -48,5 +48,8 @@ display_name = "Jason Brashear"
 display_name = "Netter"
 sync_github_name = false
 
+[people.Momentum96]
+sync_github_name = true
+
 [people.justinjohn0306]
 sync_github_name = true

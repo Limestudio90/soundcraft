@@ -453,7 +453,7 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
         let Some(info) = crate::mix_window::plugin_info(&ins.plugin) else { continue };
         let place = if instrument { "instrument".to_string() } else { char::from(b'a'.saturating_add(slot as u8)).to_string() };
         let mut open = true;
-        egui::Window::new(format!("{tname} · {place} · {}", info.name))
+        let shown = egui::Window::new(format!("{tname} · {place} · {}", info.name))
             .id(egui::Id::new(("plugin", tid.0, slot)))
             .open(&mut open)
             .default_width(340.0)
@@ -487,11 +487,14 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
                         }
                     }
                 });
-                if instrument {
-                    // The parameter commands address insert slots: an instrument is played and
-                    // edited in its own editor.
+                if instrument && soundcraft_mix::is_third_party(&ins.plugin) {
+                    // A hosted instrument keeps its sounds and settings in its own editor.
                     ui.label(egui::RichText::new("Load and edit sounds in the plugin's own editor.").color(Tokens::current().text_dim));
                     return;
+                }
+                if instrument && ins.plugin == crate::sampler_window::SAMPLER {
+                    crate::sampler_window::sample_strip(app, ui, tid, &ins);
+                    ui.add_space(4.0);
                 }
                 if info.id == "eq_7band" || info.id == "eq_1band" {
                     eq_curve(ui, info.id, &ins);
@@ -515,12 +518,21 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
                                 r.response
                             } else {
                                 let mut sl = egui::Slider::new(&mut x, p.min..=p.max).show_value(false);
+                                if instrument && crate::sampler_window::whole_number(&ins.plugin, p.id) {
+                                    sl = sl.integer();
+                                }
                                 if p.taper == soundcraft_dsp::Taper::Log && p.min > 0.0 {
                                     sl = sl.logarithmic(true);
                                 }
                                 ui.add(sl)
                             };
-                            if (x - v).abs() > f32::EPSILON {
+                            if (x - v).abs() > f32::EPSILON && instrument {
+                                let _ = app.engine.execute_merged(
+                                    "mix.instrument_param",
+                                    &json!({"track": tid.0, "param": p.id, "value": x}),
+                                    &format!("instrument_param:{}:{}", tid.0, p.id),
+                                );
+                            } else if (x - v).abs() > f32::EPSILON {
                                 let _ = app.engine.execute_merged(
                                     "mix.insert_param",
                                     &json!({"track": tid.0, "slot": slot, "param": p.id, "value": x}),
@@ -532,12 +544,19 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
                                 }
                             }
                             let _ = resp;
-                            ui.label(egui::RichText::new(p.format(x)).font(mono(11.0)));
+                            let shown = if instrument { crate::sampler_window::format_param(&ins.plugin, p, x) } else { p.format(x) };
+                            ui.label(egui::RichText::new(shown).font(mono(11.0)));
                             ui.end_row();
                         }
                     });
                 });
             });
+        if let Some(w) = shown
+            && instrument
+            && ins.plugin == crate::sampler_window::SAMPLER
+        {
+            crate::sampler_window::drop_target(app, ctx, w.response.rect, tid);
+        }
         if open {
             keep.push((tid, slot));
         }

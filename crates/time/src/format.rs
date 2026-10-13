@@ -143,6 +143,18 @@ mod tests {
     }
 
     #[test]
+    fn huge_typed_positions_parse_without_overflowing() {
+        let (sr, map, rate) = ctx();
+        for (text, fmt) in [
+            ("999999999999999999:0", TimeFormat::Timecode),
+            ("100000000000000:00:00:00", TimeFormat::Timecode),
+            ("-9223372036854775808", TimeFormat::BarsBeats),
+        ] {
+            let _ = parse_position(text, fmt, sr, &map, rate, 0, 0);
+        }
+    }
+
+    #[test]
     fn formats_like_pro_tools_counters() {
         let (sr, map, rate) = ctx();
         assert_eq!(format_position(0, TimeFormat::MinSecs, sr, &map, rate, 0, 0), "0:00.000");

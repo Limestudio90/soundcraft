@@ -5,6 +5,7 @@ use crate::widgets::{icon_button, key, key_fill};
 use crate::{SoundApp, icons};
 use egui::{Align2, Color32, CornerRadius, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use serde_json::json;
+use soundcraft_engine::edit::{SHUFFLE_LOCK, SNAP_TO_GRID};
 use soundcraft_model::{EditMode, Tool};
 use soundcraft_time::{TimeFormat, format_length};
 
@@ -44,7 +45,9 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
 
 fn edit_modes(app: &mut SoundApp, ui: &mut Ui) {
     let t = Tokens::current();
-    let cur = app.engine.session().edit.edit_mode;
+    let ed = &app.engine.session().edit;
+    let (cur, snap, locked) = (ed.edit_mode, ed.flag(SNAP_TO_GRID), ed.flag(SHUFFLE_LOCK));
+    let cmd = crate::shortcuts::shortcut_label("Cmd", ui.ctx().os() == egui::os::OperatingSystem::Mac);
     let modes = [
         (EditMode::Shuffle, 0, 0, "SHUFFLE", "F1"),
         (EditMode::Spot, 1, 0, "SPOT", "F3"),
@@ -62,21 +65,47 @@ fn edit_modes(app: &mut SoundApp, ui: &mut Ui) {
             let resp = ui.interact(cell, ui.id().with(("mode", label)), Sense::click());
             let on = cur == m || (m == EditMode::Grid && cur == EditMode::GridRelative);
             key(ui.painter(), cell, &resp, if on { t.mode_on } else { t.mode_off });
-            let txt = if m == EditMode::Grid && cur == EditMode::GridRelative { "REL GRID" } else { label };
-            ui.painter().text(cell.center(), Align2::CENTER_CENTER, txt, bold(10.5), if on { t.mode_on_text } else { t.mode_off_text });
-            if resp.clicked() {
-                let id = match m {
-                    EditMode::Grid if cur == EditMode::Grid => "relative_grid",
-                    EditMode::Shuffle => "shuffle",
-                    EditMode::Spot => "spot",
-                    EditMode::Slip => "slip",
-                    _ => "grid",
-                };
-                let _ = app.run("edit.mode", json!({"mode": id}));
+            let fg = if on { t.mode_on_text } else { t.mode_off_text };
+            if m == EditMode::Grid && snap {
+                ui.painter().rect_stroke(cell, 1.0, Stroke::new(1.5, t.mode_on), StrokeKind::Inside);
             }
-            resp.on_hover_text(format!("{} mode ({fkey})", label.to_lowercase()));
+            if m == EditMode::Shuffle && locked {
+                icons::draw(ui.painter(), Rect::from_center_size(cell.center(), vec2(15.0, 15.0)), "lock", fg);
+            } else {
+                let txt = if m == EditMode::Grid && cur == EditMode::GridRelative { "REL GRID" } else { label };
+                ui.painter().text(cell.center(), Align2::CENTER_CENTER, txt, bold(10.5), fg);
+            }
+            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, on, label));
+            if resp.clicked() {
+                mode_click(app, m, ui.input(|i| i.modifiers));
+            }
+            resp.on_hover_text(match m {
+                EditMode::Shuffle if locked => format!("Shuffle is locked ({cmd}-click to unlock)"),
+                EditMode::Shuffle => format!("Shuffle mode ({fkey}); {cmd}-click locks it out"),
+                EditMode::Grid => format!("Grid mode ({fkey}; again for Relative); Shift-click: Snap to Grid in the other modes"),
+                _ => format!("{} mode ({fkey}); Shift-click adds Snap to Grid", if m == EditMode::Slip { "Slip" } else { "Spot" }),
+            });
         }
     });
+}
+
+/// Shift adds Snap to Grid to Shuffle, Slip and Spot (on Grid it toggles it for the current mode);
+/// Cmd/Ctrl on Shuffle toggles Shuffle Lock.
+fn mode_click(app: &mut SoundApp, m: EditMode, mods: egui::Modifiers) {
+    let cur = app.engine.session().edit.edit_mode;
+    let _ = if m == EditMode::Shuffle && mods.command {
+        app.run("edit.shuffle_lock", json!({}))
+    } else if m == EditMode::Grid && mods.shift && !cur.is_grid() {
+        app.run("edit.snap_to_grid", json!({}))
+    } else {
+        let id = match m {
+            EditMode::Shuffle => "shuffle",
+            EditMode::Spot => "spot",
+            EditMode::Slip => "slip",
+            _ => crate::shortcuts::grid_mode(app),
+        };
+        app.run("edit.mode", json!({"mode": id, "snap_to_grid": mods.shift}))
+    };
 }
 
 fn zoom_group(app: &mut SoundApp, ui: &mut Ui) {
@@ -128,6 +157,9 @@ fn tools(app: &mut SoundApp, ui: &mut Ui) {
             ui.spacing_mut().item_spacing = vec2(2.0, 3.0);
             let row = ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
+                if icon_button(ui, vec2(36.0, 26.0), "zoom_toggle", app.engine.session().edit.zoom_toggle.is_some(), "Zoom Toggle (E)").clicked() {
+                    crate::edit_window::zoom_toggle(app);
+                }
                 for (tool, icon) in [
                     (Tool::Zoom, "zoom"),
                     (Tool::Trim, "trim"),
@@ -145,7 +177,7 @@ fn tools(app: &mut SoundApp, ui: &mut Ui) {
             });
             // Smart tool bracket above Trim/Selector/Grabber.
             let rr = row.response.rect;
-            let bx0 = rr.min.x + 38.0;
+            let bx0 = rr.min.x + 76.0;
             let bx1 = bx0 + 38.0 * 3.0 - 2.0;
             let bracket = Rect::from_min_max(pos2(bx0 - 2.0, r.min.y + 1.0), pos2(bx1 + 2.0, r.min.y + 5.0));
             let resp = ui.interact(bracket.expand2(vec2(0.0, 2.0)), ui.id().with("smart"), Sense::click());
@@ -157,7 +189,7 @@ fn tools(app: &mut SoundApp, ui: &mut Ui) {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 let e = app.engine.session().edit.clone();
                 let toggles: [(&str, &str, bool, &str); 5] = [
-                    ("options.tab_to_transient", "selector", e.tab_to_transient, "Tab to Transient"),
+                    ("options.tab_to_transient", "tab_transient", e.tab_to_transient, "Tab to Transient"),
                     ("options.link_timeline_edit", "link", e.link_timeline_edit, "Link Timeline and Edit Selection"),
                     ("options.link_track_edit", "link", e.link_track_edit, "Link Track and Edit Selection"),
                     ("options.mirrored_midi", "note", e.mirrored_midi, "Mirrored MIDI Editing"),

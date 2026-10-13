@@ -254,7 +254,7 @@ fn transients_detected_near_onsets() {
     let mut x = vec![0.0f32; 48_000 * 2];
     let onsets = [9_600usize, 33_600, 60_000, 81_000];
     for &o in &onsets {
-        for i in 0..6000 {
+        for i in 0..15000 {
             x[o + i] += 0.8 * (-(i as f32) / 1500.0).exp() * (TAU * 180.0 * i as f32 / sr).sin();
         }
     }

@@ -1,12 +1,17 @@
 //! The Edit window: toolbar, rulers, track headers and playlists.
 
+use crate::dialogs::Dialog;
+use crate::spot::Spot;
 use crate::theme::{Tokens, bold, clip_colors, regular, rgb};
 use crate::widgets::{groove, level_pos, meter_pos, raised_key, shade};
 use crate::{Gesture, SoundApp, toolbar};
 use egui::{Align2, Color32, CornerRadius, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2};
 use serde_json::json;
-use soundcraft_model::{AutoParam, Clip, ClipContent, ClipId, Session, Tool, Track, TrackHeight, TrackId, TrackKind};
+use soundcraft_engine::edit as ops;
+use soundcraft_model::{AutoParam, Clip, ClipContent, ClipId, EditMode, Session, Tool, Track, TrackHeight, TrackId, TrackKind};
 use soundcraft_time::{GridValue, NoteValue, Range, Samples, TimeFormat, format_position};
+use std::collections::HashSet;
+use std::sync::Arc;
 
 pub const HEADER_W: f32 = 136.0;
 pub const COLUMN_W: f32 = 112.0;
@@ -48,6 +53,8 @@ pub struct EditLayout {
     pub rows: Vec<(u64, [f32; 4])>,
     pub scroll_y: f32,
     pub content_h: f32,
+    /// While Zoom Toggle is on: the vertical scroll to go back to.
+    zoom_back: Option<f32>,
     /// Follow-hold: the view was moved by something other than the playhead
     /// follow (a manual pan, scrollbar, universe jump, or programmatic
     /// scroll) during playback, so timeline auto-scroll stays paused until
@@ -173,7 +180,7 @@ fn status_bar(app: &mut SoundApp, ui: &mut Ui) {
     let t = Tokens::current();
     let r = ui.max_rect();
     let s = app.engine.session();
-    let left = format!(
+    let mut left = format!(
         "{} · {} Hz · {} · {} tracks · {}",
         s.name,
         s.sample_rate.hz(),
@@ -185,6 +192,7 @@ fn status_bar(app: &mut SoundApp, ui: &mut Ui) {
         s.tracks.len(),
         app.ui.status
     );
+    soundcraft_model::truncate_chars(&mut left, 4 * soundcraft_model::MAX_NAME_CHARS);
     ui.painter().text(pos2(r.min.x + 10.0, r.center().y), Align2::LEFT_CENTER, left, regular(11.0), t.text_dim);
     let undo = app.engine.undo_label().map_or(String::new(), |l| format!("Undo {l}"));
     ui.painter().text(
@@ -225,6 +233,7 @@ fn main_area_content(app: &mut SoundApp, ui: &mut Ui) {
     let tl = Rect::from_min_max(pos2(full.min.x + hw, full.min.y + rulers_h), pos2(full.max.x - 12.0, full.max.y - hscroll_h));
     let rulers_rect = Rect::from_min_max(pos2(full.min.x, full.min.y), pos2(full.max.x, full.min.y + rulers_h));
     app.edit_layout.timeline = [tl.min.x, tl.min.y, tl.max.x, tl.max.y];
+    follow_zoom_toggle(app);
     ui.painter().rect_filled(full, 0.0, t.window_bg);
     scroll_and_zoom(app, ui, full, tl);
     draw_rulers(app, ui, rulers_rect, tl, &rulers);
@@ -281,7 +290,26 @@ fn main_area_content(app: &mut SoundApp, ui: &mut Ui) {
 }
 
 fn in_edit_window(s: &Session, t: &Track) -> bool {
-    !t.hidden && t.folder.and_then(|f| s.track(f)).is_none_or(|f| f.folder_open)
+    ops::shown(s, t)
+}
+
+/// Pro Tools' rule for track height: Alt reaches every shown track, Alt+Shift the selected ones too.
+pub(crate) fn height_targets(s: &Session, m: egui::Modifiers, own: &[TrackId]) -> Vec<u64> {
+    let extra = |t: &Track| if m.shift { s.edit.selected_tracks.contains(&t.id) } else { in_edit_window(s, t) };
+    s.tracks.iter().filter(|t| own.contains(&t.id) || (m.alt && extra(t))).map(|t| t.id.0).collect()
+}
+
+/// How many folders this track sits in, for the name's indent (at most 6 shown).
+fn folder_depth(s: &Session, track: &Track) -> usize {
+    let mut current = track.folder;
+    let mut depth = 0;
+    while let Some(folder) = current.and_then(|folder| s.track(folder))
+        && depth < 6
+    {
+        depth += 1;
+        current = folder.folder;
+    }
+    depth
 }
 
 /// Pro Tools' track-name click: Shift adds the tracks up to the nearest selected one, Cmd/Ctrl adds or removes one.
@@ -357,6 +385,28 @@ fn hscrollbar(app: &mut SoundApp, ui: &mut Ui, sb: Rect, tl: Rect) {
         let dx = resp.drag_delta().x / sb.width();
         let by_px = f64::from(dx) * total / s.edit.zoom.samples_per_px;
         pan(app, by_px);
+    }
+}
+
+/// Zoom Toggle sized to the track area on screen.
+pub fn zoom_toggle(app: &mut SoundApp) {
+    let [x0, y0, x1, y1] = app.edit_layout.timeline;
+    let _ = app.run("view.zoom_toggle", json!({"width_px": x1 - x0, "height_px": y1 - y0}));
+}
+
+/// Zoom Toggle scrolls the first track it fitted to the top, and back when it turns off.
+fn follow_zoom_toggle(app: &mut SoundApp) {
+    let l = &mut app.edit_layout;
+    match (&app.engine.session().edit.zoom_toggle, l.zoom_back) {
+        (Some(z), None) => {
+            l.zoom_back = Some(l.scroll_y);
+            let content_top = l.rows.first().map_or(0.0, |(_, r)| r[1]);
+            if let Some((_, r)) = l.rows.iter().find(|(id, _)| z.heights.iter().any(|(t, _)| t.0 == *id)) {
+                l.scroll_y = r[1] - content_top;
+            }
+        }
+        (None, Some(y)) => (l.scroll_y, l.zoom_back) = (y, None),
+        _ => {}
     }
 }
 
@@ -442,7 +492,7 @@ fn nice_step(spp: f64, sr: f64, min_px: f64) -> i64 {
 
 fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect, rulers: &[String]) {
     let t = Tokens::current();
-    let s = app.engine.session().clone();
+    let s = app.engine.session_arc();
     ui.painter().rect_filled(area, 0.0, t.ruler_bg);
     let view = Range::new(sample_at(&s, tl, tl.min.x), sample_at(&s, tl, tl.max.x));
     let sr = s.sample_rate;
@@ -527,9 +577,7 @@ fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect, rulers: &[
                 } else {
                     soundcraft_time::FrameRate::Fps25
                 };
-                let mut s2 = s.clone();
-                s2.frame_rate = alt;
-                timebase_ruler(ui, &painter, &s2, tl, row, view, TimeFormat::Timecode, i + 1 == rulers.len());
+                timebase_ruler(ui, &painter, &s, tl, row, view, TimeFormat::Timecode, alt, i + 1 == rulers.len());
             }
             "markers" | "markers2" | "markers3" | "markers4" | "markers5" | "chords" => {
                 let lane: u8 = match id.as_str() {
@@ -584,7 +632,7 @@ fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect, rulers: &[
             }
             _ => {
                 if let Some(f) = fmt {
-                    timebase_ruler(ui, &painter, &s, tl, row, view, f, i + 1 == rulers.len());
+                    timebase_ruler(ui, &painter, &s, tl, row, view, f, s.frame_rate, i + 1 == rulers.len());
                     // Clicking a timebase ruler locates.
                     let resp = ui.interact(row, ui.id().with(("ruler", id.as_str())), Sense::click_and_drag());
                     if (resp.clicked() || resp.dragged())
@@ -606,7 +654,17 @@ fn draw_rulers(app: &mut SoundApp, ui: &mut Ui, area: Rect, tl: Rect, rulers: &[
     ui.painter().line_segment([pos2(area.min.x, area.max.y - 1.0), pos2(area.max.x, area.max.y - 1.0)], Stroke::new(1.0, t.border));
 }
 
-fn timebase_ruler(_ui: &Ui, painter: &egui::Painter, s: &Session, tl: Rect, row: Rect, view: Range, f: TimeFormat, bottom: bool) {
+fn timebase_ruler(
+    _ui: &Ui,
+    painter: &egui::Painter,
+    s: &Session,
+    tl: Rect,
+    row: Rect,
+    view: Range,
+    f: TimeFormat,
+    rate: soundcraft_time::FrameRate,
+    bottom: bool,
+) {
     let t = Tokens::current();
     let sr = s.sample_rate;
     let spp = s.edit.zoom.samples_per_px;
@@ -616,7 +674,7 @@ fn timebase_ruler(_ui: &Ui, painter: &egui::Painter, s: &Session, tl: Rect, row:
             // Bars every n so labels are ≥ 60 px apart.
             let bar_px = {
                 let b = GridValue::Note { value: NoteValue::Bar, dotted: false, triplet: false };
-                b.step_samples(view.start.max(0), sr, &s.tempo, s.frame_rate) as f64 / spp
+                b.step_samples(view.start.max(0), sr, &s.tempo, rate) as f64 / spp
             };
             let every = [1i64, 2, 4, 8, 16, 32, 64, 128].into_iter().find(|n| bar_px * *n as f64 >= 60.0).unwrap_or(256);
             let first = s.tempo.bar_beat_at(view.start.max(0), sr).bar;
@@ -685,9 +743,13 @@ fn timebase_ruler(_ui: &Ui, painter: &egui::Painter, s: &Session, tl: Rect, row:
                 TimeFormat::BarsBeats => s.tempo.bar_beat_at(at, sr).bar.to_string(),
                 TimeFormat::MinSecs => {
                     let secs = sr.seconds(at);
-                    if secs.fract().abs() < 1e-9 { format!("{}:{:02}", (secs / 60.0) as i64, (secs as i64) % 60) } else { s.format_position(at, f) }
+                    if secs.fract().abs() < 1e-9 {
+                        format!("{}:{:02}", (secs / 60.0) as i64, (secs as i64) % 60)
+                    } else {
+                        format_position(at, f, sr, &s.tempo, rate, s.timecode_start, s.feet_frames_start())
+                    }
                 }
-                _ => s.format_position(at, f),
+                _ => format_position(at, f, sr, &s.tempo, rate, s.timecode_start, s.feet_frames_start()),
             };
             painter.text(pos2(x + 3.0, row.center().y), Align2::LEFT_CENTER, label, regular(11.0), t.ruler_text);
         } else {
@@ -748,28 +810,28 @@ fn views_button(app: &mut SoundApp, ui: &mut Ui, rulers: Rect) {
 
 fn track_row(app: &mut SoundApp, ui: &mut Ui, id: TrackId, row: Rect, tl: Rect, cols: &[Column]) {
     let t = Tokens::current();
-    let s = app.engine.session();
-    let Some(track) = s.track(id).cloned() else { return };
+    let s = app.engine.session_arc();
+    let Some(track) = s.track(id) else { return };
     let selected = s.edit.selected_tracks.contains(&id);
     let head = Rect::from_min_max(row.min, pos2(row.min.x + HEADER_W, row.max.y));
     let (head_bg, lane_bg) = crate::theme::track_backgrounds(track.color, selected, app.ui.track_tint);
     let mut x = head.max.x;
     for &(col, _, _, w) in cols {
-        header_column(app, ui, &track, col, Rect::from_min_size(pos2(x, row.min.y), vec2(w, row.height())), head_bg);
+        header_column(app, ui, track, col, Rect::from_min_size(pos2(x, row.min.y), vec2(w, row.height())), head_bg);
         x += w;
     }
     let main_h = track.height.points();
-    let lane = lane_rect(&track, row, tl);
+    let lane = lane_rect(track, row, tl);
     ui.painter().rect_filled(head, 0.0, head_bg);
     ui.painter().rect_filled(Rect::from_min_size(head.min, vec2(STRIP_W, head.height())), 0.0, rgb(track.color));
     ui.painter().line_segment([pos2(head.min.x, row.max.y + 0.5), pos2(tl.max.x, row.max.y + 0.5)], Stroke::new(1.0, t.border));
     ui.painter().hline(head.min.x + STRIP_W..=head.max.x, head.min.y + 0.5, Stroke::new(1.0, t.edge_light));
-    track_header(app, ui, &track, head, selected, head_bg);
+    track_header(app, ui, track, head, selected, head_bg);
     // Lane.
     ui.painter().vline(tl.min.x - 0.5, row.y_range(), Stroke::new(1.0, t.border));
     let painter = ui.painter().with_clip_rect(lane.intersect(ui.clip_rect()));
     painter.rect_filled(lane, 0.0, lane_bg);
-    let s = app.engine.session().clone();
+    let s = app.engine.session_arc();
     // Shown grid lines go over the clips; otherwise the bar lines stay behind them.
     if !s.edit.grid_lines {
         grid_lines(&painter, &s, tl, lane);
@@ -780,18 +842,19 @@ fn track_row(app: &mut SoundApp, ui: &mut Ui, id: TrackId, row: Rect, tl: Rect, 
         if !clip.range().overlaps(&view) {
             continue;
         }
-        draw_clip(app, &painter, &s, &track, clip, tl, lane, auto_view.is_some());
+        draw_clip(app, &painter, &s, track, clip, tl, lane, auto_view.is_some());
     }
-    crate::video_track::draw_lane(app, &painter, &s, &track, tl, lane);
+    draw_live_take(app, &painter, &s, track, tl, lane);
+    crate::video_track::draw_lane(app, &painter, &s, track, tl, lane);
     if s.edit.grid_lines {
         grid_lines(&painter, &s, tl, lane);
     }
     if let Some(p) = &auto_view {
-        draw_automation(&painter, &s, &track, p, tl, lane);
+        draw_automation(&painter, &s, track, p, tl, lane);
     }
     if track.kind == TrackKind::Master || track.kind == TrackKind::Aux || track.kind == TrackKind::Vca {
         let p = auto_view.clone().unwrap_or(AutoParam::Volume);
-        draw_automation(&painter, &s, &track, &p, tl, lane);
+        draw_automation(&painter, &s, track, &p, tl, lane);
     }
     // Selection highlight on this track.
     let sel = s.edit.selection;
@@ -802,16 +865,16 @@ fn track_row(app: &mut SoundApp, ui: &mut Ui, id: TrackId, row: Rect, tl: Rect, 
             painter.rect_filled(Rect::from_min_max(pos2(x0, lane.min.y), pos2(x1, lane.max.y)), 0.0, t.selection);
         }
     }
-    lane_interaction(app, ui, &track, lane, tl);
+    lane_interaction(app, ui, track, lane, tl);
     if track.view == "playlists" {
-        playlist_lanes(app, ui, &track, row, main_h, tl);
+        playlist_lanes(app, ui, track, row, main_h, tl);
     }
 }
 
 /// Alternate playlists as lanes under the main one; clicking a clip promotes it (comping).
 fn playlist_lanes(app: &mut SoundApp, ui: &mut Ui, track: &Track, row: Rect, main_h: f32, tl: Rect) {
     let t = Tokens::current();
-    let s = app.engine.session().clone();
+    let s = app.engine.session_arc();
     let mut y = row.min.y + main_h;
     for (i, pl) in track.playlists.iter().enumerate() {
         if i == track.active_playlist {
@@ -823,9 +886,7 @@ fn playlist_lanes(app: &mut SoundApp, ui: &mut Ui, track: &Track, row: Rect, mai
         ui.painter().text(pos2(head.min.x + 4.0, head.center().y), Align2::LEFT_CENTER, &pl.name, regular(10.5), t.text_dim);
         let painter = ui.painter().with_clip_rect(lane.intersect(ui.clip_rect()));
         for c in &pl.clips {
-            let r = Rect::from_min_max(pos2(x_of(&s, tl, c.start), lane.min.y + 3.0), pos2(x_of(&s, tl, c.end()), lane.max.y - 3.0));
-            painter.rect(r, 2.0, rgb(track.color).gamma_multiply(0.45), Stroke::new(1.0, Color32::BLACK), StrokeKind::Inside);
-            painter.text(pos2(r.min.x + 4.0, r.min.y + 7.0), Align2::LEFT_CENTER, &c.name, regular(9.5), t.text);
+            draw_clip(app, &painter, &s, track, c, tl, lane, false);
         }
         let resp = ui.interact(lane, ui.id().with(("pl_lane", track.id.0, i)), Sense::click());
         if resp.clicked()
@@ -856,13 +917,26 @@ fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, sele
     if eresp.hovered() || eresp.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
     }
-    if eresp.drag_stopped()
+    if eresp.drag_started() {
+        ui.data_mut(|d| d.insert_temp(eresp.id, track.height));
+    }
+    if eresp.dragged()
         && let Some(p) = ui.ctx().pointer_latest_pos()
+        && let Some(origin) = ui.input(|i| i.pointer.press_origin()).filter(|o| o.y != p.y)
     {
-        let want = (p.y - head.min.y).max(10.0);
-        let best = TrackHeight::ALL.into_iter().min_by_key(|h| ((h.points() - want).abs() * 10.0) as i64).unwrap_or(TrackHeight::Medium);
-        if best != track.height {
-            let _ = app.run("track.height", json!({"tracks": [id.0], "height": best.label()}));
+        let start = ui.data(|d| d.get_temp::<TrackHeight>(eresp.id)).unwrap_or(track.height);
+        let want = start.points() + p.y - origin.y;
+        let m = ui.input(|i| i.modifiers);
+        let best = if m.command {
+            TrackHeight::from_points(want)
+        } else {
+            TrackHeight::ALL.into_iter().min_by_key(|h| ((h.points() - want).abs() * 10.0) as i64).unwrap_or(start)
+        };
+        let s = app.engine.session();
+        let tracks = height_targets(s, m, &[id]);
+        if tracks.iter().any(|t| s.track(TrackId(*t)).is_some_and(|tr| tr.height != best)) {
+            let _ = app.engine.execute_merged("track.height", &json!({"tracks": tracks, "height": best.points()}), &format!("track_height:{}", id.0));
+            ui.ctx().request_repaint();
         }
     }
     let h = head.height();
@@ -908,7 +982,8 @@ fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, sele
         }
     }
     // Name, highlighted when the track is selected, and the playlist menu beside it.
-    let name_r = at(16.0, 1.5, 97.0, 15.0);
+    let indent = folder_depth(app.engine.session(), track) as f32 * 10.0;
+    let name_r = at(16.0 + indent, 1.5, 97.0 - indent, 15.0);
     if selected {
         ui.painter().rect_filled(name_r, 2.0, t.name_field_sel);
     }
@@ -1076,7 +1151,9 @@ fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, sele
                 let name =
                     track.instrument.as_ref().and_then(|i| crate::mix_window::plugin_info(&i.plugin)).map_or("no instrument", |p| p.short_name);
                 ui.painter().with_clip_rect(field).text(pos2(field.min.x + 5.0, field.center().y), Align2::LEFT_CENTER, name, bold(10.0), t.text);
-                egui::Popup::menu(&resp.on_hover_text("Instrument")).show(|ui| crate::mix_window::instrument_menu(app, ui, id));
+                egui::Popup::menu(&resp.on_hover_text("Instrument"))
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| crate::mix_window::instrument_menu(app, ui, id));
             } else {
                 let c = pos2(field.min.x + 7.0, field.center().y);
                 ui.painter().line_segment([c + vec2(0.0, -3.5), c + vec2(0.0, 1.0)], Stroke::new(1.0, t.text));
@@ -1345,21 +1422,47 @@ pub(crate) fn track_context_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
         ("Move to New Folder...", "track.move_to_new_folder"),
         ("Group...", "track.group"),
     ];
+    let selection: Vec<u64> = {
+        let selected = &app.engine.session().edit.selected_tracks;
+        if selected.contains(&id) { selected.iter().map(|track| track.0).collect() } else { vec![tid] }
+    };
     for (label, cmd) in items {
         if ui.button(label).clicked() {
             if cmd == "ui.rename_track" {
                 let name = app.engine.session().track(id).map(|t| t.name.clone()).unwrap_or_default();
                 app.dialogs.open_rename_track(id, &name);
             } else {
-                let _ = app.run(cmd, json!({"tracks": [tid]}));
+                let _ = app.run(cmd, json!({"tracks": selection}));
             }
         }
+    }
+    let folders: Vec<(u64, String)> = app
+        .engine
+        .session()
+        .tracks
+        .iter()
+        .filter(|track| track.is_folder() && !selection.contains(&track.id.0))
+        .map(|track| (track.id.0, track.name.clone()))
+        .collect();
+    if !folders.is_empty() {
+        ui.menu_button("Move to Folder", |ui| {
+            for (folder, name) in &folders {
+                if ui.button(name).clicked() {
+                    let _ = app.run("track.move_to_folder", json!({"tracks": selection, "folder": folder}));
+                }
+            }
+        });
+    }
+    if app.engine.session().track(id).is_some_and(|track| track.folder.is_some()) && ui.button("Remove from Folder").clicked() {
+        let _ = app.run("track.remove_from_folder", json!({"tracks": selection}));
     }
     ui.separator();
     ui.menu_button("Track Height", |ui| {
         for h in TrackHeight::ALL {
             if ui.button(h.label()).clicked() {
-                let _ = app.run("track.height", json!({"tracks": [tid], "height": h.label()}));
+                let own: Vec<TrackId> = selection.iter().map(|&t| TrackId(t)).collect();
+                let tracks = height_targets(app.engine.session(), ui.input(|i| i.modifiers), &own);
+                let _ = app.run("track.height", json!({"tracks": tracks, "height": h.label()}));
             }
         }
     });
@@ -1368,7 +1471,7 @@ pub(crate) fn track_context_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
             let (r, resp) = ui.allocate_exact_size(vec2(120.0, 14.0), Sense::click());
             ui.painter().rect_filled(r, 2.0, rgb(*c));
             if resp.clicked() {
-                let _ = app.run("track.color", json!({"tracks": [tid], "color": i}));
+                let _ = app.run("track.color", json!({"tracks": selection, "color": i}));
             }
         }
     });
@@ -1400,6 +1503,74 @@ fn grid_lines(painter: &egui::Painter, s: &Session, tl: Rect, lane: Rect) {
     }
 }
 
+fn clip_name_height(s: &Session, lane: Rect) -> f32 {
+    if lane.height() >= 40.0 && s.edit.flag("view.clip.name") { 13.0 } else { 0.0 }
+}
+
+fn fade_curve_points(fade: soundcraft_model::Fade, fade_in: bool, a: f32, b: f32, body: Rect, pixels_per_point: f32) -> Vec<Pos2> {
+    let scale = if pixels_per_point.is_finite() { pixels_per_point.clamp(0.5, 4.0) } else { 1.0 };
+    let extent = (b - a).abs().max(body.height().abs()) * scale;
+    let extent = if extent.is_finite() { extent.clamp(64.0, 4096.0) } else { 64.0 };
+    // Physical-pixel sampling avoids visible corners, even for steep bends.
+    // Keep an exact midpoint and cap allocations for extreme zoom/clip sizes.
+    let segments = (extent.ceil() as usize).div_ceil(2) * 2;
+    (0..=segments)
+        .map(|i| {
+            let k = i as f32 / segments as f32;
+            pos2(a + (b - a) * k, body.max.y - body.height() * fade.gain(if fade_in { k } else { 1.0 - k }))
+        })
+        .collect()
+}
+
+fn fade_control_position(fade: soundcraft_model::Fade, a: f32, b: f32, body: Rect) -> Pos2 {
+    let padding = body.height().clamp(0.0, 8.0) * 0.5;
+    let y = body.max.y - body.height() * fade.gain(0.5);
+    // Keep the whole handle inside the body when a bend approaches an edge.
+    pos2((a + b) * 0.5, y.max(body.min.y + padding).min(body.max.y - padding))
+}
+
+fn clip_preview_fades(clip: &Clip, gesture: Option<&Gesture>) -> (soundcraft_model::Fade, soundcraft_model::Fade) {
+    let (mut fade_in, mut fade_out) = (clip.fade_in, clip.fade_out);
+    match gesture {
+        Some(Gesture::Fade { clip: id, fade_in: side, to, .. }) if *id == clip.id => {
+            if let Some(fade) = fade_drag_preview(clip, *side, *to) {
+                if *side {
+                    fade_in = fade;
+                } else {
+                    fade_out = fade;
+                }
+            }
+        }
+        Some(Gesture::FadeCurve { clip: id, fade_in: side, curvature, .. }) if *id == clip.id => {
+            if *side {
+                fade_in.curvature = *curvature;
+            } else {
+                fade_out.curvature = *curvature;
+            }
+        }
+        _ => {}
+    }
+    (fade_in, fade_out)
+}
+
+/// The take `track` is recording, drawn in red as it grows, as in Pro Tools.
+fn draw_live_take(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track, tl: Rect, lane: Rect) {
+    let Some(rec) = &app.recorder else { return };
+    let Some(take) = rec.live_take(track.id) else { return };
+    let block_len = soundcraft_playback::record::LIVE_BLOCK as f64 * s.sample_rate.as_f64() / f64::from(rec.sample_rate.max(1));
+    let len = soundcraft_time::to_samples(take.first().map_or(0, Vec::len) as f64 * block_len);
+    let sel = s.edit.selection;
+    let (start, pass) = if s.edit.loop_record && !sel.is_empty() { (sel.start, Some(sel.len())) } else { (app.record_start, None) };
+    let Some((origin, span)) = soundcraft_engine::io::live_span(start, pass, app.punch, len) else { return };
+    let r = Rect::from_min_max(pos2(x_of(s, tl, span.start), lane.min.y + 1.0), pos2(x_of(s, tl, span.end), lane.max.y - 1.0));
+    let t = Tokens::current();
+    let (body, _, wave) = clip_colors([t.rec.r(), t.rec.g(), t.rec.b()], false);
+    painter.rect(r, CornerRadius::same(2), body, Stroke::new(1.0, Color32::from_rgb(10, 10, 10)), StrokeKind::Inside);
+    if track.view != "blocks" {
+        crate::waveform::draw_live(&painter.with_clip_rect(r.intersect(lane)), s, tl, origin as f64, block_len, &take, r, wave);
+    }
+}
+
 /// The translucent white or black that turns `bg` into `line`, so grid lines also show over clips.
 fn grid_veil(line: Color32, bg: Color32) -> Color32 {
     let level = |c: Color32| (f32::from(c.r()) + f32::from(c.g()) + f32::from(c.b())) / 3.0;
@@ -1428,7 +1599,7 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
     }
     let body = if s.edit.flag("view.clip.transparency") { body.gamma_multiply(0.55) } else { body };
     painter.rect(r, CornerRadius::same(2), body, Stroke::new(1.0, Color32::from_rgb(10, 10, 10)), StrokeKind::Inside);
-    let name_h = if lane.height() >= 40.0 && s.edit.flag("view.clip.name") { 13.0 } else { 0.0 };
+    let name_h = clip_name_height(s, lane);
     if name_h > 0.0 {
         let nb = Rect::from_min_max(r.min, pos2(r.max.x, r.min.y + name_h));
         painter.rect_filled(nb, CornerRadius { nw: 2, ne: 2, sw: 0, se: 0 }, if clip.muted { Color32::from_rgb(70, 70, 70) } else { bar });
@@ -1443,59 +1614,26 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
     }
     let body_r = Rect::from_min_max(pos2(r.min.x, r.min.y + name_h), r.max);
     let vis = body_r.intersect(lane);
+    // The waveform and fade curve share the same temporary envelope every frame.
+    let (fade_in, fade_out) = clip_preview_fades(clip, app.gesture.as_ref().filter(|_| !dim));
     match &clip.content {
-        ClipContent::Audio { source, offset } => {
+        _ if track.view == "blocks" => {}
+        ClipContent::Audio { source, .. } => {
             if let Some(audio) = s.pool.get(*source) {
-                let nch = track.channels().min(audio.peaks.len().max(1)).max(1);
-                let ch_h = body_r.height() / nch as f32;
-                let zoom = s.edit.zoom.waveform_zoom;
-                let rectified = s.edit.flag("waveform.rectified");
-                let power = s.edit.flag("waveform.power");
-                let outlines = s.edit.flag("waveform.outlines");
-                let cols = vis.width().max(0.0) as usize;
-                if cols > 0 && vis.height() > 2.0 {
-                    let a = (offset + sample_at(s, tl, vis.min.x) - clip.start) as f64;
-                    let b = (offset + sample_at(s, tl, vis.max.x) - clip.start) as f64;
-                    for ch in 0..nch {
-                        let Some(pk) = audio.peaks.get(ch % audio.peaks.len().max(1)) else { continue };
-                        let cy = body_r.min.y + ch_h * (ch as f32 + 0.5);
-                        let half = ch_h * 0.46;
-                        let colsv = pk.columns(a, b, cols);
-                        let mut mesh = egui::Mesh::default();
-                        for (i, (mn, mx)) in colsv.iter().enumerate() {
-                            let x = vis.min.x + i as f32;
-                            let rel = sample_at(s, tl, x) - clip.start;
-                            let g = clip.gain_at(rel.clamp(0, clip.length));
-                            let (mut top, mut bot) = if rectified {
-                                let a = (mx.abs().max(mn.abs()) * g * zoom).clamp(0.0, 1.0);
-                                let b = cy + half;
-                                (b - a * half * 2.0, b)
-                            } else {
-                                (cy - (mx * g * zoom).clamp(-1.0, 1.0) * half, cy - (mn * g * zoom).clamp(-1.0, 1.0) * half)
-                            };
-                            if power {
-                                // Power view: compress peaks logarithmically around the centre.
-                                let k = |y: f32| cy + (y - cy).signum() * ((y - cy).abs() / half).sqrt() * half;
-                                top = k(top);
-                                bot = k(bot);
-                            }
-                            if outlines {
-                                bot = top + 1.0;
-                            }
-                            let bot = if (bot - top) < 1.0 { top + 1.0 } else { bot };
-                            let idx = mesh.vertices.len() as u32;
-                            mesh.colored_vertex(pos2(x, top), wave);
-                            mesh.colored_vertex(pos2(x + 1.0, top), wave);
-                            mesh.colored_vertex(pos2(x + 1.0, bot), wave);
-                            mesh.colored_vertex(pos2(x, bot), wave);
-                            mesh.add_triangle(idx, idx + 1, idx + 2);
-                            mesh.add_triangle(idx, idx + 2, idx + 3);
-                        }
-                        painter.with_clip_rect(vis).add(Shape::mesh(mesh));
-                        if nch > 1 && ch + 1 < nch {
-                            let y = body_r.min.y + ch_h * (ch as f32 + 1.0);
-                            painter.line_segment([pos2(vis.min.x, y), pos2(vis.max.x, y)], Stroke::new(1.0, body.gamma_multiply(0.7)));
-                        }
+                if vis.width() > 0.0 && vis.height() > 2.0 {
+                    // Drawn with the fades being dragged, so the waveform follows them before release.
+                    let preview;
+                    let shown = if (fade_in, fade_out) == (clip.fade_in, clip.fade_out) {
+                        clip
+                    } else {
+                        preview = Clip { fade_in, fade_out, ..clip.clone() };
+                        &preview
+                    };
+                    crate::waveform::draw(&painter.with_clip_rect(vis), s, tl, shown, audio, track.channels(), body_r, wave);
+                    let n = track.channels().min(audio.peaks.len()).max(1);
+                    for k in 1..n {
+                        let y = body_r.min.y + body_r.height() / n as f32 * k as f32;
+                        painter.line_segment([pos2(vis.min.x, y), pos2(vis.max.x, y)], Stroke::new(1.0, body.gamma_multiply(0.7)));
                     }
                 }
             } else {
@@ -1519,7 +1657,11 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
                 }
                 let y = body_r.max.y - 3.0 - (f32::from(n.pitch.saturating_sub(lo)) / span) * (body_r.height() - 6.0);
                 let nh = ((body_r.height() - 6.0) / span).clamp(1.5, 6.0);
-                let vcol = Color32::from_rgb(20, 20 + n.velocity, 40);
+                let vcol = if crate::theme::is_light() {
+                    Color32::from_rgb(20, 20 + n.velocity, 40)
+                } else {
+                    wave.gamma_multiply(0.5 + f32::from(n.velocity) / 254.0)
+                };
                 p.rect_filled(
                     Rect::from_min_max(pos2(nx0, y - nh * 0.5), pos2(nx1, y + nh * 0.5)),
                     1.0,
@@ -1527,6 +1669,21 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
                 );
             }
         }
+    }
+    let prev = crossfade_partner(track, clip);
+    if s.edit.flag("waveform.overlapped_crossfades")
+        && track.view != "blocks"
+        && let Some(prev) = prev
+        && let ClipContent::Audio { source, .. } = &prev.content
+        && let Some(audio) = s.pool.get(*source)
+    {
+        let xf = Rect::from_min_max(pos2(x0, body_r.min.y), pos2(x_of(s, tl, prev.end()).min(x1), body_r.max.y)).intersect(vis);
+        let tail = if prev.muted || dim {
+            Color32::from_rgb(70, 70, 70)
+        } else {
+            clip_colors(prev.color.unwrap_or(track.color), false).2.gamma_multiply(0.6)
+        };
+        crate::waveform::draw(&painter.with_clip_rect(xf), s, tl, prev, audio, track.channels(), body_r, tail);
     }
     // Clip gain line.
     let show_gain = s.edit.flag("view.clip.gain_line") && (!clip.gain_env.is_empty() || clip.gain_db.abs() > 0.01 || track.view == "clip_gain");
@@ -1552,28 +1709,28 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
         painter.rect_filled(Rect::from_center_size(pos2(icon.center().x, icon.center().y + 2.0), vec2(icon.width(), 3.0)), 1.0, col);
         painter.text(pos2(icon.max.x + 3.0, icon.center().y), Align2::LEFT_CENTER, format!("{:+.1} dB", clip.gain_db), regular(9.5), col);
     }
-    // Fades.
     let fade_col = Color32::from_rgba_unmultiplied(255, 255, 255, 90);
-    if clip.fade_in.len > 0 {
-        let fx = x_of(s, tl, clip.start + clip.fade_in.len);
-        let pts: Vec<Pos2> = (0..=16)
-            .map(|i| {
-                let k = i as f32 / 16.0;
-                pos2(x0 + (fx - x0) * k, body_r.max.y - body_r.height() * clip.fade_in.shape.gain(k))
-            })
-            .collect();
-        painter.add(Shape::line(pts, Stroke::new(1.2, fade_col)));
-        painter.line_segment([pos2(x0, body_r.min.y), pos2(fx, body_r.min.y)], Stroke::new(1.0, fade_col));
+    for (side, fade) in [(true, fade_in), (false, fade_out)] {
+        if fade.len <= 0 {
+            continue;
+        }
+        let (a, b) =
+            if side { (x0, x_of(s, tl, clip.start.saturating_add(fade.len))) } else { (x_of(s, tl, clip.end().saturating_sub(fade.len)), x1) };
+        let pts = fade_curve_points(fade, side, a, b, body_r, painter.ctx().pixels_per_point());
+        painter.with_clip_rect(vis).add(Shape::line(pts, Stroke::new(1.2, fade_col)));
+        let midpoint = fade_control_position(fade, a, b, body_r);
+        let active = matches!(app.gesture, Some(Gesture::FadeCurve { clip: id, fade_in, .. }) if id == clip.id && fade_in == side);
+        let hovered = painter.ctx().input(|i| i.pointer.hover_pos()).is_some_and(|p| near_fade_midpoint(p, midpoint));
+        if !dim && s.edit.tool == Tool::Smart && AutoParam::parse(&track.view).is_none() && b - a >= 32.0 && vis.contains(midpoint) {
+            let col = Color32::from_rgba_unmultiplied(255, 255, 255, if active || hovered { 230 } else { 200 });
+            painter.with_clip_rect(vis).circle(midpoint, 3.5, body, Stroke::new(1.0, col));
+        }
     }
-    if clip.fade_out.len > 0 {
-        let fx = x_of(s, tl, clip.end() - clip.fade_out.len);
-        let pts: Vec<Pos2> = (0..=16)
-            .map(|i| {
-                let k = i as f32 / 16.0;
-                pos2(fx + (x1 - fx) * k, body_r.max.y - body_r.height() * clip.fade_out.shape.gain(1.0 - k))
-            })
-            .collect();
-        painter.add(Shape::line(pts, Stroke::new(1.2, fade_col)));
+    // The fade-out of the clip this one crossfades with, drawn over the overlap.
+    if let Some(c) = prev.filter(|c| c.fade_out.len > 0) {
+        let (a, b) = (x_of(s, tl, c.end().saturating_sub(c.fade_out.len)), x_of(s, tl, c.end()));
+        let pts = fade_curve_points(c.fade_out, false, a, b, body_r, painter.ctx().pixels_per_point());
+        painter.with_clip_rect(vis).add(Shape::line(pts, Stroke::new(1.2, fade_col)));
     }
     // Optional clip overlays (View › Clip).
     let ov = Color32::from_rgb(16, 16, 16);
@@ -1594,7 +1751,7 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
     } else if s.edit.flag("view.clip.time.original") || s.edit.flag("view.clip.time.user") {
         clip.source().and_then(|src| s.source(src)).map(|src| {
             format_position(
-                i64::try_from(src.time_reference).unwrap_or(0) + clip.source_offset(),
+                i64::try_from(src.time_reference).unwrap_or(0).saturating_add(clip.source_offset()).saturating_sub(s.timecode_start),
                 TimeFormat::Timecode,
                 s.sample_rate,
                 &s.tempo,
@@ -1628,6 +1785,15 @@ fn draw_clip(app: &SoundApp, painter: &egui::Painter, s: &Session, track: &Track
         painter.text(pos2(r.max.x - 10.0, r.min.y + 7.0), Align2::CENTER_CENTER, "🔒", regular(9.0), Color32::WHITE);
     }
     let _ = app;
+}
+
+/// The earlier clip of a crossfade pair: the one before `clip` in its playlist, overlapping its start.
+fn crossfade_partner<'a>(track: &'a Track, clip: &Clip) -> Option<&'a Clip> {
+    let (p, i) = track.playlists.iter().find_map(|p| {
+        let i = p.clips.partition_point(|c| c.start < clip.start);
+        p.clips.get(i).is_some_and(|c| c.id == clip.id).then_some((p, i))
+    })?;
+    p.clips.get(i.checked_sub(1)?).filter(|c| c.end() > clip.start)
 }
 
 fn draw_automation(painter: &egui::Painter, s: &Session, track: &Track, p: &AutoParam, tl: Rect, lane: Rect) {
@@ -1692,11 +1858,57 @@ fn plugin_range(track: &Track, p: &AutoParam) -> (f32, f32) {
 // ---- interaction -----------------------------------------------------------------------------
 
 fn snap(s: &Session, at: Samples) -> Samples {
-    if s.edit.edit_mode.is_grid() { s.edit.grid.snap(at, s.sample_rate, &s.tempo, s.frame_rate) } else { at }
+    let on = s.edit.edit_mode.is_grid() || s.edit.flag(ops::SNAP_TO_GRID);
+    if on { s.edit.grid.snap(at, s.sample_rate, &s.tempo, s.frame_rate) } else { at }
 }
 
 fn clip_at(track: &Track, at: Samples) -> Option<&Clip> {
     track.clips().iter().rev().find(|c| c.range().contains(at))
+}
+
+/// The unity-gain end of each existing fade, at the top of the clip body.
+fn fade_handle_at(s: &Session, tl: Rect, lane: Rect, clip: &Clip, p: Pos2) -> Option<bool> {
+    if clip.length <= 0 || clip.end() <= clip.start {
+        return None;
+    }
+    let y = lane.min.y + 1.0 + clip_name_height(s, lane);
+    [(true, clip.fade_in), (false, clip.fade_out)]
+        .into_iter()
+        .filter(|(_, fade)| fade.len > 0)
+        .filter_map(|(fade_in, fade)| {
+            let len = fade.len.min(clip.length);
+            let at = if fade_in { clip.start.saturating_add(len).min(clip.end()) } else { clip.end().saturating_sub(len).max(clip.start) };
+            let head = pos2(x_of(s, tl, at), y);
+            let delta = p - head;
+            (lane.contains(head) && delta.x.abs() <= 8.0 && delta.y.abs() <= 8.0).then_some((fade_in, delta.length_sq()))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(fade_in, _)| fade_in)
+}
+
+fn near_fade_midpoint(p: Pos2, midpoint: Pos2) -> bool {
+    let delta = p - midpoint;
+    delta.x.abs() <= 8.0 && delta.y.abs() <= 8.0
+}
+
+fn fade_midpoint(s: &Session, tl: Rect, lane: Rect, clip: &Clip, fade_in: bool) -> Option<Pos2> {
+    let fade = if fade_in { clip.fade_in } else { clip.fade_out };
+    if fade.len <= 0 || clip.length <= 0 {
+        return None;
+    }
+    let len = fade.len.min(clip.length);
+    let (a, b) = if fade_in { (clip.start, clip.start.saturating_add(len)) } else { (clip.end().saturating_sub(len), clip.end()) };
+    let (a, b) = (x_of(s, tl, a), x_of(s, tl, b));
+    if b - a < 32.0 {
+        return None;
+    }
+    let body = Rect::from_min_max(pos2(a, lane.min.y + 1.0 + clip_name_height(s, lane)), pos2(b, lane.max.y - 1.0));
+    let p = fade_control_position(fade, a, b, body);
+    lane.contains(p).then_some(p)
+}
+
+fn fade_curve_handle_at(s: &Session, tl: Rect, lane: Rect, clip: &Clip, p: Pos2) -> Option<bool> {
+    [true, false].into_iter().find(|side| fade_midpoint(s, tl, lane, clip, *side).is_some_and(|midpoint| near_fade_midpoint(p, midpoint)))
 }
 
 pub const CLIP_FADER_TRAVEL: f32 = 200.0;
@@ -1746,20 +1958,44 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
         && let Some(p) = ui.ctx().pointer_latest_pos()
     {
         let s = app.engine.session();
-        let at = snap(s, sample_at(s, tl, p.x).max(0));
-        let _ = app.run("clip.place_source", json!({"source": src.0, "track": track.id.0, "at": at}));
+        let at = drag_snap(s, sample_at(s, tl, p.x).max(0), ui.input(|i| i.modifiers.command));
+        let spot = Spot::source(s, soundcraft_model::SourceId(src.0), track.id, at);
+        spot_or_run(app, spot);
     }
     if resp.dnd_hover_payload::<crate::DragSource>().is_some() {
         ui.painter().rect_stroke(lane, 0.0, Stroke::new(2.0, Tokens::current().accent), StrokeKind::Inside);
     }
-    let s = app.engine.session().clone();
+    // Audio files dropped from outside onto an instrument track load its sampler.
+    if track.kind == soundcraft_model::TrackKind::Instrument {
+        crate::sampler_window::drop_target(app, ui.ctx(), lane, track.id);
+    }
+    let s = app.engine.session_arc();
     let tool = s.edit.tool;
     let mods = ui.input(|i| i.modifiers);
     let Some(p) = resp.interact_pointer_pos().or_else(|| resp.hover_pos()) else { return };
     let at = sample_at(&s, tl, p.x).max(0);
     let origin = if resp.drag_started() { ui.input(|i| i.pointer.press_origin()).unwrap_or(p) } else { p };
     let at_origin = sample_at(&s, tl, origin.x).max(0);
-    let hit = clip_at(track, at_origin).cloned();
+    let auto_view = AutoParam::parse(&track.view);
+    let body_hit = clip_at(track, at_origin);
+    // Check fade endpoints before clip bodies: a full-length fade can end exactly
+    // at the next clip's start, where `clip_at` would otherwise choose that neighbour.
+    let fade_handle = if tool == Tool::Smart && auto_view.is_none() {
+        track
+            .clips()
+            .iter()
+            .rev()
+            .filter(|c| body_hit.is_none_or(|front| front.id == c.id || front.start == c.end()))
+            .find_map(|c| fade_handle_at(&s, tl, lane, c, origin).map(|side| (c, side)))
+    } else {
+        None
+    };
+    let curve_handle = if tool == Tool::Smart && auto_view.is_none() && fade_handle.is_none() {
+        body_hit.and_then(|c| fade_curve_handle_at(&s, tl, lane, c, origin).map(|side| (c, side)))
+    } else {
+        None
+    };
+    let hit = fade_handle.or(curve_handle).map(|(c, _)| c).or(body_hit).cloned();
     let upper = origin.y < lane.center().y;
     let near_edge = |c: &Clip| -> Option<bool> {
         let xs = x_of(&s, tl, c.start);
@@ -1800,27 +2036,31 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
         };
         ui.ctx().set_cursor_icon(icon);
     }
-    let auto_view = AutoParam::parse(&track.view);
     let fade_corner = if tool == Tool::Smart {
-        hit.as_ref().and_then(|c| {
-            let xs = x_of(&s, tl, c.start);
-            let xe = x_of(&s, tl, c.end());
-            let top = origin.y < lane.min.y + lane.height() * 0.28;
-            if !top {
-                None
-            } else if (origin.x - xs) > 0.0 && (origin.x - xs) < 14.0 {
-                Some(true)
-            } else if (xe - origin.x) > 0.0 && (xe - origin.x) < 14.0 {
-                Some(false)
-            } else {
-                None
-            }
+        fade_handle.map(|(_, side)| side).or_else(|| {
+            hit.as_ref().and_then(|c| {
+                let xs = x_of(&s, tl, c.start);
+                let xe = x_of(&s, tl, c.end());
+                let top = origin.y < lane.min.y + lane.height() * 0.28;
+                if !top {
+                    None
+                } else if (origin.x - xs) > 0.0 && (origin.x - xs) < 14.0 {
+                    Some(true)
+                } else if (xe - origin.x) > 0.0 && (xe - origin.x) < 14.0 {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
         })
     } else {
         None
     };
     if fade_corner.is_some() && resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+    }
+    if curve_handle.is_some() && resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
     }
     let gain_icon_at = |q: Pos2| {
         let c = clip_at(track, sample_at(&s, tl, q.x).max(0)).filter(|_| auto_view.is_none())?;
@@ -1829,7 +2069,7 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
     if resp.hovered() && gain_icon_at(p).is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
     }
-    let selector_press = eff == Tool::Selector && fade_corner.is_none() && gain_icon_at(origin).is_none();
+    let selector_press = eff == Tool::Selector && fade_corner.is_none() && curve_handle.is_none() && gain_icon_at(origin).is_none();
     if selector_press && resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed()) {
         place_insertion(app, ui, &s, track.id, at, mods.shift);
     }
@@ -1846,9 +2086,23 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
         let fine = mods.command || mods.ctrl;
         app.gesture = Some(Gesture::ClipGain { clip: c.id, track: track.id, pos, anchor: (origin.y, pos), fine, fader_bottom });
     } else if resp.drag_started()
+        && let Some((c, fade_in)) = curve_handle
+    {
+        let fade = if fade_in { c.fade_in } else { c.fade_out };
+        let anchor = (origin.y, fade.gain(0.5));
+        let height = (lane.height() - 2.0 - clip_name_height(&s, lane)).max(1.0);
+        app.gesture = Some(Gesture::FadeCurve { clip: c.id, fade_in, curvature: fade_curve_drag_value(fade, anchor, height, p.y), anchor, height });
+        ui.ctx().request_repaint();
+    } else if resp.drag_started()
         && let (Some(fade_in), Some(c)) = (fade_corner, hit.as_ref())
     {
-        app.gesture = Some(Gesture::Fade { clip: c.id, track: track.id, fade_in, to: at });
+        app.gesture = fade_drag_range(c, fade_in, at).map(|range| Gesture::Fade {
+            clip: c.id,
+            track: track.id,
+            fade_in,
+            to: if fade_in { range.end } else { range.start },
+        });
+        ui.ctx().request_repaint();
     } else if resp.drag_started() {
         app.gesture = match eff {
             Tool::Selector | Tool::Smart => Some(Gesture::Select { track: track.id, anchor: snap(&s, at_origin), tracks: vec![track.id] }),
@@ -1862,6 +2116,9 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
                 _ => Gesture::TrimEnd { clip: c.id, track: track.id, to: c.end() },
             }),
             Tool::Scrubber => Some(Gesture::Scrub { last: at }),
+            Tool::Pencil if auto_view.is_none() && track.kind.is_midi() => {
+                hit.is_none().then_some(Gesture::MidiClip { track: track.id, from: at_origin, to: at_origin })
+            }
             Tool::Pencil => Some(Gesture::Pencil { track: track.id, points: Vec::new() }),
             Tool::Zoom => Some(Gesture::ZoomBox { start: origin.x }),
         };
@@ -1884,13 +2141,22 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
         clip_gain_popup(ui.ctx(), *fader_bottom, *pos);
     }
-    if resp.clicked() {
+    if resp.clicked() && curve_handle.is_none() {
         match eff {
             Tool::Grabber => {
                 if let Some(c) = &hit {
                     let mut ids = if mods.shift { s.edit.selected_clips.iter().map(|x| x.0).collect::<Vec<_>>() } else { Vec::new() };
                     ids.push(c.id.0);
                     let _ = app.run("edit.select", json!({"clips": ids}));
+                    if s.edit.edit_mode == EditMode::Spot {
+                        app.dialogs.open = Spot::clips(&s, vec![c.id], None, 0).map(Dialog::Spot);
+                    }
+                }
+            }
+            Tool::Trim if s.edit.edit_mode == EditMode::Spot && hit.is_some() => {
+                if let Some(c) = &hit {
+                    let start = at - c.start < c.end() - at;
+                    app.dialogs.open = Spot::trim(&s, c.id, start, if start { c.start } else { c.end() }).map(Dialog::Spot);
                 }
             }
             Tool::Zoom => {
@@ -1911,6 +2177,8 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
                         "automation.set_point",
                         json!({"track": track.id.0, "param": automation_id(param), "at": at, "value": lo + (hi - lo) * k}),
                     );
+                } else if track.kind.is_midi() && hit.is_none() {
+                    new_midi_clip(app, &s, track.id, at, at);
                 }
             }
             _ if !selector_press => place_insertion(app, ui, &s, track.id, at, mods.shift),
@@ -1918,10 +2186,14 @@ fn lane_interaction(app: &mut SoundApp, ui: &mut Ui, track: &Track, lane: Rect, 
         }
     }
     if resp.double_clicked()
+        && curve_handle.is_none()
         && eff != Tool::Pencil
         && let Some(c) = &hit
     {
         let _ = app.run("edit.select", json!({"clips": [c.id.0]}));
+        if eff == Tool::Grabber && matches!(c.content, ClipContent::Midi { .. }) {
+            app.ui.show_midi_editor = true;
+        }
     }
 }
 
@@ -1944,6 +2216,33 @@ fn place_insertion(app: &mut SoundApp, ui: &Ui, s: &Session, track: TrackId, at:
     }
 }
 
+/// The same bounded range drives the preview and the committed fade.
+fn fade_drag_range(clip: &Clip, fade_in: bool, to: Samples) -> Option<Range> {
+    let end = clip.end();
+    if clip.length <= 0 || end <= clip.start {
+        return None;
+    }
+    Some(if fade_in {
+        Range::new(clip.start, to.clamp(clip.start.saturating_add(1), end))
+    } else {
+        Range::new(to.clamp(clip.start, end.saturating_sub(1)), end)
+    })
+}
+
+fn fade_drag_preview(clip: &Clip, fade_in: bool, to: Samples) -> Option<soundcraft_model::Fade> {
+    let range = fade_drag_range(clip, fade_in, to)?;
+    let original = if fade_in { clip.fade_in } else { clip.fade_out };
+    Some(soundcraft_model::Fade {
+        len: range.end.saturating_sub(range.start),
+        shape: if original.len > 0 { original.shape } else { soundcraft_model::FadeShape::SCurve },
+        curvature: if original.len > 0 { original.curvature } else { 0.0 },
+    })
+}
+
+fn fade_curve_drag_value(fade: soundcraft_model::Fade, anchor: (f32, f32), height: f32, y: f32) -> f32 {
+    fade.curvature_for_midpoint_gain(anchor.1 + (anchor.0 - y) / height.max(1.0))
+}
+
 /// Runs before anything is painted, against the last frame's layout.
 fn drive_drag(app: &mut SoundApp, ctx: &egui::Context) {
     if app.gesture.is_none() || matches!(app.gesture, Some(Gesture::Fader { .. })) {
@@ -1961,6 +2260,7 @@ fn drive_drag(app: &mut SoundApp, ctx: &egui::Context) {
     let rows = &app.edit_layout.rows;
     let gap = |r: &[f32; 4]| (r[1] - inside.y).max(inside.y - r[3]).max(0.0);
     let to_track = rows.iter().min_by(|a, b| gap(&a.1).total_cmp(&gap(&b.1))).map(|(i, _)| TrackId(*i));
+    let mut invalid_fade = false;
     match &mut app.gesture {
         Some(Gesture::Select { track, tracks, .. }) => {
             let row_of = |t: TrackId| rows.iter().position(|(i, _)| *i == t.0);
@@ -1968,23 +2268,34 @@ fn drive_drag(app: &mut SoundApp, ctx: &egui::Context) {
                 *tracks = rows.get(a.min(b)..=a.max(b)).unwrap_or_default().iter().map(|(i, _)| TrackId(*i)).collect();
             }
         }
-        Some(Gesture::MoveClips { grab_at, delta, from_track, to_track: tt, .. }) => {
-            let raw = at - *grab_at;
-            *delta = if s.edit.edit_mode.is_grid() {
-                let base = s.track(*from_track).and_then(|t| clip_at(t, *grab_at)).map_or(*grab_at, |c| c.start);
-                snap(&s, base + raw) - base
-            } else {
-                raw
-            };
-            if s.edit.edit_mode == soundcraft_model::EditMode::Spot {
-                *delta = 0;
-            }
+        Some(Gesture::MoveClips { clips, grab_at, delta, from_track, to_track: tt }) => {
             if let Some(t2) = to_track {
                 *tt = t2;
             }
+            let plan = drag_plan(ctx, &s, app.engine.revision, clips, (*from_track, *tt), *grab_at);
+            *delta = move_delta(&plan, &s, *from_track, at - *grab_at, ctx.input(|i| i.modifiers.command));
         }
-        Some(Gesture::TrimStart { to, .. } | Gesture::TrimEnd { to, .. }) => *to = snap(&s, at),
-        Some(Gesture::Fade { to, .. }) => *to = at,
+        Some(Gesture::TrimStart { to, .. } | Gesture::TrimEnd { to, .. }) => *to = drag_snap(&s, at, ctx.input(|i| i.modifiers.command)),
+        Some(Gesture::MidiClip { to, .. }) => *to = at,
+        Some(Gesture::Fade { clip, fade_in, to, .. }) => {
+            if let Some(range) = s.find_clip(*clip).and_then(|(_, c)| fade_drag_range(c, *fade_in, at)) {
+                *to = if *fade_in { range.end } else { range.start };
+            } else {
+                invalid_fade = true;
+            }
+        }
+        Some(Gesture::FadeCurve { clip, fade_in, curvature, anchor, height }) => {
+            if let Some((_, c)) = s.find_clip(*clip).filter(|(_, c)| c.length > 0) {
+                let fade = if *fade_in { c.fade_in } else { c.fade_out };
+                if fade.len > 0 {
+                    *curvature = fade_curve_drag_value(fade, *anchor, *height, p.y);
+                } else {
+                    invalid_fade = true;
+                }
+            } else {
+                invalid_fade = true;
+            }
+        }
         Some(Gesture::Scrub { last }) => {
             *last = at;
             let _ = app.engine.execute("transport.locate", &json!({"at": at}));
@@ -2011,6 +2322,9 @@ fn drive_drag(app: &mut SoundApp, ctx: &egui::Context) {
         }
         _ => {}
     }
+    if invalid_fade {
+        app.gesture = None;
+    }
     if let Some(Gesture::Select { anchor, tracks, .. }) = &app.gesture {
         let r = Range::new(*anchor, snap(&s, at));
         if *tracks != s.edit.selected_tracks || r != s.edit.selection {
@@ -2031,25 +2345,31 @@ fn drive_drag(app: &mut SoundApp, ctx: &egui::Context) {
 
 fn finish_drag(app: &mut SoundApp, s: &Session, tl: Rect, p: Option<Pos2>) {
     match app.gesture.take() {
-        Some(Gesture::MoveClips { clips, delta, from_track, to_track, .. }) => {
-            let ids: Vec<u64> = clips.iter().map(|c| c.0).collect();
-            let mut params = json!({"clips": ids, "by": delta});
-            if to_track != from_track {
-                params["track"] = json!(to_track.0);
-            }
-            if delta != 0 || to_track != from_track {
-                let _ = app.run("edit.move_clips", params);
-            }
-        }
-        Some(Gesture::Fade { clip, track, fade_in, to }) => {
-            if let Some((_, c)) = s.find_clip(clip) {
-                // Not clamp: it panics on a zero-length clip.
-                let (a, b) = if fade_in { (c.start, to.max(c.start + 1).min(c.end())) } else { (to.max(c.start).min(c.end() - 1), c.end()) };
-                let _ = app.run("edit.fades_create", json!({"tracks": [track.0], "start": a, "end": b, "shape": "s-curve"}));
+        Some(Gesture::MoveClips { clips, delta, from_track, to_track, .. }) => drop_clips(app, clips, delta, from_track, to_track),
+        Some(Gesture::Fade { clip, fade_in, to, .. }) => {
+            let to = p.map_or(to, |p| sample_at(s, tl, p.x).max(0));
+            if let Some(fade) = s.find_clip(clip).and_then(|(_, c)| fade_drag_preview(c, fade_in, to)) {
+                let _ = app.run(
+                    "edit.fades_create",
+                    json!({"clip": clip.0, "side": if fade_in { "in" } else { "out" }, "length": fade.len, "shape": fade.shape.label(), "curvature": fade.curvature}),
+                );
             }
         }
-        Some(Gesture::TrimStart { clip, track, to }) => trim_clip(app, clip, track, to, true),
-        Some(Gesture::TrimEnd { clip, track, to }) => trim_clip(app, clip, track, to, false),
+        Some(Gesture::FadeCurve { clip, fade_in, curvature, anchor, height }) => {
+            if let Some((_, c)) = s.find_clip(clip).filter(|(_, c)| c.length > 0) {
+                let fade = if fade_in { c.fade_in } else { c.fade_out };
+                let curvature = p.map_or(curvature, |p| fade_curve_drag_value(fade, anchor, height, p.y));
+                if fade.len > 0 && (fade.curvature - curvature).abs() > 1e-6 {
+                    let _ = app.run(
+                        "edit.fades_create",
+                        json!({"clip": clip.0, "side": if fade_in { "in" } else { "out" }, "length": fade.len, "shape": fade.shape.label(), "curvature": curvature}),
+                    );
+                }
+            }
+        }
+        Some(Gesture::TrimStart { clip, to, .. }) => trim_clip(app, clip, to, true),
+        Some(Gesture::TrimEnd { clip, to, .. }) => trim_clip(app, clip, to, false),
+        Some(Gesture::MidiClip { track, from, to }) => new_midi_clip(app, s, track, from, to),
         Some(Gesture::Pencil { track, points }) => {
             if let Some(param) = s.track(track).and_then(|t| AutoParam::parse(&t.view)) {
                 let pid = automation_id(&param);
@@ -2085,22 +2405,120 @@ fn automation_id(p: &AutoParam) -> String {
     }
 }
 
-fn trim_clip(app: &mut SoundApp, clip: ClipId, track: TrackId, to: Samples, start: bool) {
-    let cmd = if start { "edit.trim_start_to_insertion" } else { "edit.trim_end_to_insertion" };
-    // Trims through the command layer: select the clip's track and position the insertion.
-    let sel_before = app.engine.session().edit.selection;
-    let tracks_before: Vec<u64> = app.engine.session().edit.selected_tracks.iter().map(|x| x.0).collect();
-    let c = app.engine.session().find_clip(clip).map(|(_, c)| c.clone());
-    if let Some(c) = c {
-        if start && to < c.start || !start && to > c.end() {
-            // Extending: use trim to fill selection with handles.
-            let r = if start { Range::new(to, c.end()) } else { Range::new(c.start, to) };
-            let _ = app.run("edit.trim_to_fill_selection", json!({"clips": [clip.0], "start": r.start, "end": r.end}));
-        } else {
-            let _ = app.run(cmd, json!({"tracks": [track.0], "at": to}));
-        }
+/// Grid snapping while dragging; holding Cmd/Ctrl swaps Grid and Slip.
+fn drag_snap(s: &Session, at: Samples, flip: bool) -> Samples {
+    if s.edit.edit_mode.is_grid() != flip { s.edit.grid.snap(at, s.sample_rate, &s.tempo, s.frame_rate) } else { at }
+}
+
+/// What a clip drag works out once per target track rather than every frame: where the tracks go
+/// (None when the clips can't land there), each destination's earliest clip and Shuffle slots,
+/// the clips that move (track, start, length) and the clip Grid snaps.
+struct DragPlan {
+    dest: Option<Vec<(TrackId, TrackId)>>,
+    groups: Vec<(TrackId, Samples, Vec<Samples>)>,
+    moving: Vec<(TrackId, Samples, Samples)>,
+    grabbed: Option<Clip>,
+}
+
+/// The [`DragPlan`] for `clips` grabbed at `grab_at` on track `from` and dragged onto `to`, kept
+/// until the document, the Edit mode or the target changes.
+fn drag_plan(ctx: &egui::Context, s: &Session, revision: u64, clips: &[ClipId], (from, to): (TrackId, TrackId), grab_at: Samples) -> Arc<DragPlan> {
+    type Key = (u64, EditMode, Vec<ClipId>, TrackId, TrackId, Samples);
+    let id = egui::Id::new("clip_drag_plan");
+    let key: Key = (revision, s.edit.edit_mode, clips.to_vec(), from, to, grab_at);
+    if let Some((k, plan)) = ctx.data(|d| d.get_temp::<(Key, Arc<DragPlan>)>(id))
+        && k == key
+    {
+        return plan;
     }
-    let _ = app.engine.execute("edit.select", &json!({"tracks": tracks_before, "start": sel_before.start, "end": sel_before.end}));
+    let dest = if to == from { Some(Vec::new()) } else { ops::destinations(s, clips, from, to) };
+    let groups = match &dest {
+        Some(d) if s.edit.edit_mode == EditMode::Shuffle => {
+            ops::shuffle_groups(s, clips, d).into_iter().map(|(t, first)| (t, first, ops::shuffle_slots(s, t, clips))).collect()
+        }
+        _ => Vec::new(),
+    };
+    let ids: HashSet<ClipId> = clips.iter().copied().collect();
+    let movable = |c: &&Clip| ids.contains(&c.id) && !ops::locked(c);
+    let moving = s.tracks.iter().flat_map(|t| t.clips().iter().filter(movable).map(|c| (t.id, c.start, c.length))).collect();
+    let mine: Vec<&Clip> = s.track(from).map(|t| t.clips().iter().filter(movable).collect()).unwrap_or_default();
+    let grabbed = mine.iter().rev().find(|c| c.range().contains(grab_at)).or_else(|| mine.iter().min_by_key(|c| c.start)).map(|c| (*c).clone());
+    let plan = Arc::new(DragPlan { dest, groups, moving, grabbed });
+    ctx.data_mut(|d| d.insert_temp(id, (key, Arc::clone(&plan))));
+    plan
+}
+
+/// How far a Grabber drag by `raw` from track `from` takes the clips in the current Edit mode.
+/// Shuffle lands the earliest clip bound for the target track on a slot there, as
+/// `edit.move_clips` does; Grid snaps the grabbed clip.
+fn move_delta(plan: &DragPlan, s: &Session, from: TrackId, raw: Samples, flip: bool) -> Samples {
+    let mode = s.edit.edit_mode;
+    if mode == EditMode::Shuffle {
+        let to = plan.dest.as_ref().map_or(from, |d| ops::lands(d, from));
+        plan.groups
+            .iter()
+            .find(|g| g.0 == to)
+            .map_or(raw, |(_, first, slots)| ops::nearest_slot(slots, first.saturating_add(raw)).saturating_sub(*first))
+    } else if mode.is_grid() != flip
+        && let Some(c) = &plan.grabbed
+    {
+        ops::grid_delta(s, c, raw, mode == EditMode::GridRelative)
+    } else {
+        raw
+    }
+}
+
+/// The dragged clips with one from the grabbed track first: `edit.move_clips` sends that track to
+/// the target and the others along with it.
+fn grabbed_first(s: &Session, clips: &[ClipId], from: TrackId) -> Vec<ClipId> {
+    let mut v = clips.to_vec();
+    v.sort_by_key(|c| s.find_clip(*c).is_none_or(|(t, _)| t != from));
+    v
+}
+
+fn drop_clips(app: &mut SoundApp, clips: Vec<ClipId>, delta: Samples, from: TrackId, to: TrackId) {
+    let s = app.engine.session();
+    let spot = Spot::clips(s, grabbed_first(s, &clips, from), (to != from).then_some(to), delta);
+    spot_or_run(app, spot);
+}
+
+fn trim_clip(app: &mut SoundApp, clip: ClipId, to: Samples, start: bool) {
+    let spot = Spot::trim(app.engine.session(), clip, start, to);
+    spot_or_run(app, spot);
+}
+
+/// Spot mode asks for exact positions first; the other modes make the edit straight away.
+fn spot_or_run(app: &mut SoundApp, spot: Option<Spot>) {
+    let Some(spot) = spot else { return };
+    if app.engine.session().edit.edit_mode == EditMode::Spot {
+        app.dialogs.open = Some(Dialog::Spot(spot));
+    } else if let Some((id, params)) = spot.command(app.engine.session()) {
+        let _ = app.run(&id, params);
+    }
+}
+
+/// Whole bars from `from` to `to` (at least one), inside the gap between clips where `from` is.
+fn midi_clip_span(s: &Session, track: TrackId, from: Samples, to: Samples) -> Option<Range> {
+    let clips = s.track(track)?.clips();
+    let bar = GridValue::Note { value: NoteValue::Bar, dotted: false, triplet: false };
+    let start = bar.line_at_or_before(from.min(to), s.sample_rate, &s.tempo, s.frame_rate);
+    let last = from.max(to);
+    let mut end = bar.line_at_or_before(last, s.sample_rate, &s.tempo, s.frame_rate);
+    if end < last || end <= start {
+        end = bar.next_line(end, s.sample_rate, &s.tempo, s.frame_rate);
+    }
+    let prev = clips.iter().map(Clip::end).filter(|&e| e <= from).max().unwrap_or(start);
+    let next = clips.iter().map(|c| c.start).filter(|&b| b > from).min().unwrap_or(end);
+    let r = Range::new(start.max(prev), end.min(next));
+    (!r.is_empty()).then_some(r)
+}
+
+fn new_midi_clip(app: &mut SoundApp, s: &Session, track: TrackId, from: Samples, to: Samples) {
+    if let Some(r) = midi_clip_span(s, track, from, to)
+        && let Ok(v) = app.run("midi.new_clip", json!({"track": track.0, "start": r.start, "end": r.end}))
+    {
+        let _ = app.run("edit.select", json!({"clips": [v["clip"]]}));
+    }
 }
 
 fn clip_context_menu(app: &mut SoundApp, ui: &mut Ui, clip: Option<ClipId>) {
@@ -2238,12 +2656,20 @@ fn overlay(app: &mut SoundApp, ui: &mut Ui, tl: Rect, area: Rect) {
         scroll_to = follow_to;
     }
     // Ghost of a clip move.
-    if let Some(Gesture::MoveClips { clips, delta, to_track, .. }) = &app.gesture {
-        let row = app.edit_layout.rows.iter().find(|(i, _)| *i == to_track.0).map(|(_, r)| *r);
-        for c in clips {
-            if let (Some((_, clip)), Some(r)) = (s.find_clip(*c), row) {
-                let x0 = x_of(s, tl, clip.start + delta);
-                let x1 = x_of(s, tl, clip.end() + delta);
+    if let Some(Gesture::MoveClips { clips, delta, from_track, to_track, grab_at }) = &app.gesture
+        && let plan = drag_plan(ui.ctx(), s, app.engine.revision, clips, (*from_track, *to_track), *grab_at)
+        && let Some(dest) = &plan.dest
+    {
+        for &(t, start, len) in &plan.moving {
+            let d = ops::lands(dest, t);
+            let start = plan
+                .groups
+                .iter()
+                .find(|g| g.0 == d)
+                .map_or(start + delta, |(_, first, slots)| ops::nearest_slot(slots, first + delta) + (start - first));
+            if let Some((_, r)) = app.edit_layout.rows.iter().find(|(i, _)| *i == d.0) {
+                let x0 = x_of(s, tl, start);
+                let x1 = x_of(s, tl, start + len);
                 painter.rect_stroke(
                     Rect::from_min_max(pos2(x0, r[1] + 1.0), pos2(x1, r[3] - 1.0)),
                     2.0,
@@ -2253,6 +2679,13 @@ fn overlay(app: &mut SoundApp, ui: &mut Ui, tl: Rect, area: Rect) {
             }
         }
     }
+    if let Some(Gesture::MidiClip { track, from, to }) = &app.gesture
+        && let Some(r) = midi_clip_span(s, *track, *from, *to)
+        && let Some((_, row)) = app.edit_layout.rows.iter().find(|(i, _)| *i == track.0)
+    {
+        let ghost = Rect::from_min_max(pos2(x_of(s, tl, r.start), row[1] + 1.0), pos2(x_of(s, tl, r.end), row[3] - 1.0));
+        painter.rect_stroke(ghost, 2.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Inside);
+    }
     if let Some(Gesture::TrimStart { to, clip, .. } | Gesture::TrimEnd { to, clip, .. }) = &app.gesture
         && let Some((tid, _)) = s.find_clip(*clip)
         && let Some((_, r)) = app.edit_layout.rows.iter().find(|(i, _)| *i == tid.0)
@@ -2260,18 +2693,13 @@ fn overlay(app: &mut SoundApp, ui: &mut Ui, tl: Rect, area: Rect) {
         let x = x_of(s, tl, *to);
         painter.line_segment([pos2(x, r[1]), pos2(x, r[3])], Stroke::new(2.0, Color32::WHITE));
     }
-    if let Some(Gesture::Fade { clip, fade_in, to, .. }) = &app.gesture
-        && let Some((tid, c)) = s.find_clip(*clip)
-        && let Some((_, r)) = app.edit_layout.rows.iter().find(|(i, _)| *i == tid.0)
-    {
-        let (a, b) = if *fade_in { (c.start, *to) } else { (*to, c.end()) };
-        let (x0, x1) = (x_of(s, tl, a), x_of(s, tl, b));
-        let (y0, y1) = (r[1] + 2.0, r[3] - 2.0);
-        let line = if *fade_in { [pos2(x0, y1), pos2(x1, y0)] } else { [pos2(x0, y0), pos2(x1, y1)] };
-        painter.line_segment(line, Stroke::new(2.0, Color32::WHITE));
-    }
     if let Some(at) = scroll_to {
         let _ = app.engine.execute("view.scroll", &json!({"to": at}));
+    }
+    if matches!(app.gesture, Some(Gesture::Fade { .. })) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+    } else if matches!(app.gesture, Some(Gesture::FadeCurve { .. })) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
     }
 }
 
@@ -2327,7 +2755,9 @@ mod tests {
 
     fn harness_with(engine: soundcraft_engine::Engine) -> Harness<'static, SoundApp> {
         let app = SoundApp::new(engine, None, crate::Services::default());
-        let mut h = Harness::builder().with_size(vec2(1400.0, 900.0)).with_step_dt(1.0 / 60.0).build_ui_state(
+        let builder = Harness::builder().with_size(vec2(1400.0, 900.0)).with_step_dt(1.0 / 60.0);
+        let builder = if std::env::var_os("SOUNDCRAFT_FADE_SHOTS").is_some() { builder.wgpu() } else { builder };
+        let mut h = builder.build_ui_state(
             |ui, app: &mut SoundApp| {
                 let ctx = ui.ctx().clone();
                 app.logic(&ctx);
@@ -2338,6 +2768,15 @@ mod tests {
         h.input_mut().max_texture_side = Some(8192);
         h.run_steps(4);
         h
+    }
+
+    #[test]
+    fn a_file_time_stamp_at_the_end_of_the_range_draws() {
+        let mut engine = soundcraft_engine::demo::demo_engine();
+        let s = engine.session_mut();
+        s.edit.flags.insert("view.clip.time.original".into());
+        s.sources.iter_mut().for_each(|src| src.time_reference = i64::MAX as u64);
+        harness_with(engine).run_steps(2);
     }
 
     fn smart_demo() -> Harness<'static, SoundApp> {
@@ -2598,6 +3037,706 @@ mod tests {
     }
 
     #[test]
+    fn fade_drag_ranges_handle_empty_short_and_saturated_clips() {
+        let mut c = Clip::audio(ClipId(1), "test", soundcraft_model::SourceId(1), 0, 100, 1);
+        for side in [true, false] {
+            for to in [i64::MIN, 100, 101, i64::MAX] {
+                assert_eq!(fade_drag_range(&c, side, to), Some(Range::new(100, 101)));
+            }
+            c.length = 0;
+            assert_eq!(fade_drag_range(&c, side, 100), None);
+            c.length = -1;
+            assert_eq!(fade_drag_range(&c, side, 100), None);
+            c.length = 1;
+        }
+        c.start = i64::MAX - 1;
+        c.length = 10;
+        for side in [true, false] {
+            assert_eq!(fade_drag_range(&c, side, i64::MAX), Some(Range::new(i64::MAX - 1, i64::MAX)));
+            c.start = i64::MAX;
+            assert_eq!(fade_drag_range(&c, side, i64::MAX), None);
+            c.start = i64::MAX - 1;
+        }
+    }
+
+    fn fade_shot(h: &mut Harness<SoundApp>, name: &str) {
+        if let Some(dir) = std::env::var_os("SOUNDCRAFT_FADE_SHOTS") {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            h.render().unwrap().save(dir.join(format!("{name}.png"))).unwrap();
+        }
+    }
+
+    fn fade_curves(h: &Harness<SoundApp>, clip_rect: Rect) -> Vec<(egui::epaint::PathShape, Rect)> {
+        h.output()
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Path(path)
+                    if path.stroke == egui::epaint::PathStroke::new(1.2, Color32::from_rgba_unmultiplied(255, 255, 255, 90))
+                        && path.points.iter().all(|point| clip_rect.contains(*point)) =>
+                {
+                    Some((path.clone(), shape.clip_rect))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn waveform_geometry(h: &Harness<SoundApp>, clip_rect: Rect) -> Vec<Vec<Pos2>> {
+        h.output()
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                // The waveform's columns snap to physical pixels and fade out over half of one.
+                Shape::Mesh(mesh) if !mesh.vertices.is_empty() && mesh.vertices.iter().all(|vertex| clip_rect.expand(1.0).contains(vertex.pos)) => {
+                    Some(mesh.vertices.iter().map(|vertex| vertex.pos).collect())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn waveforms_follow_fade_drags_before_release_and_match_the_committed_waveform() {
+        for channels in [1, 2] {
+            for fade_in in [true, false] {
+                for bend in [false, true] {
+                    for mode in ["peak", "power", "rectified", "outlines"] {
+                        let mut h = smart_demo();
+                        let tl = timeline(&h);
+                        let (clip, lane) = clip_on_screen(&h, |xs, xe| xs > tl.min.x + 30.0 && xe < tl.max.x - 100.0 && xe - xs > 100.0);
+                        let (tid, _) = h.state().engine.session().find_clip(clip.id).unwrap();
+                        let neighbour = h
+                            .state()
+                            .engine
+                            .session()
+                            .track(tid)
+                            .unwrap()
+                            .clips()
+                            .iter()
+                            .find(|c| c.id != clip.id && c.start >= clip.end())
+                            .unwrap()
+                            .clone();
+                        let source = clip.source().unwrap();
+                        if channels == 2 {
+                            let audio = h.state().engine.session().pool.get(source).unwrap().clone();
+                            let left = audio.buffer.channels[0].clone();
+                            let right = left.iter().map(|sample| sample * 0.5).collect();
+                            let audio = soundcraft_model::SourceAudio::new(soundcraft_audio_io::AudioBuffer {
+                                sample_rate: audio.buffer.sample_rate,
+                                channels: vec![left, right],
+                            });
+                            let s = h.state_mut().engine.session_mut();
+                            s.pool.insert(source, std::sync::Arc::new(audio));
+                            s.track_mut(tid).unwrap().format = soundcraft_model::ChannelFormat::Stereo;
+                        }
+                        if mode == "power" {
+                            h.state_mut().engine.execute("view.waveform_power", &json!({})).unwrap();
+                        }
+                        h.state_mut().engine.execute("view.waveform_rectified", &json!({"value": mode == "rectified"})).unwrap();
+                        h.state_mut().engine.execute("view.waveform_outlines", &json!({"value": mode == "outlines"})).unwrap();
+                        h.state_mut().engine.execute("view.waveform_zoom", &json!({"value": 1.4})).unwrap();
+                        let c = h.state_mut().engine.session_mut().find_clip_mut(clip.id).unwrap();
+                        c.gain_db = -3.0;
+                        c.gain_env = vec![(0, -3.0), (c.length, 3.0)];
+                        let target = soundcraft_model::Fade {
+                            len: if bend { c.length * 2 / 3 } else { c.length / 4 },
+                            shape: soundcraft_model::FadeShape::SCurve,
+                            curvature: 0.0,
+                        };
+                        let other = soundcraft_model::Fade { len: c.length / 8, shape: soundcraft_model::FadeShape::Linear, curvature: 0.2 };
+                        (c.fade_in, c.fade_out) = if fade_in { (target, other) } else { (other, target) };
+                        h.step();
+                        let before = h.state().engine.session().clone();
+                        let undo_len = h.state().engine.undo_history().len();
+                        let audio = before.pool.get(source).unwrap().clone();
+                        let (xs, xe) = (x_of(&before, tl, clip.start), x_of(&before, tl, clip.end()));
+                        let clip_rect = Rect::from_min_max(pos2(xs, lane.min.y), pos2(xe, lane.max.y)).intersect(tl);
+                        let neighbour_rect = Rect::from_min_max(
+                            pos2(x_of(&before, tl, neighbour.start), lane.min.y),
+                            pos2(x_of(&before, tl, neighbour.end()), lane.max.y),
+                        )
+                        .intersect(tl);
+                        let original = waveform_geometry(&h, clip_rect);
+                        let neighbour_wave = waveform_geometry(&h, neighbour_rect);
+                        assert_eq!(original.len(), channels);
+                        let side = if fade_in { "in" } else { "out" };
+                        let operation = if bend { "bend" } else { "length" };
+                        let screenshot = channels == 1 && mode == "peak";
+                        if screenshot {
+                            fade_shot(&mut h, &format!("waveform-{side}-{operation}-before"));
+                        }
+                        let (press, to) = if bend {
+                            let c = before.find_clip(clip.id).unwrap().1;
+                            let midpoint = fade_midpoint(&before, tl, lane, c, fade_in).unwrap();
+                            (midpoint, midpoint - vec2(0.0, 16.0))
+                        } else {
+                            (
+                                pos2(if fade_in { xs + 6.0 } else { xe - 6.0 }, lane.min.y + 4.0),
+                                pos2(xs + (xe - xs) * if fade_in { 0.7 } else { 0.3 }, lane.min.y + 4.0),
+                            )
+                        };
+                        h.hover_at(press);
+                        h.drag_at(press);
+                        h.hover_at(to);
+                        h.step();
+                        h.step();
+                        assert!(if bend {
+                            matches!(h.state().gesture, Some(Gesture::FadeCurve { .. }))
+                        } else {
+                            matches!(h.state().gesture, Some(Gesture::Fade { .. }))
+                        });
+                        let preview = waveform_geometry(&h, clip_rect);
+                        assert_eq!(preview.len(), channels);
+                        for channel in 0..channels {
+                            assert_ne!(
+                                preview[channel], original[channel],
+                                "the waveform must respond while the button is held: {side}, {operation}, {mode}, channel={channel}"
+                            );
+                        }
+                        assert_eq!(waveform_geometry(&h, neighbour_rect), neighbour_wave);
+                        assert_eq!(h.state().engine.session(), &before);
+                        assert_eq!(h.state().engine.undo_history().len(), undo_len);
+                        assert!(
+                            std::sync::Arc::ptr_eq(h.state().engine.session().pool.get(source).unwrap(), &audio),
+                            "preview must retain cached media and peaks"
+                        );
+                        if screenshot {
+                            fade_shot(&mut h, &format!("waveform-{side}-{operation}-preview"));
+                        }
+                        h.drop_at(to);
+                        h.step();
+                        assert!(h.state().gesture.is_none());
+                        assert_eq!(waveform_geometry(&h, clip_rect), preview, "release must not cause a waveform jump");
+                        assert_eq!(waveform_geometry(&h, neighbour_rect), neighbour_wave);
+                        assert_eq!(h.state().engine.undo_history().len(), undo_len + 1);
+                        assert!(std::sync::Arc::ptr_eq(h.state().engine.session().pool.get(source).unwrap(), &audio));
+                        if screenshot {
+                            fade_shot(&mut h, &format!("waveform-{side}-{operation}-released"));
+                        }
+                        assert!(h.state_mut().engine.undo());
+                        assert_eq!(h.state().engine.session(), &before);
+                        h.step();
+                        assert_eq!(waveform_geometry(&h, clip_rect), original);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fade_drag_previews_and_commits_stay_inside_the_clip() {
+        for fade_in in [true, false] {
+            for release_outside in [false, true] {
+                let mut h = smart_demo();
+                let tl = timeline(&h);
+                let (clip, lane) = clip_on_screen(&h, |xs, xe| xs > tl.min.x + 30.0 && xe < tl.max.x - 100.0 && xe - xs > 100.0);
+                let s = h.state().engine.session();
+                let (xs, xe) = (x_of(s, tl, clip.start), x_of(s, tl, clip.end()));
+                let corner = pos2(if fade_in { xs + 6.0 } else { xe - 6.0 }, lane.min.y + 4.0);
+                let before = s.clone();
+                let undo_len = h.state().engine.undo_history().len();
+                start_drag(&mut h, corner);
+                assert!(matches!(h.state().gesture, Some(Gesture::Fade { fade_in: side, .. }) if side == fade_in));
+                let name = if fade_in { "fade-in" } else { "fade-out" };
+                for (label, x) in [("left", xs - 60.0), ("right", xe + 60.0), ("inside", (xs + xe) / 2.0)] {
+                    h.hover_at(pos2(x, corner.y));
+                    h.step();
+                    let s = h.state().engine.session();
+                    let range = fade_drag_range(&clip, fade_in, sample_at(s, tl, x)).unwrap();
+                    let curves = fade_curves(&h, Rect::from_min_max(pos2(xs, lane.min.y), pos2(xe, lane.max.y)));
+                    assert_eq!(curves.len(), 1, "only one fade curve should be painted");
+                    let (curve, clip_rect) = &curves[0];
+                    let points = &curve.points;
+                    assert_eq!(points.first().unwrap().x, x_of(s, tl, range.start));
+                    assert_eq!(points.last().unwrap().x, x_of(s, tl, range.end));
+                    assert!(points.iter().all(|p| p.x >= xs && p.x <= xe && lane.contains(*p)));
+                    assert!(clip_rect.min.x >= xs && clip_rect.max.x <= xe);
+                    assert_eq!(h.state().engine.session(), &before, "drag must only preview");
+                    if !release_outside {
+                        fade_shot(&mut h, &format!("{name}-{label}"));
+                    }
+                }
+                // Releasing at a new point without an intervening move must use that point.
+                let release = pos2(if release_outside { if fade_in { xe + 60.0 } else { xs - 60.0 } } else { xs + (xe - xs) * 0.3 }, corner.y);
+                h.drop_at(release);
+                h.step();
+                assert!(h.state().gesture.is_none());
+                let range = fade_drag_range(&clip, fade_in, sample_at(&before, tl, release.x)).unwrap();
+                let mut expected = before.clone();
+                let c = expected.find_clip_mut(clip.id).unwrap();
+                let fade = soundcraft_model::Fade { len: range.end - range.start, shape: soundcraft_model::FadeShape::SCurve, curvature: 0.0 };
+                if fade_in {
+                    c.fade_in = fade;
+                } else {
+                    c.fade_out = fade;
+                }
+                assert_eq!(h.state().engine.session(), &expected);
+                assert_eq!(h.state().engine.undo_history().len(), undo_len + 1);
+                if release_outside {
+                    assert_eq!(fade.len, clip.length);
+                    fade_shot(&mut h, &format!("{name}-committed"));
+                }
+                assert!(h.state_mut().engine.undo());
+                assert_eq!(h.state().engine.session(), &before);
+                assert!(h.state_mut().engine.redo());
+                assert_eq!(h.state().engine.session(), &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn a_fade_drag_replaces_the_old_curve_and_matches_the_released_curve() {
+        for fade_in in [true, false] {
+            for show_name in [true, false] {
+                let mut h = smart_demo();
+                h.state_mut().engine.execute("view.clip_name", &json!({"value": show_name})).unwrap();
+                h.step();
+                let tl = timeline(&h);
+                let (clip, lane) = clip_on_screen(&h, |xs, xe| xs > tl.min.x + 30.0 && xe < tl.max.x - 100.0 && xe - xs > 100.0);
+                let c = h.state_mut().engine.session_mut().find_clip_mut(clip.id).unwrap();
+                c.fade_in = soundcraft_model::Fade { len: c.length / 8, shape: soundcraft_model::FadeShape::Linear, curvature: 0.0 };
+                c.fade_out = soundcraft_model::Fade { len: c.length / 8, shape: soundcraft_model::FadeShape::EqualPower, curvature: 0.0 };
+                h.step();
+                let s = h.state().engine.session();
+                let (xs, xe) = (x_of(s, tl, clip.start), x_of(s, tl, clip.end()));
+                let clip_rect = Rect::from_min_max(pos2(xs, lane.min.y), pos2(xe, lane.max.y));
+                let original = fade_curves(&h, clip_rect);
+                assert_eq!(original.len(), 2);
+                let (edited, opposite) = if fade_in { (0, 1) } else { (1, 0) };
+                let before = s.clone();
+                let corner = pos2(if fade_in { xs + 6.0 } else { xe - 6.0 }, lane.min.y + 4.0);
+                start_drag(&mut h, corner);
+                let to = pos2(if fade_in { xs + (xe - xs) * 0.65 } else { xs + (xe - xs) * 0.35 }, corner.y);
+                h.hover_at(to);
+                h.step();
+                let preview = fade_curves(&h, clip_rect);
+                assert_eq!(preview.len(), 2, "one curve per side, without the old curve underneath");
+                assert_ne!(preview[edited], original[edited]);
+                assert_eq!(preview[opposite], original[opposite]);
+                assert_eq!(h.state().engine.session(), &before);
+                assert!(!h.output().shapes.iter().any(|shape| {
+                    matches!(&shape.shape, Shape::LineSegment { points, stroke } if stroke.width == 2.0 && stroke.color == Color32::WHITE && points.iter().all(|p| clip_rect.contains(*p)))
+                }), "the straight preview must be gone");
+                let side = if fade_in { "in" } else { "out" };
+                if show_name {
+                    fade_shot(&mut h, &format!("fade-{side}-curve-dragging"));
+                }
+                h.drop_at(to);
+                h.step();
+                assert_eq!(fade_curves(&h, clip_rect), preview, "curve geometry, thickness and colour must be identical after release");
+                if show_name {
+                    fade_shot(&mut h, &format!("fade-{side}-curve-released"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fade_curve_sampling_keeps_steep_bends_below_a_quarter_pixel_error() {
+        for (width, height) in [(420.0, 180.0), (75.0, 320.0), (10_000.0, 80.0)] {
+            let body = Rect::from_min_size(Pos2::ZERO, vec2(width, height));
+            for scale in [1.0, 2.0, 4.0] {
+                for shape in soundcraft_model::FadeShape::ALL {
+                    for curvature in [-1.0, 1.0] {
+                        for fade_in in [true, false] {
+                            let fade = soundcraft_model::Fade { len: 1000, shape, curvature };
+                            let points = fade_curve_points(fade, fade_in, 0.0, width, body, scale);
+                            assert!(points.len() > 17 && points.len() <= 4097);
+                            assert_eq!((points.len() - 1) % 2, 0);
+                            let segments = (points.len() - 1) as f32;
+                            for (i, pair) in points.windows(2).enumerate() {
+                                let line = pair[1] - pair[0];
+                                for fraction in [0.25, 0.5, 0.75] {
+                                    let t = (i as f32 + fraction) / segments;
+                                    let actual = pos2(width * t, height - height * fade.gain(if fade_in { t } else { 1.0 - t }));
+                                    let along = ((actual - pair[0]).dot(line) / line.length_sq()).clamp(0.0, 1.0);
+                                    let distance = actual.distance(pair[0] + line * along) * scale;
+                                    assert!(
+                                        distance < 0.25,
+                                        "{width}x{height}, scale={scale}, {shape:?}, curve={curvature}, side={fade_in}, error={distance}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let body = Rect::from_min_size(Pos2::ZERO, vec2(1e20, 1e20));
+        for scale in [f32::NAN, f32::INFINITY, 1.0] {
+            let points = fade_curve_points(soundcraft_model::Fade::default(), true, 0.0, 1e20, body, scale);
+            assert!(points.len() <= 4097);
+        }
+    }
+
+    fn painted_fade_control(h: &Harness<SoundApp>, clip_rect: Rect) -> Pos2 {
+        let controls: Vec<_> = h
+            .output()
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                Shape::Circle(circle) if circle.radius == 3.5 && clip_rect.contains(circle.center) => {
+                    let radius = circle.radius + circle.stroke.width * 0.5;
+                    for offset in [vec2(radius, 0.0), vec2(-radius, 0.0), vec2(0.0, radius), vec2(0.0, -radius)] {
+                        assert!(shape.clip_rect.contains(circle.center + offset), "the complete control must remain visible");
+                    }
+                    Some(circle.center)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(controls.len(), 1, "the midpoint must stay visible without hover or a held mouse button");
+        controls[0]
+    }
+
+    #[test]
+    fn fade_midpoint_handles_remain_visible_and_can_be_grabbed_again() {
+        for fade_in in [true, false] {
+            for show_name in [true, false] {
+                for shape in [soundcraft_model::FadeShape::SCurve, soundcraft_model::FadeShape::Exponential] {
+                    for height in ["micro", "jumbo"] {
+                        let mut h = smart_demo();
+                        let tl = timeline(&h);
+                        let (clip, _) = clip_on_screen(&h, |xs, xe| xs > tl.min.x + 30.0 && xe < tl.max.x - 100.0 && xe - xs > 100.0);
+                        let (tid, _) = h.state().engine.session().find_clip(clip.id).unwrap();
+                        let spp = h.state().engine.session().edit.zoom.samples_per_px * 0.5;
+                        h.state_mut().engine.execute("view.clip_name", &json!({"value": show_name})).unwrap();
+                        h.state_mut().engine.execute("track.height", &json!({"tracks": [tid.0], "height": height})).unwrap();
+                        h.state_mut().engine.execute("view.zoom_set", &json!({"samples_per_px": spp})).unwrap();
+                        h.state_mut().engine.execute("view.scroll", &json!({"to": clip.start - clip.length / 5})).unwrap();
+                        let c = h.state_mut().engine.session_mut().find_clip_mut(clip.id).unwrap();
+                        let fade = soundcraft_model::Fade { len: c.length * 2 / 3, shape, curvature: 0.0 };
+                        if fade_in {
+                            c.fade_in = fade;
+                        } else {
+                            c.fade_out = fade;
+                        }
+                        h.step();
+                        let row = h.state().edit_layout.rows.iter().find(|(id, _)| *id == tid.0).unwrap().1;
+                        let lane = lane_rect(h.state().engine.session().track(tid).unwrap(), rect(row), tl);
+                        let s = h.state().engine.session();
+                        let clip_rect = Rect::from_min_max(pos2(x_of(s, tl, clip.start), lane.min.y), pos2(x_of(s, tl, clip.end()), lane.max.y));
+                        let control = painted_fade_control(&h, clip_rect);
+                        let undo_len = h.state().engine.undo_history().len();
+                        start_drag(&mut h, control);
+                        let outside = control + vec2(0.0, 500.0);
+                        h.hover_at(outside);
+                        h.step();
+                        h.drop_at(outside);
+                        h.step();
+                        let c = h.state().engine.session().find_clip(clip.id).unwrap().1;
+                        assert_eq!(if fade_in { c.fade_in.curvature } else { c.fade_out.curvature }, -1.0);
+                        assert!(h.state().gesture.is_none());
+                        painted_fade_control(&h, clip_rect);
+                        let side = if fade_in { "in" } else { "out" };
+                        let screenshot = show_name && height == "jumbo" && shape == soundcraft_model::FadeShape::SCurve;
+                        if screenshot {
+                            fade_shot(&mut h, &format!("fade-{side}-smooth-released"));
+                        }
+                        for iteration in 0..2 {
+                            let before = h.state().engine.session().clone();
+                            let control = painted_fade_control(&h, clip_rect);
+                            h.hover_at(control);
+                            h.step();
+                            assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::ResizeVertical);
+                            start_drag(&mut h, control);
+                            let to = control - vec2(0.0, (lane.height() - 2.0 - clip_name_height(&before, lane)) * 0.1);
+                            h.hover_at(to);
+                            h.step();
+                            assert!(
+                                matches!(h.state().gesture, Some(Gesture::FadeCurve { clip: id, fade_in: side, .. }) if id == clip.id && side == fade_in)
+                            );
+                            h.drop_at(to);
+                            h.step();
+                            let c = h.state().engine.session().find_clip(clip.id).unwrap().1;
+                            let current = if fade_in { c.fade_in } else { c.fade_out };
+                            let previous = before.find_clip(clip.id).unwrap().1;
+                            let previous = if fade_in { previous.fade_in } else { previous.fade_out };
+                            assert!(current.curvature > previous.curvature);
+                            assert_eq!((current.len, current.shape), (previous.len, previous.shape));
+                            painted_fade_control(&h, clip_rect);
+                            assert_eq!(h.state().engine.undo_history().len(), undo_len + iteration + 2);
+                            if screenshot && iteration == 1 {
+                                fade_shot(&mut h, &format!("fade-{side}-smooth-regrabbed"));
+                            }
+                            let after = h.state().engine.session().clone();
+                            assert!(h.state_mut().engine.undo());
+                            assert_eq!(h.state().engine.session(), &before);
+                            assert!(h.state_mut().engine.redo());
+                            assert_eq!(h.state().engine.session(), &after);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fade_midpoints_drag_vertically_without_moving_the_endpoints() {
+        for fade_in in [true, false] {
+            for show_name in [true, false] {
+                for dy in [-16.0, 16.0] {
+                    let mut h = smart_demo();
+                    h.state_mut().engine.execute("view.clip_name", &json!({"value": show_name})).unwrap();
+                    h.step();
+                    let tl = timeline(&h);
+                    let (clip, lane) = clip_on_screen(&h, |xs, xe| xs > tl.min.x + 30.0 && xe < tl.max.x - 100.0 && xe - xs > 100.0);
+                    let c = h.state_mut().engine.session_mut().find_clip_mut(clip.id).unwrap();
+                    let target = soundcraft_model::Fade { len: c.length * 2 / 3, shape: soundcraft_model::FadeShape::SCurve, curvature: 0.0 };
+                    let other = soundcraft_model::Fade { len: c.length / 8, shape: soundcraft_model::FadeShape::Linear, curvature: -0.2 };
+                    (c.fade_in, c.fade_out) = if fade_in { (target, other) } else { (other, target) };
+                    h.step();
+                    let before = h.state().engine.session().clone();
+                    let clip_rect =
+                        Rect::from_min_max(pos2(x_of(&before, tl, clip.start), lane.min.y), pos2(x_of(&before, tl, clip.end()), lane.max.y));
+                    let original = fade_curves(&h, clip_rect);
+                    let (edited, opposite) = if fade_in { (0, 1) } else { (1, 0) };
+                    let middle = original[edited].0.points.len() / 2;
+                    let midpoint = original[edited].0.points[middle];
+                    let undo_len = h.state().engine.undo_history().len();
+                    h.hover_at(midpoint);
+                    h.step();
+                    assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::ResizeVertical);
+                    click(&mut h, midpoint);
+                    assert_eq!(h.state().engine.session(), &before, "clicking the curve control should not change the selection");
+                    h.drag_at(midpoint);
+                    let to = midpoint + vec2(0.0, dy);
+                    h.hover_at(to);
+                    h.step();
+                    h.step(); // Paint the frame requested when the drag gesture starts.
+                    let curvature = match h.state().gesture {
+                        Some(Gesture::FadeCurve { clip: id, fade_in: side, curvature, .. }) if id == clip.id && side == fade_in => curvature,
+                        _ => panic!("the midpoint must start a curve gesture"),
+                    };
+                    assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::ResizeVertical);
+                    assert!(if dy < 0.0 { curvature > 0.0 } else { curvature < 0.0 });
+                    let preview = fade_curves(&h, clip_rect);
+                    assert_eq!(preview.len(), 2);
+                    assert_eq!(preview[opposite], original[opposite]);
+                    assert_eq!(preview[edited].0.points.first(), original[edited].0.points.first());
+                    assert_eq!(preview[edited].0.points.last(), original[edited].0.points.last());
+                    assert_eq!(preview[edited].0.points[middle].x, midpoint.x);
+                    assert!(
+                        (preview[edited].0.points[middle].y - (midpoint.y + dy)).abs() < 0.001,
+                        "side={fade_in}, names={show_name}, dy={dy}, midpoint={midpoint:?}, drawn={:?}, gesture={:?}",
+                        preview[edited].0.points[middle],
+                        h.state().gesture
+                    );
+                    assert_eq!(h.state().engine.session(), &before);
+                    let side = if fade_in { "in" } else { "out" };
+                    let direction = if dy < 0.0 { "up" } else { "down" };
+                    if show_name {
+                        fade_shot(&mut h, &format!("fade-{side}-bend-{direction}-preview"));
+                    }
+                    h.drop_at(to);
+                    h.step();
+                    let mut expected = before.clone();
+                    let c = expected.find_clip_mut(clip.id).unwrap();
+                    if fade_in {
+                        c.fade_in.curvature = curvature;
+                    } else {
+                        c.fade_out.curvature = curvature;
+                    }
+                    assert_eq!(h.state().engine.session(), &expected);
+                    assert_eq!(fade_curves(&h, clip_rect), preview, "the released envelope must match the preview");
+                    let rel = if fade_in { target.len / 2 } else { clip.length - target.len / 2 };
+                    let previous_gain = before.find_clip(clip.id).unwrap().1.gain_at(rel);
+                    let new_gain = expected.find_clip(clip.id).unwrap().1.gain_at(rel);
+                    assert!(if dy < 0.0 { new_gain > previous_gain } else { new_gain < previous_gain });
+                    assert_eq!(h.state().engine.undo_history().len(), undo_len + 1);
+                    if show_name {
+                        fade_shot(&mut h, &format!("fade-{side}-bend-{direction}-released"));
+                    }
+                    assert!(h.state_mut().engine.undo());
+                    assert_eq!(h.state().engine.session(), &before);
+                    assert!(h.state_mut().engine.redo());
+                    assert_eq!(h.state().engine.session(), &expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fade_curve_drags_cancel_safely_or_return_to_the_original_curve() {
+        for invalidate in [0, 1, 2] {
+            let mut h = smart_demo();
+            let tl = timeline(&h);
+            let (clip, lane) = clip_on_screen(&h, |xs, xe| xs > tl.min.x + 30.0 && xe < tl.max.x - 100.0 && xe - xs > 100.0);
+            let c = h.state_mut().engine.session_mut().find_clip_mut(clip.id).unwrap();
+            c.fade_out = soundcraft_model::Fade { len: c.length * 2 / 3, shape: soundcraft_model::FadeShape::SCurve, curvature: 0.0 };
+            h.step();
+            let midpoint =
+                fade_midpoint(h.state().engine.session(), tl, lane, h.state().engine.session().find_clip(clip.id).unwrap().1, false).unwrap();
+            let before = h.state().engine.session().clone();
+            let undo_len = h.state().engine.undo_history().len();
+            start_drag(&mut h, midpoint);
+            h.hover_at(midpoint - vec2(0.0, 16.0));
+            h.step();
+            assert!(matches!(h.state().gesture, Some(Gesture::FadeCurve { .. })));
+            if invalidate == 1 {
+                h.state_mut().engine.session_mut().find_clip_mut(clip.id).unwrap().length = 0;
+            } else if invalidate == 2 {
+                let (tid, _) = before.find_clip(clip.id).unwrap();
+                h.state_mut().engine.session_mut().track_mut(tid).unwrap().playlist_mut().unwrap().clips.retain(|c| c.id != clip.id);
+            }
+            h.hover_at(midpoint);
+            h.step();
+            h.drop_at(midpoint);
+            h.step();
+            assert!(h.state().gesture.is_none());
+            assert_eq!(h.state().engine.undo_history().len(), undo_len);
+            if invalidate == 0 {
+                assert_eq!(h.state().engine.session(), &before);
+            }
+        }
+    }
+
+    #[test]
+    fn existing_fades_drag_from_their_upper_curve_endpoints() {
+        for fade_in in [true, false] {
+            for show_name in [true, false] {
+                for full_length in [false, true] {
+                    let mut h = smart_demo();
+                    h.state_mut().engine.execute("view.clip_name", &json!({"value": show_name})).unwrap();
+                    h.step();
+                    let tl = timeline(&h);
+                    let (clip, lane) = clip_on_screen(&h, |xs, xe| xs > tl.min.x + 30.0 && xe < tl.max.x - 100.0 && xe - xs > 100.0);
+                    let len = if full_length { clip.length } else { clip.length * 2 / 3 };
+                    let c = h.state_mut().engine.session_mut().find_clip_mut(clip.id).unwrap();
+                    let fade = soundcraft_model::Fade { len, shape: soundcraft_model::FadeShape::SCurve, curvature: 0.35 };
+                    if fade_in {
+                        c.fade_in = fade;
+                    } else {
+                        c.fade_out = fade;
+                    }
+                    h.step();
+                    let s = h.state().engine.session();
+                    let (xs, xe) = (x_of(s, tl, clip.start), x_of(s, tl, clip.end()));
+                    let curves = fade_curves(&h, Rect::from_min_max(pos2(xs, lane.min.y), pos2(xe, lane.max.y)));
+                    assert_eq!(curves.len(), 1);
+                    let curve = &curves[0].0;
+                    // Take the handle from the painted curve, rather than duplicating hit geometry.
+                    let head = *if fade_in { curve.points.last() } else { curve.points.first() }.unwrap();
+                    let press = head + vec2(3.0, 2.0);
+                    if fade_in && full_length {
+                        let (tid, _) = s.find_clip(clip.id).unwrap();
+                        assert_ne!(
+                            clip_at(s.track(tid).unwrap(), sample_at(s, tl, press.x)).unwrap().id,
+                            clip.id,
+                            "the pointer should be over the adjacent clip"
+                        );
+                    }
+                    let before = s.clone();
+                    let undo_len = h.state().engine.undo_history().len();
+                    h.hover_at(press);
+                    h.step();
+                    assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::ResizeNwSe);
+                    let side = if fade_in { "in" } else { "out" };
+                    if show_name && !full_length {
+                        fade_shot(&mut h, &format!("fade-{side}-endpoint-hover"));
+                    }
+                    h.drag_at(press);
+                    let to = head + vec2(if fade_in { -35.0 } else { 35.0 }, 0.0);
+                    h.hover_at(to);
+                    h.step();
+                    assert!(matches!(h.state().gesture, Some(Gesture::Fade { clip: id, fade_in: side, .. }) if id == clip.id && side == fade_in));
+                    assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::ResizeNwSe);
+                    assert_eq!(h.state().engine.session(), &before, "pressing the handle must not move the edit selection");
+                    if show_name && !full_length {
+                        fade_shot(&mut h, &format!("fade-{side}-endpoint-dragging"));
+                    }
+                    h.drop_at(to);
+                    h.step();
+                    let range = fade_drag_range(&clip, fade_in, sample_at(&before, tl, to.x)).unwrap();
+                    let mut expected = before.clone();
+                    let c = expected.find_clip_mut(clip.id).unwrap();
+                    let fade = soundcraft_model::Fade { len: range.end - range.start, shape: soundcraft_model::FadeShape::SCurve, curvature: 0.35 };
+                    assert!(fade.len < len);
+                    if fade_in {
+                        c.fade_in = fade;
+                    } else {
+                        c.fade_out = fade;
+                    }
+                    assert_eq!(h.state().engine.session(), &expected);
+                    assert_eq!(h.state().engine.undo_history().len(), undo_len + 1);
+                    assert!(h.state_mut().engine.undo());
+                    assert_eq!(h.state().engine.session(), &before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn existing_fade_handles_preserve_selector_and_other_smart_tool_zones() {
+        let mut h = smart_demo();
+        let tl = timeline(&h);
+        let (clip, lane) = clip_on_screen(&h, |xs, xe| xs > tl.min.x + 30.0 && xe < tl.max.x - 100.0 && xe - xs > 100.0);
+        let c = h.state_mut().engine.session_mut().find_clip_mut(clip.id).unwrap();
+        c.fade_out = soundcraft_model::Fade { len: c.length / 2, shape: soundcraft_model::FadeShape::SCurve, curvature: 0.0 };
+        h.step();
+        let s = h.state().engine.session();
+        let rect = Rect::from_min_max(pos2(x_of(s, tl, clip.start), lane.min.y), pos2(x_of(s, tl, clip.end()), lane.max.y));
+        let curves = fade_curves(&h, rect);
+        let head = *curves[0].0.points.first().unwrap();
+        h.hover_at(head + vec2(0.0, 16.0));
+        h.step();
+        assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::Text);
+        h.state_mut().engine.execute("edit.tool", &json!({"tool": "selector"})).unwrap();
+        h.step();
+        h.hover_at(head);
+        h.step();
+        assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::Text);
+        start_drag(&mut h, head);
+        assert!(matches!(h.state().gesture, Some(Gesture::Select { .. })));
+        h.drop_at(head + vec2(20.0, 0.0));
+        h.step();
+    }
+
+    #[test]
+    fn a_fade_drag_handles_its_clip_shrinking_to_one_sample() {
+        for fade_in in [true, false] {
+            let mut h = smart_demo();
+            let tl = timeline(&h);
+            let (clip, lane) = clip_on_screen(&h, |xs, xe| xs > tl.min.x + 20.0 && xe < tl.max.x - 20.0 && xe - xs > 100.0);
+            let s = h.state().engine.session();
+            let corner = pos2(x_of(s, tl, if fade_in { clip.start } else { clip.end() }) + if fade_in { 6.0 } else { -6.0 }, lane.min.y + 4.0);
+            start_drag(&mut h, corner);
+            assert!(matches!(h.state().gesture, Some(Gesture::Fade { .. })));
+            let c = h.state_mut().engine.session_mut().find_clip_mut(clip.id).unwrap();
+            c.length = 1;
+            c.clamp_fades();
+            let undo_len = h.state().engine.undo_history().len();
+            h.drop_at(corner + vec2(40.0, 0.0));
+            h.step();
+            let c = h.state().engine.session().find_clip(clip.id).unwrap().1;
+            assert_eq!(if fade_in { c.fade_in.len } else { c.fade_out.len }, 1);
+            assert_eq!(h.state().engine.undo_history().len(), undo_len + 1);
+            assert!(h.state().gesture.is_none());
+        }
+    }
+
+    #[test]
+    fn a_fade_drag_cancels_if_its_clip_disappears() {
+        let mut h = smart_demo();
+        let tl = timeline(&h);
+        let (clip, lane) = clip_on_screen(&h, |xs, xe| xs > tl.min.x + 20.0 && xe - xs > 100.0);
+        let corner = pos2(x_of(h.state().engine.session(), tl, clip.start) + 6.0, lane.min.y + 4.0);
+        start_drag(&mut h, corner);
+        assert!(matches!(h.state().gesture, Some(Gesture::Fade { .. })));
+        let (tid, _) = h.state().engine.session().find_clip(clip.id).unwrap();
+        h.state_mut().engine.session_mut().track_mut(tid).unwrap().playlist_mut().unwrap().clips.retain(|c| c.id != clip.id);
+        let undo_len = h.state().engine.undo_history().len();
+        h.hover_at(corner + vec2(40.0, 0.0));
+        h.step();
+        h.drop_at(corner + vec2(40.0, 0.0));
+        h.step();
+        assert!(h.state().gesture.is_none());
+        assert_eq!(h.state().engine.undo_history().len(), undo_len);
+    }
+
+    #[test]
     fn a_fade_drag_survives_its_clip_shrinking_to_nothing() {
         let mut h = smart_demo();
         let tl = timeline(&h);
@@ -2608,9 +3747,14 @@ mod tests {
         if let Some(c) = h.state_mut().engine.session_mut().find_clip_mut(clip.id) {
             c.length = 0;
         }
+        let undo_len = h.state().engine.undo_history().len();
+        h.hover_at(corner + vec2(20.0, 0.0));
+        h.step();
+        assert!(h.state().gesture.is_none());
         h.drop_at(corner + vec2(20.0, 0.0));
         h.step();
         assert!(h.state().gesture.is_none());
+        assert_eq!(h.state().engine.undo_history().len(), undo_len);
     }
 
     #[test]

@@ -37,7 +37,7 @@ fn video(app: &mut SoundApp, ctx: &egui::Context) {
     let mut burn = app.ui.video_burn_in;
     egui::Window::new("Video").open(&mut open).default_size(vec2(480.0, 480.0 / aspect + 28.0)).resizable(true).show(ctx, |ui| {
         ui.horizontal(|ui| {
-            ui.checkbox(&mut burn, "Timecode burn-in");
+            crate::widgets::checkbox(ui, &mut burn, "Timecode burn-in");
             let text = match &pic {
                 Some((k, ..)) => match app.video.info(*k) {
                     Some(Ok(i)) => format!("{}x{}  {:.3} fps  {}", i.width, i.height, i.frame_rate, i.codec_detail),

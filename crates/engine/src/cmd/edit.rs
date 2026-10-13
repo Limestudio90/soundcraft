@@ -1,10 +1,11 @@
 //! Edit menu commands.
 
+use super::more_util::toggle_flag;
 use super::*;
 use crate::edit as ops;
 use crate::{Clipboard, cmd};
 use serde_json::json;
-use soundcraft_model::{EditMode, FadeShape, Session};
+use soundcraft_model::{EditMode, Fade, FadeShape, Session};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -71,8 +72,8 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(noundo "edit.move_selection_right", "Move Edit Right", ["Edit", "Selection"], Some("Cmd+Alt+'"), "{}", always, |e, _| shift_selection(e, 1)),
         cmd!(noundo "edit.halve_selection", "Halve Edit", ["Edit", "Selection"], None, "{}", always, |e, _| scale_selection(e, 0.5)),
         cmd!(noundo "edit.double_selection", "Double Edit", ["Edit", "Selection"], None, "{}", always, |e, _| scale_selection(e, 2.0)),
-        cmd!(noundo "edit.extend_selection_up", "Extend Edit Up", ["Edit", "Selection"], None, "{}", has_tracks, |e, _| extend_tracks(e, -1)),
-        cmd!(noundo "edit.extend_selection_down", "Extend Edit Down", ["Edit", "Selection"], None, "{}", has_tracks, |e, _| extend_tracks(e, 1)),
+        cmd!(noundo "edit.extend_selection_up", "Extend Edit Up", ["Edit", "Selection"], Some("Ctrl+Shift+P"), "{}", has_tracks, |e, _| extend_tracks(e, -1)),
+        cmd!(noundo "edit.extend_selection_down", "Extend Edit Down", ["Edit", "Selection"], Some("Ctrl+Shift+;"), "{}", has_tracks, |e, _| extend_tracks(e, 1)),
         cmd!(noundo "edit.remove_selection_top", "Remove Edit from Top", ["Edit", "Selection"], None, "{}", has_tracks, |e, _| {
             let s = e.session_mut();
             if !s.edit.selected_tracks.is_empty() {
@@ -125,7 +126,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Create...",
             ["Edit", "Fades"],
             Some("Cmd+F"),
-            "{shape?: linear|equal power|s-curve|exponential|logarithmic, tracks?, start?, end?}",
+            "{shape?: linear|equal power|s-curve|exponential|logarithmic, tracks?, start?, end?} or {clip: id, side: in|out, length: samples, shape?, curvature?: -1..1}",
             has_range,
             fades_create
         ),
@@ -133,11 +134,33 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("edit.fade_to_start", "Fade to Start", ["Edit", "Fades"], Some("Cmd+Ctrl+D"), "{}", has_selection, |e, p| fade_to(e, p, true)),
         cmd!("edit.fade_to_end", "Fade to End", ["Edit", "Fades"], Some("Cmd+Ctrl+G"), "{}", has_selection, |e, p| fade_to(e, p, false)),
         cmd!("edit.nudge", "Nudge", [], Some("Plus/Minus"), "{direction: 1|-1, count?: n, next?: bool (next larger value)}", has_selection, nudge),
-        cmd!(noundo "edit.mode", "Edit Mode", [], Some("F1-F4"), "{mode: shuffle|slip|spot|grid|relative_grid}", always, |e, p| {
-            let m = str_param(p, "mode").and_then(EditMode::from_id).ok_or_else(|| bad("edit.mode", "mode must be shuffle|slip|spot|grid|relative_grid"))?;
-            e.session_mut().edit.edit_mode = m;
-            Ok(json!({"mode": m}))
-        }),
+        cmd!(
+            noundo "edit.mode",
+            "Edit Mode",
+            [],
+            Some("F1-F4, Alt+1-4, `"),
+            "{mode: shuffle|slip|spot|grid|relative_grid, snap_to_grid?: bool (Shuffle, Slip and Spot)}",
+            always,
+            set_mode
+        ),
+        cmd!(
+            noundo "edit.snap_to_grid",
+            "Snap to Grid",
+            [],
+            Some("Shift+F4"),
+            "{value?: bool} (toggles when omitted) — in Shuffle, Slip and Spot the Edit cursor and selections snap to the grid",
+            always,
+            snap_to_grid
+        ),
+        cmd!(
+            noundo "edit.shuffle_lock",
+            "Shuffle Lock",
+            [],
+            None,
+            "{value?: bool} (toggles when omitted) — keeps Shuffle mode from being chosen",
+            always,
+            shuffle_lock
+        ),
         cmd!(noundo "edit.tool", "Edit Tool", [], Some("F5-F10"), "{tool: zoom|trim|selector|grabber|scrubber|pencil|smart}", always, |e, p| {
             let t = str_param(p, "tool").and_then(soundcraft_model::Tool::from_id).ok_or_else(|| bad("edit.tool", "unknown tool"))?;
             e.session_mut().edit.tool = t;
@@ -148,9 +171,18 @@ pub fn specs() -> Vec<CommandSpec> {
             "Move Clips",
             [],
             None,
-            "{clips?: [id], by?: samples, to?: position (first clip start), track?: target}",
+            "{clips?: [id], by?: samples, to?: position for the first clip that can move (Grid modes snap its sync point), track?: where the first clip's track goes; the others keep their distance}",
             has_selection,
             move_clips
+        ),
+        cmd!(
+            "edit.trim_clip",
+            "Trim Clip",
+            [],
+            None,
+            "{clip: id, start?: position, end?: position} — moves the clip's edges like the Trim tool, in the current Edit mode",
+            always,
+            trim_clip
         ),
         cmd!("edit.consolidate", "Consolidate", ["Edit"], Some("Alt+Shift+3"), "{tracks?, start?, end?}", has_range, consolidate),
     ]
@@ -158,6 +190,35 @@ pub fn specs() -> Vec<CommandSpec> {
 
 fn shuffle(s: &Session) -> bool {
     s.edit.edit_mode == EditMode::Shuffle
+}
+
+fn set_mode(e: &mut Engine, p: &Value) -> Result<Value> {
+    let m = str_param(p, "mode").and_then(EditMode::from_id).ok_or_else(|| bad("edit.mode", "mode must be shuffle|slip|spot|grid|relative_grid"))?;
+    if m == EditMode::Shuffle && e.session().edit.flag(ops::SHUFFLE_LOCK) {
+        return Err(bad("edit.mode", "Shuffle is locked"));
+    }
+    let snap = bool_or(p, "snap_to_grid", false) && !m.is_grid();
+    let ed = &mut e.session_mut().edit;
+    ed.edit_mode = m;
+    ed.set_flag(ops::SNAP_TO_GRID, snap);
+    if m.is_grid() {
+        ed.set_flag(ops::RELATIVE_GRID, m == EditMode::GridRelative);
+    }
+    Ok(json!({"mode": m, "snap_to_grid": snap}))
+}
+
+fn snap_to_grid(e: &mut Engine, p: &Value) -> Result<Value> {
+    if e.session().edit.edit_mode.is_grid() {
+        return Err(bad("edit.snap_to_grid", "Grid mode always snaps"));
+    }
+    toggle_flag(e, p, ops::SNAP_TO_GRID)
+}
+
+fn shuffle_lock(e: &mut Engine, p: &Value) -> Result<Value> {
+    if shuffle(e.session()) && bool_or(p, "value", true) {
+        return Err(bad("edit.shuffle_lock", "leave Shuffle mode before locking it"));
+    }
+    toggle_flag(e, p, ops::SHUFFLE_LOCK)
 }
 
 fn has_last_selection(e: &Engine) -> std::result::Result<(), String> {
@@ -190,7 +251,7 @@ fn cut_copy(e: &mut Engine, p: &Value, cut: bool, id: &str) -> Result<Value> {
     if range.is_empty() {
         return Err(bad(id, "selection is empty"));
     }
-    let mut cb = Clipboard { length: range.len(), ..Clipboard::default() };
+    let mut cb = Clipboard::of_range(e.session(), range);
     let follow = e.session().edit.automation_follows_edit;
     for t in &tracks {
         cb.tracks.push(ops::copy_range(e.session(), *t, range));
@@ -232,15 +293,7 @@ fn cut_copy(e: &mut Engine, p: &Value, cut: bool, id: &str) -> Result<Value> {
         let sh = shuffle(e.session());
         let s = e.session_mut();
         for t in &tracks {
-            ops::clear_range(s, *t, range, sh);
-            if follow && let Some(tr) = s.track_mut(*t) {
-                for l in &mut tr.automation {
-                    l.clear_range(range.start, range.end);
-                    if sh {
-                        l.shift_from(range.end, -range.len());
-                    }
-                }
-            }
+            cut_track(s, *t, range, sh, follow);
         }
         s.edit.selection = soundcraft_time::Range::point(range.start);
     }
@@ -249,17 +302,39 @@ fn cut_copy(e: &mut Engine, p: &Value, cut: bool, id: &str) -> Result<Value> {
     Ok(json!({"clips": n, "length": range.len()}))
 }
 
+/// Remove `r` from a track, closing the gap in Shuffle mode; automation follows when `follow`.
+fn cut_track(s: &mut Session, t: TrackId, r: soundcraft_time::Range, sh: bool, follow: bool) {
+    if follow && let Some(tr) = s.track_mut(t) {
+        for l in &mut tr.automation {
+            l.clear_range(r.start, r.end);
+        }
+    }
+    ops::clear_range(s, t, r, sh);
+}
+
 fn paste(e: &mut Engine, p: &Value) -> Result<Value> {
     let tracks = tracks_required(e, "edit.paste", p)?;
-    let at = position_param(e, "edit.paste", p, "at")?.unwrap_or(e.session().edit.selection.start);
+    let given = position_param(e, "edit.paste", p, "at")?;
     let cb = e.clipboard.clone();
-    let sh = shuffle(e.session());
-    let follow = e.session().edit.automation_follows_edit;
+    let s = e.session();
+    let at = match given {
+        Some(at) => at,
+        None if s.edit.edit_mode == EditMode::GridRelative => {
+            s.edit.grid.line_at_or_before(s.edit.selection.start, s.sample_rate, &s.tempo, s.frame_rate).saturating_add(cb.grid_offset)
+        }
+        None => s.edit.selection.start,
+    };
+    let sh = shuffle(s) && !cb.automation_only;
+    let follow = s.edit.automation_follows_edit;
+    let replace = Some(s.edit.selection).filter(|r| sh && given.is_none() && !r.is_empty());
     let s = e.session_mut();
     let mut pasted = 0;
     for (i, t) in tracks.iter().enumerate() {
         let Some(clips) = cb.tracks.get(i % cb.tracks.len().max(1)) else { continue };
-        pasted += ops::paste(s, *t, at, clips, cb.length, sh).len();
+        if let Some(r) = replace {
+            cut_track(s, *t, r, true, follow);
+        }
+        pasted += ops::paste(s, *t, at, clips, cb.length, sh).map_err(|why| bad("edit.paste", why))?.len();
         if follow && let (Some(lanes), Some(tr)) = (cb.automation.get(i % cb.automation.len().max(1)), s.track_mut(*t)) {
             for l in lanes {
                 let dst = tr.lane_mut(&l.param);
@@ -356,7 +431,7 @@ fn repeat_to_fill(e: &mut Engine, p: &Value) -> Result<Value> {
                         c
                     })
                     .collect();
-                ops::paste(s, *t, at, &trimmed, (range.end - at).min(len), false);
+                let _ = ops::paste(s, *t, at, &trimmed, (range.end - at).min(len), false);
             }
         }
         at += len;
@@ -485,12 +560,14 @@ fn duplicate(e: &mut Engine, p: &Value) -> Result<Value> {
     if range.is_empty() {
         return Err(bad("edit.duplicate", "selection is empty"));
     }
+    let sh = shuffle(e.session());
+    let follow = e.session().edit.automation_follows_edit;
     let s = e.session_mut();
     let mut n = 0;
     for t in &tracks {
         let clips = ops::copy_range(s, *t, range);
-        n += ops::paste(s, *t, range.end, &clips, range.len(), false).len();
-        if let Some(tr) = s.track_mut(*t) {
+        n += ops::paste(s, *t, range.end, &clips, range.len(), sh).map_err(|why| bad("edit.duplicate", why))?.len();
+        if follow && let Some(tr) = s.track_mut(*t) {
             for l in &mut tr.automation {
                 let pts: Vec<_> = l.points.iter().filter(|p| range.contains(p.at)).copied().collect();
                 for pt in pts {
@@ -510,11 +587,13 @@ fn repeat(e: &mut Engine, p: &Value) -> Result<Value> {
     if range.is_empty() {
         return Err(bad("edit.repeat", "selection is empty"));
     }
+    let sh = shuffle(e.session());
     let s = e.session_mut();
     for t in &tracks {
         let clips = ops::copy_range(s, *t, range);
         for k in 1..=count {
-            ops::paste(s, *t, range.start + range.len() * k, &clips, range.len(), false);
+            let at = range.start.saturating_add(range.len().saturating_mul(k));
+            ops::paste(s, *t, at, &clips, range.len(), sh).map_err(|why| bad("edit.repeat", why))?;
         }
     }
     Ok(json!({"repeats": count}))
@@ -525,19 +604,25 @@ fn shift(e: &mut Engine, p: &Value) -> Result<Value> {
     let later = bool_or(p, "later", true);
     let ids = clip_ids_param(e, p);
     let s = e.session_mut();
-    let n = ops::move_clips(s, &ids, if later { by } else { -by }, None);
+    let n = ops::move_clips(s, &ids, if later { by } else { -by }, &[]);
     Ok(json!({"moved": n}))
 }
 
 fn insert_silence(e: &mut Engine, p: &Value) -> Result<Value> {
     let tracks = tracks_required(e, "edit.insert_silence", p)?;
     let range = range_param(e, "edit.insert_silence", p)?;
+    let sh = shuffle(e.session());
+    let follow = e.session().edit.automation_follows_edit;
     let s = e.session_mut();
     for t in &tracks {
-        ops::insert_silence(s, *t, range);
-        if let Some(tr) = s.track_mut(*t) {
-            for l in &mut tr.automation {
-                l.shift_from(range.start, range.len());
+        if sh {
+            ops::make_room(s, *t, range.start, range.len()).map_err(|why| bad("edit.insert_silence", why))?;
+        } else {
+            ops::clear_range(s, *t, range, false);
+            if follow && let Some(tr) = s.track_mut(*t) {
+                for l in &mut tr.automation {
+                    l.clear_range(range.start, range.end);
+                }
             }
         }
     }
@@ -716,11 +801,53 @@ fn strip_silence(e: &mut Engine, p: &Value) -> Result<Value> {
 }
 
 fn fades_create(e: &mut Engine, p: &Value) -> Result<Value> {
-    let tracks = tracks_required(e, "edit.fades_create", p)?;
-    let r = range_param(e, "edit.fades_create", p)?;
     let shape = str_param(p, "shape")
         .map_or(Some(FadeShape::EqualPower), FadeShape::from_id)
         .ok_or_else(|| bad("edit.fades_create", "unknown fade shape"))?;
+    if p.get("clip").is_some() || p.get("side").is_some() {
+        let curvature = match p.get("curvature") {
+            None => 0.0,
+            Some(value) => value
+                .as_f64()
+                .filter(|v| v.is_finite() && (-1.0..=1.0).contains(v))
+                .ok_or_else(|| bad("edit.fades_create", "curvature must be a finite number from -1 to 1"))? as f32,
+        };
+        if ["track", "tracks", "clips", "start", "end"].iter().any(|key| p.get(key).is_some()) {
+            return Err(bad("edit.fades_create", "clip fades cannot also specify tracks or an edit range"));
+        }
+        let id = p.get("clip").and_then(Value::as_u64).map(soundcraft_model::ClipId).ok_or_else(|| bad("edit.fades_create", "clip must be an id"))?;
+        let fade_in = match str_param(p, "side") {
+            Some("in") => true,
+            Some("out") => false,
+            _ => return Err(bad("edit.fades_create", "side must be in or out")),
+        };
+        let length = p
+            .get("length")
+            .and_then(Value::as_i64)
+            .filter(|len| *len > 0)
+            .ok_or_else(|| bad("edit.fades_create", "length must be a positive sample count"))?;
+        let (_, clip) = e.session().find_clip(id).ok_or_else(|| bad("edit.fades_create", "clip not found"))?;
+        let available = clip.length.min(clip.end().saturating_sub(clip.start));
+        if available <= 0 {
+            return Err(bad("edit.fades_create", "clip has no length"));
+        }
+        if p.get("shape").is_some_and(|v| !v.is_string()) {
+            return Err(bad("edit.fades_create", "shape must be a fade shape name"));
+        }
+        let fade = Fade { len: length.min(available), shape, curvature };
+        let clip = e.session_mut().find_clip_mut(id).ok_or_else(|| bad("edit.fades_create", "clip not found"))?;
+        if fade_in {
+            clip.fade_in = fade;
+        } else {
+            clip.fade_out = fade;
+        }
+        return Ok(json!({"fades": 1}));
+    }
+    if p.get("curvature").is_some() {
+        return Err(bad("edit.fades_create", "curvature requires a clip and side"));
+    }
+    let tracks = tracks_required(e, "edit.fades_create", p)?;
+    let r = range_param(e, "edit.fades_create", p)?;
     let s = e.session_mut();
     let n: usize = tracks.iter().map(|t| ops::create_fades(s, *t, r, shape)).sum();
     if n == 0 {
@@ -764,7 +891,7 @@ fn nudge(e: &mut Engine, p: &Value) -> Result<Value> {
     let step = value.step_samples(s.edit.selection.start, s.sample_rate, &s.tempo, s.frame_rate) * count * if dir == 0 { 1 } else { dir };
     let ids = clip_ids_param(e, p);
     let s = e.session_mut();
-    let n = if ids.is_empty() { 0 } else { ops::move_clips(s, &ids, step, None) };
+    let n = if ids.is_empty() { 0 } else { ops::move_clips(s, &ids, step, &[]) };
     s.edit.selection = s.edit.selection.shifted(step);
     if s.edit.selection.start < 0 {
         s.edit.selection = s.edit.selection.shifted(-s.edit.selection.start);
@@ -777,24 +904,46 @@ fn move_clips(e: &mut Engine, p: &Value) -> Result<Value> {
     if ids.is_empty() {
         return Err(bad("edit.move_clips", "no clips"));
     }
-    let to_track = track_param(e, "edit.move_clips", p, "track")?;
-    let first = ids.iter().filter_map(|id| e.session().find_clip(*id).map(|(_, c)| c.start)).min().unwrap_or(0);
+    let s = e.session();
+    let dest = match track_param(e, "edit.move_clips", p, "track")? {
+        Some(to) => ids
+            .iter()
+            .find_map(|c| s.find_clip(*c))
+            .and_then(|(from, _)| ops::destinations(s, &ids, from, to))
+            .ok_or_else(|| bad("edit.move_clips", "the clips can't land there: past the last track, or on a track that can't hold them"))?,
+        None => Vec::new(),
+    };
+    let first = ops::first_movable(s, &ids);
     let delta = match (position_param(e, "edit.move_clips", p, "by")?, position_param(e, "edit.move_clips", p, "to")?) {
         (Some(by), _) => by,
-        (None, Some(to)) => to - first,
+        (None, Some(to)) => to.saturating_sub(first.map_or(0, |c| c.start)),
         _ => 0,
     };
-    // Grid mode snaps the destination.
-    let s = e.session();
-    let delta = if s.edit.edit_mode.is_grid() && p.get("to").is_some() {
-        s.edit.grid.snap(first + delta, s.sample_rate, &s.tempo, s.frame_rate) - first
-    } else {
-        delta
+    let mode = s.edit.edit_mode;
+    let delta = match first {
+        Some(c) if mode.is_grid() && p.get("to").is_some() => ops::grid_delta(s, c, delta, mode == EditMode::GridRelative),
+        _ => delta,
     };
     let s = e.session_mut();
-    let n = ops::move_clips(s, &ids, delta, to_track);
+    let n = if mode == EditMode::Shuffle {
+        ops::shuffle_clips(s, &ids, delta, &dest).map_err(|why| bad("edit.move_clips", why))?
+    } else {
+        ops::move_clips(s, &ids, delta, &dest)
+    };
     s.edit.selected_clips = ids;
     Ok(json!({"moved": n, "by": delta}))
+}
+
+fn trim_clip(e: &mut Engine, p: &Value) -> Result<Value> {
+    let id = clip_id(p, "edit.trim_clip")?;
+    let start = position_param(e, "edit.trim_clip", p, "start")?;
+    let end = position_param(e, "edit.trim_clip", p, "end")?;
+    if start.is_none() && end.is_none() {
+        return Err(bad("edit.trim_clip", "pass `start` and/or `end`"));
+    }
+    let sh = shuffle(e.session());
+    let c = ops::trim_clip(e.session_mut(), id, start, end, sh).ok_or_else(|| bad("edit.trim_clip", "no such clip, or it is edit-locked"))?;
+    Ok(json!({"start": c.start, "end": c.end()}))
 }
 
 fn consolidate(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -803,18 +952,135 @@ fn consolidate(e: &mut Engine, p: &Value) -> Result<Value> {
     if r.is_empty() {
         return Err(bad("edit.consolidate", "selection is empty"));
     }
+    let midi = tracks.iter().filter(|&&t| crate::edit::consolidate_midi(e.session_mut(), t, r)).count();
     let mut n = 0;
     for t in tracks {
         if crate::io::consolidate(e, "edit.consolidate", t, r)? {
             n += 1;
         }
     }
-    Ok(json!({"consolidated": n}))
+    Ok(json!({"consolidated": n + midi}))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soundcraft_model::{ChannelFormat, Clip, ClipContent, TrackId, TrackKind};
+
+    #[test]
+    fn targeted_fade_curvature_saves_reopens_and_undoes_without_changing_lengths() {
+        for side in ["in", "out"] {
+            let mut e = crate::demo::demo_engine();
+            let clip = e.session().track_by_name("Kick").unwrap().clips()[0].clone();
+            e.execute("edit.fades_create", &json!({"clip": clip.id.0, "side": side, "length": clip.length / 2, "shape": "s-curve"})).unwrap();
+            let before = e.session().clone();
+            let undo_len = e.undo_history().len();
+            e.execute(
+                "edit.fades_create",
+                &json!({"clip": clip.id.0, "side": side, "length": clip.length / 2, "shape": "s-curve", "curvature": -0.65}),
+            )
+            .unwrap();
+            let mut expected = before.clone();
+            let c = expected.find_clip_mut(clip.id).unwrap();
+            if side == "in" {
+                c.fade_in.curvature = -0.65;
+            } else {
+                c.fade_out.curvature = -0.65;
+            }
+            assert_eq!(e.session(), &expected);
+            let reopened = Session::from_json(&e.session().to_json().unwrap()).unwrap();
+            let reopened = reopened.find_clip(clip.id).unwrap().1;
+            let stored = expected.find_clip(clip.id).unwrap().1;
+            assert_eq!(reopened.fade_in, stored.fade_in);
+            assert_eq!(reopened.fade_out, stored.fade_out);
+            assert_eq!(e.undo_history().len(), undo_len + 1);
+            assert!(e.undo());
+            assert_eq!(e.session(), &before);
+            assert!(e.redo());
+            assert_eq!(e.session(), &expected);
+        }
+    }
+
+    #[test]
+    fn targeted_fades_fill_only_the_requested_side_and_undo_once() {
+        for side in ["in", "out"] {
+            let mut e = crate::demo::demo_engine();
+            let clip = e.session().track_by_name("Kick").unwrap().clips()[0].clone();
+            e.execute("edit.select_none", &json!({})).unwrap();
+            let before = e.session().clone();
+            let undo_len = e.undo_history().len();
+            assert_eq!(
+                e.execute("edit.fades_create", &json!({"clip": clip.id.0, "side": side, "length": i64::MAX, "shape": "s-curve"})).unwrap(),
+                json!({"fades": 1})
+            );
+            let mut expected = before.clone();
+            let c = expected.find_clip_mut(clip.id).unwrap();
+            let fade = Fade { len: clip.length, shape: FadeShape::SCurve, curvature: 0.0 };
+            if side == "in" {
+                c.fade_in = fade;
+            } else {
+                c.fade_out = fade;
+            }
+            assert_eq!(e.session(), &expected);
+            assert_eq!(e.undo_history().len(), undo_len + 1);
+            assert!(e.undo());
+            assert_eq!(e.session(), &before);
+            assert!(e.redo());
+            assert_eq!(e.session(), &expected);
+        }
+    }
+
+    #[test]
+    fn targeted_fades_reject_invalid_parameters_without_an_edit() {
+        let mut e = crate::demo::demo_engine();
+        let id = e.session().track_by_name("Kick").unwrap().clips()[0].id.0;
+        for params in [
+            json!({"clip": id, "side": "in"}),
+            json!({"clip": id, "length": 10}),
+            json!({"side": "out", "length": 10}),
+            json!({"clip": "bad", "side": "in", "length": 10}),
+            json!({"clip": u64::MAX, "side": "in", "length": 10}),
+            json!({"clip": id, "side": "bad", "length": 10}),
+            json!({"clip": id, "side": "in", "length": 0}),
+            json!({"clip": id, "side": "in", "length": -1}),
+            json!({"clip": id, "side": "in", "length": 1.5}),
+            json!({"clip": id, "side": "in", "length": "10"}),
+            json!({"clip": id, "side": "in", "length": u64::MAX}),
+            json!({"clip": id, "side": "in", "length": 10, "shape": "bad"}),
+            json!({"clip": id, "side": "in", "length": 10, "shape": null}),
+            json!({"clip": id, "side": "in", "length": 10, "start": 0}),
+            json!({"clip": id, "side": "in", "length": 10, "end": 100}),
+            json!({"clip": id, "side": "in", "length": 10, "tracks": []}),
+            json!({"clip": id, "side": "in", "length": 10, "curvature": 2}),
+            json!({"clip": id, "side": "in", "length": 10, "curvature": -2}),
+            json!({"clip": id, "side": "in", "length": 10, "curvature": 1e100}),
+            json!({"clip": id, "side": "in", "length": 10, "curvature": null}),
+            json!({"clip": id, "side": "in", "length": 10, "curvature": "0.5"}),
+            json!({"start": 0, "end": 100, "curvature": 0.5}),
+        ] {
+            let before = e.session().clone();
+            let history = e.undo_history();
+            assert!(e.execute("edit.fades_create", &params).is_err(), "{params}");
+            assert_eq!(e.session(), &before, "{params}");
+            assert_eq!(e.undo_history(), history, "{params}");
+        }
+        e.session_mut().find_clip_mut(soundcraft_model::ClipId(id)).unwrap().length = 0;
+        let before = e.session().clone();
+        assert!(e.execute("edit.fades_create", &json!({"clip": id, "side": "in", "length": 1})).is_err());
+        assert_eq!(e.session(), &before);
+    }
+
+    #[test]
+    fn targeted_fades_support_one_sample_clips() {
+        let mut e = crate::demo::demo_engine();
+        let id = e.session().track_by_name("Kick").unwrap().clips()[0].id;
+        e.session_mut().find_clip_mut(id).unwrap().length = 1;
+        for side in ["in", "out"] {
+            e.execute("edit.fades_create", &json!({"clip": id.0, "side": side, "length": 1})).unwrap();
+            let clip = e.session().find_clip(id).unwrap().1;
+            assert_eq!(if side == "in" { clip.fade_in.len } else { clip.fade_out.len }, 1);
+        }
+    }
 
     #[test]
     fn selecting_what_is_already_selected_leaves_the_document_alone() {
@@ -827,6 +1093,51 @@ mod tests {
         assert_eq!(e.revision, rev);
         e.execute("edit.select", &json!({"tracks": [ids[0]], "start": 100, "end": 300})).unwrap();
         assert_ne!(e.revision, rev);
+    }
+
+    fn keys() -> (Engine, TrackId, impl Fn(i64) -> i64) {
+        let mut e = Engine::default();
+        let t = e.session_mut().add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some("Keys"));
+        let (tempo, sr) = (e.session().tempo.clone(), e.session().sample_rate);
+        (e, t, move |q| tempo.tick_to_samples(q * soundcraft_time::TICKS_PER_QUARTER, sr))
+    }
+
+    fn note(start: i64, length: i64, pitch: u8) -> soundcraft_midi::Note {
+        let q = soundcraft_time::TICKS_PER_QUARTER;
+        soundcraft_midi::Note { pitch, velocity: 100, release_velocity: 64, channel: 0, start: start * q, length: length * q }
+    }
+
+    #[test]
+    fn consolidating_an_empty_midi_selection_makes_an_empty_clip() {
+        let (mut e, t, at) = keys();
+        e.execute("edit.select", &json!({"tracks": [t.0], "start": at(4), "end": at(12)})).unwrap();
+        assert_eq!(e.execute("edit.consolidate", &json!({})).unwrap()["consolidated"], 1);
+        let clips = e.session().track(t).unwrap().clips().to_vec();
+        assert_eq!(clips.iter().map(|c| (c.start, c.end())).collect::<Vec<_>>(), vec![(at(4), at(12))]);
+        assert!(matches!(&clips[0].content, ClipContent::Midi { sequence } if sequence.notes.is_empty()));
+    }
+
+    #[test]
+    fn consolidating_midi_merges_the_clips_as_they_sound() {
+        let (mut e, t, at) = keys();
+        let s = e.session_mut();
+        let cc = soundcraft_midi::CtrlEvent { tick: 0, channel: 0, kind: soundcraft_midi::CtrlKind::Cc(1), value: 64 };
+        let a = soundcraft_midi::Sequence { notes: vec![note(0, 1, 60), note(3, 2, 62), note(5, 1, 63)], ctrls: vec![] };
+        let b = soundcraft_midi::Sequence { notes: vec![note(0, 1, 64)], ctrls: vec![] };
+        let c = soundcraft_midi::Sequence { notes: vec![note(1, 1, 65)], ctrls: vec![cc] };
+        for (start, end, seq, muted) in [(0, 4, a, false), (6, 8, b, true), (8, 12, c, false)] {
+            let id = s.new_clip_id();
+            let mut clip = Clip::midi(id, "Keys", at(start), at(end) - at(start), seq);
+            clip.muted = muted;
+            ops::place_clip(s, t, clip);
+        }
+        e.execute("edit.select", &json!({"tracks": [t.0], "start": at(2), "end": at(10)})).unwrap();
+        e.execute("edit.consolidate", &json!({})).unwrap();
+        let clips = e.session().track(t).unwrap().clips().to_vec();
+        assert_eq!(clips.iter().map(|c| (c.start, c.end())).collect::<Vec<_>>(), vec![(0, at(2)), (at(2), at(10)), (at(10), at(12))]);
+        let ClipContent::Midi { sequence } = &clips[1].content else { panic!("not MIDI") };
+        assert_eq!(sequence.notes, vec![note(1, 1, 62), note(7, 1, 65)]);
+        assert_eq!(sequence.ctrls, vec![soundcraft_midi::CtrlEvent { tick: 6 * soundcraft_time::TICKS_PER_QUARTER, ..cc }]);
     }
 
     /// A 60,000-frame source with `clips` placed on one track as (start, length, source offset).
