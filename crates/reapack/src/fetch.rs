@@ -30,7 +30,9 @@ impl Fetch for CurlFetch {
         }
         let ua = concat!("SoundCraft/", env!("CARGO_PKG_VERSION"), " (ReaPack client)");
         let mut cmd = Command::new("curl");
-        cmd.args(["--silent", "--show-error", "--fail", "--location", "--proto", "=https", "--proto-redir", "=https", "--max-redirs", "5"])
+        // `-q` must come first: it stops curl reading the user's ~/.curlrc, which could change
+        // the protocol, proxy or output behaviour this code relies on.
+        cmd.args(["-q", "--silent", "--show-error", "--fail", "--location", "--proto", "=https", "--proto-redir", "=https", "--max-redirs", "5"])
             .args(["--connect-timeout", CONNECT_TIMEOUT_S, "--max-time", TOTAL_TIMEOUT_S, "--user-agent", ua])
             .arg("--max-filesize")
             .arg(max_bytes.to_string())

@@ -55,7 +55,8 @@ pub(crate) fn valid_url(u: &str) -> bool {
 }
 
 /// The components of a relative path that stays inside the folder it is joined to; `None` for
-/// anything else (empty parts, `.`/`..`, drive letters, backslashes, NUL, control characters).
+/// anything else (empty parts, `.`/`..`, drive letters, backslashes, NUL, control characters,
+/// Windows device names).
 pub(crate) fn safe_rel(path: &str) -> Option<Vec<&str>> {
     if path.is_empty() || path.len() > 400 || path.starts_with('/') {
         return None;
@@ -69,8 +70,22 @@ pub(crate) fn safe_rel(path: &str) -> Option<Vec<&str>> {
                 && p.trim() == *p
                 && !p.ends_with('.')
                 && !p.chars().any(|c| c.is_control() || matches!(c, '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+                && !windows_device(p)
         });
     ok.then_some(parts)
+}
+
+/// A name Windows maps to a device whatever its extension (`CON`, `nul.jsfx`, `COM1.txt`, `LPT²`):
+/// writing to it would talk to the device instead of creating a file.
+fn windows_device(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end().to_ascii_uppercase();
+    match stem.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
+        s => {
+            (s.starts_with("COM") || s.starts_with("LPT"))
+                && s.get(3..).is_some_and(|d| matches!(d, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"))
+        }
+    }
 }
 
 /// A repository name turned into one safe folder name.
@@ -81,7 +96,13 @@ pub(crate) fn folder_name(name: &str) -> String {
         .map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
         .collect();
     let s = s.trim_matches(|c: char| c == '.' || c.is_whitespace()).to_string();
-    if s.is_empty() { "repository".to_string() } else { s }
+    if s.is_empty() {
+        "repository".to_string()
+    } else if windows_device(&s) {
+        format!("_{s}")
+    } else {
+        s
+    }
 }
 
 #[cfg(test)]
@@ -113,6 +134,18 @@ mod tests {
         for bad in ["", "/etc/x", "../x", "a/../x", "a/./x", "a//x", "a\\b", "C:/x", "a/b:c", "a/b\0", "a/ b", "a/b.", "a/*", &"a/".repeat(20)] {
             assert!(safe_rel(bad).is_none(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn windows_device_names_are_refused_on_every_platform() {
+        for bad in ["CON", "a/nul", "a/NUL.jsfx", "Aux.txt/x", "a/com1", "a/LPT9.jsfx-inc", "a/COM¹", "a/con .txt", "a/CONOUT$"] {
+            assert!(safe_rel(bad).is_none(), "{bad:?}");
+        }
+        for ok in ["a/console.jsfx", "a/nullify", "a/COM10", "a/comp.jsfx", "a/LPT", "a/auxiliary.jsfx"] {
+            assert!(safe_rel(ok).is_some(), "{ok:?}");
+        }
+        assert_eq!(folder_name("NUL"), "_NUL");
+        assert!(safe_rel(&folder_name("com3.repo")).is_some());
     }
 
     #[test]
