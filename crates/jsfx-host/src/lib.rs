@@ -18,9 +18,10 @@
 //! `@slider`, `@block` and `@sample` sections, operators, `mem[]`/`gmem[]` (gmem is per instance),
 //! `loop`/`while`/`if`, user-defined functions (parameters, `local`, `instance`, `global`, `this.`,
 //! `ns.method()`), `spl()`/`slider()`, `sliderchange`, MIDI input (`midirecv`, fed by note events),
-//! `fft`/`ifft`/`fft_permute`/`fft_ipermute` and the common math builtins. Not yet: `@serialize`,
-//! `@gfx`, MIDI output (sends are dropped), `mdct`/convolution, string and file functions. Scripts
-//! that need them fail to load with [`JsfxError::Unsupported`] naming the missing feature.
+//! `fft`/`ifft`/`fft_real`/`ifft_real`/`fft_permute`/`fft_ipermute`, strings (`strcpy` and
+//! friends, `sprintf`, `match`/`matchi`) and the common math builtins. Not yet: `@serialize`,
+//! `@gfx`, MIDI output (sends are dropped), `mdct`/convolution, file functions. Scripts that need
+//! them fail to load with [`JsfxError::Unsupported`] naming the missing feature.
 //!
 //! `PluginInfo` must be `&'static`: one `PluginInfo` is leaked per distinct effect source and cached,
 //! so the leak is bounded by the number of different effects actually loaded.
@@ -29,6 +30,7 @@ mod ast;
 mod fft;
 mod header;
 mod lex;
+mod matching;
 mod parse;
 mod plugin;
 mod registry;

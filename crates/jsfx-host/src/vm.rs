@@ -5,7 +5,8 @@
 
 use crate::ast::{BinOp, Builtin, Expr, Func, UnOp};
 use crate::fft;
-use crate::parse::{MAX_SLIDERS, SLIDER1};
+use crate::matching::{MatchScratch, convert, matches};
+use crate::parse::{MAX_SLIDERS, NUM_CH, SLIDER1};
 use crate::strfmt::{STR_MAX, format_into};
 
 /// EEL2 treats values closer to zero than this as false and equal.
@@ -129,6 +130,9 @@ pub(crate) struct Machine {
     /// Scratch buffers for string functions; sized once so steady-state use does not allocate.
     sbuf: Vec<u8>,
     body: Vec<u8>,
+    matching: MatchScratch,
+    /// The complex buffer `fft_real` / `ifft_real` work in (sized on first use).
+    fft_scratch: Vec<f64>,
 }
 
 impl Machine {
@@ -147,6 +151,8 @@ impl Machine {
             str_init: Vec::new(),
             sbuf: Vec::with_capacity(2 * STR_MAX),
             body: Vec::with_capacity(STR_MAX),
+            matching: MatchScratch::new(STR_MAX),
+            fft_scratch: Vec::new(),
         }
     }
 
@@ -239,9 +245,16 @@ impl Machine {
 
     /// Runs `e` with a budget of `fuel` loop iterations (builtins charge for their work too). `false` when the budget ran out.
     pub fn run(&mut self, e: &Expr, funcs: &[Func], fuel: u64) -> bool {
-        self.fuel = fuel;
+        let mut pool = fuel;
+        self.run_pooled(e, funcs, &mut pool)
+    }
+
+    /// Like [`Machine::run`], drawing on `pool` and leaving in it what is unused.
+    pub fn run_pooled(&mut self, e: &Expr, funcs: &[Func], pool: &mut u64) -> bool {
+        self.fuel = *pool;
         self.out_of_fuel = false;
         self.eval(e, funcs);
+        *pool = self.fuel;
         !self.out_of_fuel
     }
 
@@ -301,6 +314,14 @@ impl Machine {
             Loc::Mem(k) => self.mem.get(k).copied().unwrap_or(0.0),
             Loc::GMem(k) => self.gmem.get(k).copied().unwrap_or(0.0),
             Loc::Nowhere => 0.0,
+        }
+    }
+
+    /// Writes `v` to `place` when it is something that can be assigned.
+    fn put(&mut self, place: Option<&Expr>, v: f64, f: &[Func]) {
+        if let Some(p) = place.filter(|p| p.is_place()) {
+            let loc = self.locate(p, f);
+            self.save(loc, v);
         }
     }
 
@@ -453,6 +474,86 @@ impl Machine {
         self.mem.get_mut(s..s.checked_add(2 * n)?)
     }
 
+    /// `fft_real` / `ifft_real` over `size` real values at `start`. The spectrum is `size / 2`
+    /// complex values in the permuted order `fft` leaves (so `fft_permute(buf, size / 2)` puts it
+    /// in natural order), the first holding DC and Nyquist. Neither direction is scaled.
+    fn fft_real(&mut self, start: f64, size: f64, inverse: bool) {
+        let Some(n) = fft::points(size).filter(|n| *n >= 4) else { return };
+        if !self.charge(transform_cost(n)) {
+            return;
+        }
+        let Some(s) = index(start, self.mem.len()) else { return };
+        let Some(cells) = s.checked_add(n).and_then(|e| self.mem.get_mut(s..e)) else { return };
+        let buf = &mut self.fft_scratch;
+        buf.clear();
+        if inverse {
+            buf.extend_from_slice(cells);
+            fft::permute(buf);
+            // Rebuild the full spectrum from its first half (it is conjugate-symmetric).
+            buf.resize(2 * n, 0.0);
+            for k in 1..n / 2 {
+                let (re, im) = (buf[2 * k], buf[2 * k + 1]);
+                buf[2 * (n - k)] = re;
+                buf[2 * (n - k) + 1] = -im;
+            }
+            buf[n] = buf[1];
+            buf[n + 1] = 0.0;
+            buf[1] = 0.0;
+            fft::permute(buf);
+            fft::ifft(buf);
+            for i in 0..n {
+                buf[i] = buf[2 * i];
+            }
+        } else {
+            buf.extend(cells.iter().flat_map(|c| [*c, 0.0]));
+            fft::fft(buf);
+            fft::permute(buf);
+            // Bins 0..n/2 in natural order; Nyquist's real part goes where DC's (zero) imaginary was.
+            buf[1] = buf[n];
+        }
+        buf.truncate(n);
+        if !inverse {
+            fft::permute(buf);
+        }
+        cells.copy_from_slice(buf);
+    }
+
+    /// `match(needle, haystack, ...)`: 1 when the haystack fits; what the `%` conversions covered
+    /// goes into the extra arguments (numbers into variables, `%s` into strings).
+    fn match_call(&mut self, args: &[Expr], f: &[Func], fold: bool) -> f64 {
+        let needle = args.first().map_or(-1.0, |e| self.eval(e, f));
+        let hay = args.get(1).map_or(-1.0, |e| self.eval(e, f));
+        let (ni, hi) = (self.string_index(needle), self.string_index(hay));
+        let m = &mut self.matching;
+        m.needle.clear();
+        m.hay.clear();
+        if let Some(s) = ni.and_then(|i| self.strings.get(i)) {
+            m.needle.extend_from_slice(s);
+        }
+        if let Some(s) = hi.and_then(|i| self.strings.get(i)) {
+            m.hay.extend_from_slice(s);
+        }
+        let cost = m.needle.len() + m.hay.len();
+        if !self.charge(cost) || !matches(&mut self.matching, fold) {
+            return 0.0;
+        }
+        for k in 0..self.matching.caps.len() {
+            let Some(c) = self.matching.caps.get(k).copied() else { break };
+            let Some(text) = self.matching.hay.get(c.start..c.start + c.len) else { continue };
+            if c.kind == b's' {
+                let dst = args.get(2 + k).map_or(-1.0, |e| self.eval(e, f));
+                self.sbuf.clear();
+                if let Some(t) = self.matching.hay.get(c.start..c.start + c.len) {
+                    self.sbuf.extend_from_slice(t);
+                }
+                self.store_scratch(dst);
+            } else if let Some(v) = convert(c.kind, text) {
+                self.put(args.get(2 + k), v, f);
+            }
+        }
+        1.0
+    }
+
     fn call(&mut self, b: Builtin, args: &[Expr], f: &[Func]) -> f64 {
         match b {
             Builtin::SliderChange => {
@@ -479,6 +580,7 @@ impl Machine {
                 return 1.0;
             }
             Builtin::Sprintf => return self.sprintf(args, f),
+            Builtin::Match | Builtin::MatchI => return self.match_call(args, f, b == Builtin::MatchI),
             _ => {}
         }
         let a0 = args.first().map_or(0.0, |e| self.eval(e, f));
@@ -608,6 +710,15 @@ impl Machine {
                 a0
             }
             Builtin::MemTop => self.mem.len() as f64,
+            Builtin::HostNumChan => self.var(NUM_CH),
+            Builtin::FftReal => {
+                self.fft_real(a0, a1, false);
+                0.0
+            }
+            Builtin::IfftReal => {
+                self.fft_real(a0, a1, true);
+                0.0
+            }
             Builtin::FreeMBuf | Builtin::Ignored => 0.0,
             Builtin::Fft => {
                 if let Some(buf) = self.fft_buffer(a0, a1, transform_cost) {
@@ -628,7 +739,7 @@ impl Machine {
                 0.0
             }
             // Handled before the arguments are evaluated.
-            Builtin::SliderChange | Builtin::MidiRecv | Builtin::Sprintf => 0.0,
+            Builtin::SliderChange | Builtin::MidiRecv | Builtin::Sprintf | Builtin::Match | Builtin::MatchI => 0.0,
         }
     }
 }
@@ -870,15 +981,47 @@ mod tests {
         assert_eq!(val(&format!("{defs} x = f(1, 2);"), "x"), 203.0);
         // One argument: the smallest overload that fits, the missing one reads 0.
         assert_eq!(val(&format!("{defs} x = f(1);"), "x"), 201.0);
-        let mut names = Names::new();
-        assert!(compile(&format!("{defs} x = f(1, 2, 3, 4);"), 1, &mut names).is_err());
+        // Too many: the largest overload, the extra arguments ignored (as REAPER does).
+        assert_eq!(val(&format!("{defs} x = f(1, 2, 3, 4);"), "x"), 306.0);
         assert!(val("x = rand();", "x") < 1.0);
     }
 
     #[test]
-    fn function_variables_are_local_unless_declared_global() {
-        assert_eq!(val("function f() ( g = 5; ); f(); x = g;", "x"), 0.0);
-        assert_eq!(val("function f() global(g) ( g = 5; ); f(); x = g;", "x"), 5.0);
+    fn real_fft_round_trips() {
+        // A cosine in bin 2 of 16 points, forward then inverse: 16 times the input back.
+        let src = "i = 0; loop(16, i[] = cos(2 * $pi * 2 * i / 16); i += 1); fft_real(0, 16); fft_permute(0, 8); re2 = 4[]; dc = 0[]; \
+                   fft_ipermute(0, 8); ifft_real(0, 16); back = 3[] / 16; want = cos(2 * $pi * 2 * 3 / 16);";
+        assert!((val(src, "re2") - 8.0).abs() < 1e-9);
+        assert!(val(src, "dc").abs() < 1e-9);
+        assert!((val(src, "back") - val(src, "want")).abs() < 1e-9);
+    }
+
+    #[test]
+    fn match_captures_into_variables_and_strings() {
+        assert_eq!(val("ok = match(\"%ddB\", \"12dB\", v); x = ok * 100 + v;", "x"), 112.0);
+        assert_eq!(val("x = match(\"%ddB\", \"flat\", v);", "x"), 0.0);
+        assert_eq!(val("x = matchi(\"*.WAV\", \"kick.wav\");", "x"), 1.0);
+        assert_eq!(val("#name = \"\"; match(\"%s=%d\", \"gain=3\", #name, v); x = strlen(#name) * 10 + v;", "x"), 43.0);
+    }
+
+    #[test]
+    fn assignments_end_binary_expressions() {
+        assert_eq!(val("c = 3; 1 && c -= 1 > 0; x = c;", "x"), 2.0);
+        assert_eq!(val("0 || g = 5; x = g;", "x"), 5.0);
+    }
+
+    #[test]
+    fn wrapping_a_builtin_calls_the_builtin() {
+        assert_eq!(val("function sqrt(v) ( 1 + sqrt(v) ); x = sqrt(16);", "x"), 5.0);
+    }
+
+    #[test]
+    fn function_variables_are_global_unless_declared_otherwise() {
+        assert_eq!(val("function f() ( g = 5; ); f(); x = g;", "x"), 5.0);
+        assert_eq!(val("function f(g) ( g = 5; ); f(1); x = g;", "x"), 0.0);
+        // A `global(...)` list makes the names it leaves out private.
+        assert_eq!(val("function f() global(g) ( g = 5; h = 6; ); f(); x = g; y = h;", "x"), 5.0);
+        assert_eq!(val("function f() global(g) ( g = 5; h = 6; ); f(); x = g; y = h;", "y"), 0.0);
         // Locals keep per-function storage, separate from a global of the same name.
         assert_eq!(val("t = 3; function f() local(t) ( t = 99; ); f(); x = t;", "x"), 3.0);
     }
@@ -898,7 +1041,6 @@ mod tests {
     fn recursion_and_unknown_calls_are_compile_errors() {
         let mut names = Names::new();
         assert!(compile("function f(x) ( f(x); ); f(1);", 1, &mut names).is_err());
-        assert!(compile("function g(x) ( x ); g(1, 2);", 1, &mut names).is_err());
     }
 
     #[test]

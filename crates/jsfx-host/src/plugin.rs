@@ -8,7 +8,7 @@ use crate::{ID_PREFIX, JsfxError};
 use soundcraft_dsp::{Category, ParamInfo, Plugin, PluginInfo, Taper, Unit};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 /// Reads the text of an imported file by its `import` name; `None` when it cannot be found.
@@ -24,6 +24,8 @@ const MAX_MEM: usize = 1 << 24;
 const FUEL_INIT: u64 = 50_000_000;
 const FUEL_SLIDER: u64 = 5_000_000;
 const FUEL_BLOCK: u64 = 5_000_000;
+/// Per sample, pooled over the block: a one-off spike (a script clearing a delay line once) fits,
+/// and a block never does more than this times its length.
 const FUEL_SAMPLE: u64 = 200_000;
 /// Largest source file we load.
 const MAX_FILE: u64 = 2 * 1024 * 1024;
@@ -101,6 +103,41 @@ fn info_for(id: &str, text: &str, src: &JsfxSource) -> &'static PluginInfo {
     }));
     guard.insert(key, info);
     info
+}
+
+/// Most folder entries looked at when searching the Effects folder for a library by name.
+const MAX_SEARCHED: usize = 50_000;
+/// Deepest folder searched below the Effects folder.
+const MAX_SEARCH_DEPTH: usize = 8;
+
+/// The file called `file` (ignoring case) under `root` that shares the most folders with `near`.
+fn find_by_name(root: &Path, file: &std::ffi::OsStr, near: &Path) -> Option<PathBuf> {
+    let want = file.to_string_lossy().to_lowercase();
+    let mut best: Option<(usize, PathBuf)> = None;
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut seen = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            seen += 1;
+            if seen > MAX_SEARCHED {
+                return best.map(|(_, p)| p);
+            }
+            let Ok(kind) = e.file_type() else { continue };
+            let p = e.path();
+            if kind.is_dir() {
+                if depth < MAX_SEARCH_DEPTH {
+                    stack.push((p, depth + 1));
+                }
+            } else if kind.is_file() && e.file_name().to_string_lossy().to_lowercase() == want {
+                let shared = p.parent().map_or(0, |d| d.components().zip(near.components()).take_while(|(a, b)| a == b).count());
+                if best.as_ref().is_none_or(|(n, _)| shared > *n) {
+                    best = Some((shared, p));
+                }
+            }
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 /// Reads an effect file (size-capped): its plugin id (`jsfx:` + the path relative to `root`) and text.
@@ -240,16 +277,22 @@ impl JsfxPlugin {
         let root = root.to_path_buf();
         let bases: Vec<std::path::PathBuf> =
             path.parent().into_iter().flat_map(Path::ancestors).take_while(|a| a.starts_with(&root)).map(Path::to_path_buf).collect();
+        let read = |p: &Path| -> Option<String> {
+            if std::fs::metadata(p).ok()?.len() > MAX_FILE {
+                return None;
+            }
+            std::fs::read(p).ok().map(|b| String::from_utf8_lossy(&b).into_owned())
+        };
+        let near = path.parent().map(Path::to_path_buf).unwrap_or_else(|| root.clone());
         let loader = move |name: &str| -> Option<String> {
             if !Path::new(name).components().all(|c| matches!(c, Component::Normal(_))) {
                 return None;
             }
-            bases.iter().chain(std::iter::once(&root)).find_map(|base| {
-                let p = base.join(name);
-                if std::fs::metadata(&p).ok()?.len() > MAX_FILE {
-                    return None;
-                }
-                std::fs::read(&p).ok().map(|b| String::from_utf8_lossy(&b).into_owned())
+            bases.iter().chain(std::iter::once(&root)).find_map(|base| read(&base.join(name))).or_else(|| {
+                // As REAPER does, a library not at its path is looked for by file name anywhere in
+                // the Effects folder (the copy nearest the effect wins).
+                let file = Path::new(name).file_name()?;
+                read(&find_by_name(&root, file, &near)?)
             })
         };
         Self::build(&id, &text, Some(&loader), instantiate)
@@ -379,12 +422,13 @@ impl Plugin for JsfxPlugin {
         }
         let ch = io.len().min(MAX_CH);
         let n = frames.min(io.iter().take(ch).map(Vec::len).min().unwrap_or(0));
+        let mut pool = FUEL_SAMPLE.saturating_mul(n as u64);
         for i in 0..n {
             for (c, buf) in io.iter().take(ch).enumerate() {
                 self.m.set_var(parse::SPL0 + c, f64::from(buf.get(i).copied().unwrap_or(0.0)));
             }
             if let Some(e) = &self.code.sample
-                && !self.m.run(e, &self.funcs, FUEL_SAMPLE)
+                && !self.m.run_pooled(e, &self.funcs, &mut pool)
             {
                 log::warn!("jsfx {}: @sample ran out of its budget; bypassing", self.info.id);
                 self.faulted = true;

@@ -69,6 +69,13 @@ pub(crate) enum Builtin {
     MidiRecv,
     Fft,
     Ifft,
+    FftReal,
+    IfftReal,
+    /// `match` / `matchi` (ignoring case).
+    Match,
+    MatchI,
+    /// `get_host_numchan()`: the channels the host gives the effect.
+    HostNumChan,
     FftPermute,
     FftIpermute,
     // Strings are numeric handles into the machine's string table.

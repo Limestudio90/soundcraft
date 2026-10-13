@@ -1,9 +1,10 @@
 //! EEL2 parser: precedence climbing over the token stream, producing [`Expr`] with variable names
 //! already resolved to slots.
 //!
-//! User-defined functions follow EEL2's rules. Parameters and any variable the body does not
-//! declare are private to the function; `global(...)` names are shared with the rest of the
-//! script; `instance(...)` names live in a namespace chosen by the caller (`a.method()` uses the
+//! User-defined functions follow EEL2's rules. Parameters and `local(...)` names are private to
+//! the function; any other variable is shared with the rest of the script, unless the function
+//! lists its shared names with `global(...)`, which makes the unlisted ones private.
+//! `instance(...)` names live in a namespace chosen by the caller (`a.method()` uses the
 //! namespace `a`, so the variable is `a.name`; `this.name` names it explicitly; an unqualified call
 //! from inside a method keeps the caller's namespace). Each function is compiled once per
 //! namespace it is called with, so storage is static and no allocation happens at run time.
@@ -58,7 +59,10 @@ pub(crate) struct FnDef {
     /// Which parameters were written `name*` (passed by reference).
     refs: Vec<bool>,
     instance: HashSet<String>,
+    locals: HashSet<String>,
     globals: HashSet<String>,
+    /// A `global(...)` list was given: only its names (and dotted ones) are shared.
+    globals_only: bool,
     body: Vec<Lexed>,
 }
 
@@ -206,6 +210,9 @@ fn builtin(name: &str) -> Option<(Builtin, usize, usize)> {
         "freembuf" => (FreeMBuf, 1, 1),
         "sliderchange" => (SliderChange, 1, 1),
         "slider_automate" => (Ignored, 0, 2),
+        // Hiding sliders only affects REAPER's slider panel.
+        "slider_show" => (Ignored, 1, 2),
+        "get_host_numchan" => (HostNumChan, 0, 0),
         "slider_next_chg" => (Ignored, 2, 2),
         "time" | "time_precise" => (Ignored, 0, 1),
         // Where the host puts the effect (track, chain position): not known here.
@@ -216,6 +223,8 @@ fn builtin(name: &str) -> Option<(Builtin, usize, usize)> {
         "midirecv" => (MidiRecv, 3, 4),
         "fft" => (Fft, 2, 2),
         "ifft" => (Ifft, 2, 2),
+        "fft_real" => (FftReal, 2, 2),
+        "ifft_real" => (IfftReal, 2, 2),
         "fft_permute" => (FftPermute, 2, 2),
         "fft_ipermute" => (FftIpermute, 2, 2),
         "strcpy" => (StrCpy, 2, 2),
@@ -232,6 +241,8 @@ fn builtin(name: &str) -> Option<(Builtin, usize, usize)> {
         "strcpy_substr" => (StrCpySubstr, 3, 4),
         "strcpy_from" => (StrCpyFrom, 3, 3),
         "sprintf" => (Sprintf, 2, MAX_ARGS),
+        "match" => (Match, 2, MAX_ARGS),
+        "matchi" => (MatchI, 2, MAX_ARGS),
         // Printing has nowhere to go here.
         "printf" => (Ignored, 1, MAX_ARGS),
         _ => return None,
@@ -381,7 +392,9 @@ impl Parser<'_> {
                     qualify(&sc.ns, rest)
                 } else if sc.def.instance.contains(name) {
                     qualify(&sc.ns, name)
-                } else if sc.def.globals.contains(name) || name.contains('.') {
+                } else if sc.def.params.iter().any(|p| p == name) || sc.def.locals.contains(name) {
+                    format!("{}|{name}", sc.key)
+                } else if !sc.def.globals_only || sc.def.globals.contains(name) || name.contains('.') {
                     name.to_string()
                 } else {
                     format!("{}|{name}", sc.key)
@@ -474,7 +487,13 @@ impl Parser<'_> {
             if n > MAX_CHAIN {
                 return Err(self.err("expression too long"));
             }
-            let rhs = self.parse_bin(level + 1)?;
+            let mut rhs = self.parse_bin(level + 1)?;
+            // EEL2 lets an assignment end a binary expression: `a && b = c` is `a && (b = c)`.
+            if rhs.is_place()
+                && let Some(aop) = self.assign_op()
+            {
+                rhs = Expr::Assign(Box::new(rhs), aop, Box::new(self.parse_assign()?));
+            }
             lhs = match op {
                 BinOp::LAnd => Expr::LogicAnd(Box::new(lhs), Box::new(rhs)),
                 BinOp::LOr => Expr::LogicOr(Box::new(lhs), Box::new(rhs)),
@@ -515,7 +534,15 @@ impl Parser<'_> {
                 }
                 Ok(Expr::Num(n))
             }
-            Tok::Str(s) => Ok(Expr::StrRef(self.names.literal(&s))),
+            Tok::Str(s) => {
+                // Adjacent literals are one string, as in C.
+                let mut s = s;
+                while let Tok::Str(more) = self.peek().clone() {
+                    self.pos += 1;
+                    s.push_str(&more);
+                }
+                Ok(Expr::StrRef(self.names.literal(&s)))
+            }
             Tok::P("(") => {
                 let e = self.parse_seq(Some(")"))?;
                 self.expect_p(")")?;
@@ -583,7 +610,9 @@ impl Parser<'_> {
         }
         self.expect_p(")")?;
         let mut instance = HashSet::new();
+        let mut locals = HashSet::new();
         let mut globals = HashSet::new();
+        let mut globals_only = false;
         while let Tok::Ident(kw) = self.peek().clone() {
             if !matches!(kw.as_str(), "local" | "instance" | "global" | "globals") {
                 break;
@@ -599,8 +628,11 @@ impl Parser<'_> {
             self.expect_p(")")?;
             match kw.as_str() {
                 "instance" => instance.extend(list),
-                "global" | "globals" => globals.extend(list),
-                _ => {}
+                "global" | "globals" => {
+                    globals_only = true;
+                    globals.extend(list);
+                }
+                _ => locals.extend(list),
             }
         }
         self.expect_p("(")?;
@@ -627,7 +659,7 @@ impl Parser<'_> {
         let mut body = self.toks.get(start..self.pos).unwrap_or(&[]).to_vec();
         body.push(Lexed { tok: Tok::Eof, line });
         self.pos += 1; // the closing ')'
-        let def = Rc::new(FnDef { params, refs, instance, globals, body });
+        let def = Rc::new(FnDef { params, refs, instance, locals, globals, globals_only, body });
         let overloads = self.names.defs.entry(name).or_default();
         match overloads.iter_mut().find(|d| d.params.len() == def.params.len()) {
             Some(slot) => *slot = def,
@@ -663,7 +695,16 @@ impl Parser<'_> {
         let mut args = Vec::new();
         if !self.is_p(")") {
             loop {
-                args.push(self.parse_assign()?);
+                let mut arg = self.parse_assign()?;
+                // An argument may be a sequence: `f(a; b, c)` passes `b`; a stray `;` before the
+                // `)` or `,` is allowed.
+                while self.eat_p(";") {
+                    if self.is_p(")") || self.is_p(",") {
+                        break;
+                    }
+                    arg = Expr::Seq(vec![arg, self.parse_assign()?]);
+                }
+                args.push(arg);
                 if !self.eat_p(",") {
                     break;
                 }
@@ -678,16 +719,19 @@ impl Parser<'_> {
             return Err(JsfxError::Unsupported(format!("function `{fname}`")));
         };
         // Overloads differ by parameter count: take the exact match, else the one with the fewest
-        // parameters that still fits (missing trailing arguments become 0; extra ones are an error).
+        // parameters that still fits (missing trailing arguments become 0), else the one with the
+        // most, which ignores the extra arguments as REAPER does.
         let Some(def) = overloads
             .iter()
             .find(|d| d.params.len() == args.len())
             .or_else(|| overloads.iter().filter(|d| d.params.len() > args.len()).min_by_key(|d| d.params.len()))
+            .or_else(|| overloads.iter().max_by_key(|d| d.params.len()))
             .cloned()
         else {
-            let most = overloads.iter().map(|d| d.params.len()).max().unwrap_or(0);
-            return Err(self.err(&format!("`{fname}` takes {most} argument(s)")));
+            return Err(JsfxError::Unsupported(format!("function `{fname}`")));
         };
+        let mut args = args;
+        args.truncate(def.params.len());
         if def.params.len() > MAX_ARGS {
             return Err(JsfxError::Unsupported(format!("`{fname}` has more than {MAX_ARGS} parameters")));
         }
@@ -756,8 +800,13 @@ impl Parser<'_> {
             _ => {}
         }
         if let Some((fname, ns)) = self.find_fn(name) {
-            let args = self.parse_args()?;
-            return self.user_call(&fname, ns, args);
+            // A function named like a builtin that calls its own name inside calls the builtin
+            // (scripts wrap `sqrt` or drawing functions this way).
+            let wraps_builtin = builtin(&fname).is_some() && self.scope.as_ref().is_some_and(|sc| sc.key.starts_with(&format!("{fname}/")));
+            if !wraps_builtin {
+                let args = self.parse_args()?;
+                return self.user_call(&fname, ns, args);
+            }
         }
         let Some((b, min, max)) = builtin(name) else {
             return Err(JsfxError::Unsupported(format!("function `{name}`")));

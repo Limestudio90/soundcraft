@@ -114,9 +114,12 @@ pub(crate) fn parse_source(text: &str) -> Result<JsfxSource, JsfxError> {
     let mut src = JsfxSource { in_pins: 2, out_pins: 2, ..Default::default() };
     let mut cur = Cur::Header;
     let (mut in_set, mut out_set) = (false, false);
+    // Inside a `/* */` comment in the header (libraries show usage examples there, with `import`
+    // and `slider` lines that must not count).
+    let mut in_comment = false;
     for (n, raw) in text.lines().enumerate() {
         let line_no = n as u32 + 1;
-        if let Some(name) = raw.strip_prefix('@') {
+        if let Some(name) = raw.strip_prefix('@').filter(|_| !(in_comment && matches!(cur, Cur::Header))) {
             let name = name.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
             cur = match name.as_str() {
                 "init" => Cur::Init,
@@ -144,7 +147,10 @@ pub(crate) fn parse_source(text: &str) -> Result<JsfxSource, JsfxError> {
         }
         let sec = match cur {
             Cur::Header => {
-                header_line(&mut src, raw, &mut in_set, &mut out_set);
+                let visible = outside_comments(raw, &mut in_comment);
+                if !visible.trim().is_empty() {
+                    header_line(&mut src, &visible, &mut in_set, &mut out_set);
+                }
                 continue;
             }
             Cur::Init => &mut src.init,
@@ -157,6 +163,37 @@ pub(crate) fn parse_source(text: &str) -> Result<JsfxSource, JsfxError> {
         sec.code.push('\n');
     }
     Ok(src)
+}
+
+/// The parts of a header line outside `/* */` comments, which may span lines.
+fn outside_comments(line: &str, in_comment: &mut bool) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    loop {
+        if *in_comment {
+            match rest.find("*/") {
+                Some(i) => {
+                    *in_comment = false;
+                    rest = &rest[i + 2..];
+                }
+                None => return out,
+            }
+        } else {
+            // A `//` comment hides any `/*` after it (`//****` lines are common).
+            let line_comment = rest.find("//");
+            match rest.find("/*").filter(|i| line_comment.is_none_or(|l| l > *i)) {
+                Some(i) => {
+                    out.push_str(&rest[..i]);
+                    *in_comment = true;
+                    rest = &rest[i + 2..];
+                }
+                None => {
+                    out.push_str(rest);
+                    return out;
+                }
+            }
+        }
+    }
 }
 
 fn header_line(src: &mut JsfxSource, raw: &str, in_set: &mut bool, out_set: &mut bool) {
@@ -213,6 +250,14 @@ fn header_line(src: &mut JsfxSource, raw: &str, in_set: &mut bool, out_set: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_comments_hide_their_lines() {
+        let s = parse_source("desc:lib\n//****\n/* Example\n   import other.jsfx-inc\nslider1:1<0,1>No\n*/ import real.jsfx-inc\n@init\nx = 1;\n")
+            .unwrap();
+        assert_eq!(s.imports, vec!["real.jsfx-inc".to_string()]);
+        assert!(s.sliders.is_empty());
+    }
 
     #[test]
     fn slider_forms() {
