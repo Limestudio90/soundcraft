@@ -97,6 +97,8 @@ pub(crate) struct Func {
     /// Parameters declared `name*`: their final value is copied back into the caller's variable.
     pub refs: Vec<bool>,
     pub body: Expr,
+    /// How deep evaluating the body recurses (see `parse::height`).
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]

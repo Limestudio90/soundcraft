@@ -1,6 +1,7 @@
 //! Tree-walking EEL2 interpreter. Never allocates while evaluating, never panics: memory accesses are
-//! bounds-checked (out-of-range reads give 0, writes are dropped) and every loop iteration draws on
-//! a fuel budget so a runaway script is cut off instead of hanging the audio thread.
+//! bounds-checked (out-of-range reads give 0, writes are dropped) and every loop iteration (and the
+//! work of builtins such as `fft` and `memset`) draws on a fuel budget so a runaway script is cut
+//! off instead of hanging the audio thread.
 
 use crate::ast::{BinOp, Builtin, Expr, Func, UnOp};
 use crate::fft;
@@ -23,6 +24,21 @@ pub(crate) fn truthy(x: f64) -> bool {
 fn to_i(x: f64) -> i64 {
     // Saturating; NaN becomes 0.
     x as i64
+}
+
+// What builtins that touch many memory cells cost, in loop iterations (the fuel unit). A loop
+// iteration runs a few operations; filling or copying a cell is far cheaper; an FFT does about
+// log2(n) butterflies per point.
+fn cells_cost(n: usize) -> usize {
+    n / 16
+}
+
+fn transform_cost(n: usize) -> usize {
+    n.saturating_mul(n.max(1).ilog2() as usize) / 4
+}
+
+fn permute_cost(n: usize) -> usize {
+    n / 4
 }
 
 fn b2f(b: bool) -> f64 {
@@ -221,7 +237,7 @@ impl Machine {
         self.midi_head = 0;
     }
 
-    /// Runs `e` with a budget of `fuel` loop iterations. `false` when the budget ran out.
+    /// Runs `e` with a budget of `fuel` loop iterations (builtins charge for their work too). `false` when the budget ran out.
     pub fn run(&mut self, e: &Expr, funcs: &[Func], fuel: u64) -> bool {
         self.fuel = fuel;
         self.out_of_fuel = false;
@@ -235,6 +251,20 @@ impl Machine {
             false
         } else {
             self.fuel -= 1;
+            true
+        }
+    }
+
+    /// Draws `cost` from the budget for a builtin whose work grows with its arguments; `false`
+    /// (and the run stops) when not enough is left, and the builtin then does nothing.
+    fn charge(&mut self, cost: usize) -> bool {
+        let cost = cost as u64;
+        if self.fuel < cost {
+            self.fuel = 0;
+            self.out_of_fuel = true;
+            false
+        } else {
+            self.fuel -= cost;
             true
         }
     }
@@ -333,26 +363,7 @@ impl Machine {
                 last
             }
             Expr::Call(b, args) => self.call(*b, args, f),
-            Expr::UserCall(id, args) => {
-                let mut tmp = [0.0f64; MAX_ARGS];
-                for (slot, a) in tmp.iter_mut().zip(args) {
-                    *slot = self.eval(a, f);
-                }
-                let Some(func) = f.get(*id) else { return 0.0 };
-                for (slot, v) in func.params.iter().zip(tmp) {
-                    self.set_var(*slot, v);
-                }
-                let ret = self.eval(&func.body, f);
-                // By-reference parameters (`name*`) hand their final value back to the caller.
-                for ((slot, by_ref), arg) in func.params.iter().zip(&func.refs).zip(args) {
-                    if *by_ref && arg.is_place() {
-                        let v = self.var(*slot);
-                        let loc = self.locate(arg, f);
-                        self.save(loc, v);
-                    }
-                }
-                ret
-            }
+            Expr::UserCall(id, args) => self.user_call(*id, args, f),
             Expr::Loop(n, body) => {
                 let n = self.eval(n, f);
                 let n = if n >= 1.0 { (n as usize).min(MAX_ITER) } else { 0 };
@@ -385,8 +396,59 @@ impl Machine {
     }
 
     /// The complex buffer `fft`-style functions work on: `n` points starting at `start`.
-    fn fft_buffer(&mut self, start: f64, n: f64) -> Option<&mut [f64]> {
+    // `user_call` and `sprintf` keep their argument arrays out of `eval`'s frame: `eval` recurses
+    // once per tree level, so its frame size times `parse::MAX_HEIGHT` is the stack it needs.
+    #[inline(never)]
+    fn user_call(&mut self, id: usize, args: &[Expr], f: &[Func]) -> f64 {
+        let mut tmp = [0.0f64; MAX_ARGS];
+        for (slot, a) in tmp.iter_mut().zip(args) {
+            *slot = self.eval(a, f);
+        }
+        let Some(func) = f.get(id) else { return 0.0 };
+        for (slot, v) in func.params.iter().zip(tmp) {
+            self.set_var(*slot, v);
+        }
+        let ret = self.eval(&func.body, f);
+        // By-reference parameters (`name*`) hand their final value back to the caller.
+        for ((slot, by_ref), arg) in func.params.iter().zip(&func.refs).zip(args) {
+            if *by_ref && arg.is_place() {
+                let v = self.var(*slot);
+                let loc = self.locate(arg, f);
+                self.save(loc, v);
+            }
+        }
+        ret
+    }
+
+    #[inline(never)]
+    fn sprintf(&mut self, args: &[Expr], f: &[Func]) -> f64 {
+        let mut vals = [0.0f64; MAX_ARGS];
+        let (mut dst, mut fmt) = (0.0, 0.0);
+        for (i, a) in args.iter().enumerate() {
+            let v = self.eval(a, f);
+            match i {
+                0 => dst = v,
+                1 => fmt = v,
+                _ => {
+                    if let Some(slot) = vals.get_mut(i - 2) {
+                        *slot = v;
+                    }
+                }
+            }
+        }
+        let n = args.len().saturating_sub(2).min(MAX_ARGS);
+        let fmt_bytes = self.string_index(fmt).and_then(|i| self.strings.get(i)).map_or(&[][..], Vec::as_slice);
+        format_into(&mut self.sbuf, &mut self.body, fmt_bytes, vals.get(..n).unwrap_or(&[]), &self.strings);
+        self.store_scratch(dst);
+        dst
+    }
+
+    /// `cost` is the work per point, in loop iterations (see [`Machine::charge`]).
+    fn fft_buffer(&mut self, start: f64, n: f64, cost: fn(usize) -> usize) -> Option<&mut [f64]> {
         let n = fft::points(n)?;
+        if !self.charge(cost(n)) {
+            return None;
+        }
         let s = index(start, self.mem.len())?;
         self.mem.get_mut(s..s.checked_add(2 * n)?)
     }
@@ -416,27 +478,7 @@ impl Machine {
                 }
                 return 1.0;
             }
-            Builtin::Sprintf => {
-                let mut vals = [0.0f64; MAX_ARGS];
-                let (mut dst, mut fmt) = (0.0, 0.0);
-                for (i, a) in args.iter().enumerate() {
-                    let v = self.eval(a, f);
-                    match i {
-                        0 => dst = v,
-                        1 => fmt = v,
-                        _ => {
-                            if let Some(slot) = vals.get_mut(i - 2) {
-                                *slot = v;
-                            }
-                        }
-                    }
-                }
-                let n = args.len().saturating_sub(2).min(MAX_ARGS);
-                let fmt_bytes = self.string_index(fmt).and_then(|i| self.strings.get(i)).map_or(&[][..], Vec::as_slice);
-                format_into(&mut self.sbuf, &mut self.body, fmt_bytes, vals.get(..n).unwrap_or(&[]), &self.strings);
-                self.store_scratch(dst);
-                return dst;
-            }
+            Builtin::Sprintf => return self.sprintf(args, f),
             _ => {}
         }
         let a0 = args.first().map_or(0.0, |e| self.eval(e, f));
@@ -548,7 +590,9 @@ impl Machine {
             Builtin::Memset => {
                 if let Some(d) = index(a0, self.mem.len()) {
                     let n = if a2 > 0.0 { (a2 as usize).min(self.mem.len() - d) } else { 0 };
-                    if let Some(s) = self.mem.get_mut(d..d + n) {
+                    if self.charge(cells_cost(n))
+                        && let Some(s) = self.mem.get_mut(d..d + n)
+                    {
                         s.fill(a1);
                     }
                 }
@@ -557,7 +601,7 @@ impl Machine {
             Builtin::Memcpy => {
                 if let (Some(d), Some(s)) = (index(a0, self.mem.len()), index(a1, self.mem.len())) {
                     let n = if a2 > 0.0 { (a2 as usize).min(self.mem.len() - d).min(self.mem.len() - s) } else { 0 };
-                    if n > 0 {
+                    if n > 0 && self.charge(cells_cost(n)) {
                         self.mem.copy_within(s..s + n, d);
                     }
                 }
@@ -566,19 +610,19 @@ impl Machine {
             Builtin::MemTop => self.mem.len() as f64,
             Builtin::FreeMBuf | Builtin::Ignored => 0.0,
             Builtin::Fft => {
-                if let Some(buf) = self.fft_buffer(a0, a1) {
+                if let Some(buf) = self.fft_buffer(a0, a1, transform_cost) {
                     fft::fft(buf);
                 }
                 0.0
             }
             Builtin::Ifft => {
-                if let Some(buf) = self.fft_buffer(a0, a1) {
+                if let Some(buf) = self.fft_buffer(a0, a1, transform_cost) {
                     fft::ifft(buf);
                 }
                 0.0
             }
             Builtin::FftPermute | Builtin::FftIpermute => {
-                if let Some(buf) = self.fft_buffer(a0, a1) {
+                if let Some(buf) = self.fft_buffer(a0, a1, permute_cost) {
                     fft::permute(buf);
                 }
                 0.0
@@ -723,6 +767,69 @@ mod tests {
         assert!(!m.run(&e, &names.funcs, 1000));
         let e = compile("loop(1e9, loop(1e9, x += 1;););", 1, &mut names).unwrap();
         assert!(!m.run(&e, &names.funcs, 5000));
+    }
+
+    #[test]
+    fn the_deepest_accepted_code_runs_on_a_small_stack() {
+        // Per shape of code, the largest size the parser accepts. Chains grow the tree one frame
+        // per level; builtin calls (eval → call → eval) and user calls cost more per level but
+        // are bounded by the parser's nesting limit, which function bodies inherit from callers.
+        let shapes: [fn(usize) -> String; 4] = [
+            |n| format!("y = {}a;", "a+".repeat(n)),
+            |n| format!("y = {}0.5{};", "sin(".repeat(n), ")".repeat(n)),
+            |n| format!("y = {}a{}{};", "sin(".repeat(30), "+a".repeat(n), ")".repeat(30)),
+            |n| {
+                let mut s = String::from("function f0(x) ( sprintf(#s, \"%d\", x); );\n");
+                for k in 1..=n {
+                    s += &format!("function f{k}(x) ( sprintf(#s, \"%d\", f{}(x)); );\n", k - 1);
+                }
+                s + &format!("y = f{n}(1);")
+            },
+        ];
+        let mut tallest = 0;
+        for shape in shapes {
+            let mut deepest = None;
+            for n in 1..=1000 {
+                let mut names = Names::new();
+                match compile(&shape(n), 1, &mut names) {
+                    Ok(e) => deepest = Some((e, names)),
+                    Err(_) => break,
+                }
+            }
+            let (e, mut names) = deepest.unwrap();
+            let (funcs, nvars, strings) = (std::mem::take(&mut names.funcs), names.len(), std::mem::take(&mut names.strings));
+            tallest = tallest.max(crate::parse::height(&e, &funcs));
+            // Needs about 128 KiB in debug and release builds; audio threads have several times
+            // this much.
+            let ok = std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .spawn(move || Machine::new(nvars, 16).with_strings(strings).run(&e, &funcs, 1000))
+                .unwrap()
+                .join()
+                .unwrap();
+            assert!(ok);
+        }
+        assert!(tallest > crate::parse::MAX_HEIGHT - 4, "{tallest}");
+    }
+
+    #[test]
+    fn expensive_builtins_draw_on_the_budget() {
+        // A few loop iterations, each doing a big FFT or fill: cut off by the budget, not by the
+        // iteration count.
+        let mut names = Names::new();
+        for src in [
+            "loop(100, fft(0, 32768));",
+            "loop(100, memset(0, 1, 65536));",
+            "loop(100, memcpy(0, 65536, 65536));",
+            "loop(100, fft_permute(0, 32768));",
+        ] {
+            let e = compile(src, 1, &mut names).unwrap();
+            let mut m = Machine::new(names.len(), 1 << 17);
+            assert!(!m.run(&e, &names.funcs, 100_000), "{src}");
+        }
+        // The same work fits a budget sized for it.
+        let e = compile("loop(2, fft(0, 1024));", 1, &mut names).unwrap();
+        assert!(Machine::new(names.len(), 4096).run(&e, &names.funcs, 10_000));
     }
 
     #[test]

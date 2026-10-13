@@ -7,10 +7,12 @@
 //!
 //! The EEL2 language is implemented from scratch (clean-room): a lexer, a precedence-climbing parser
 //! producing a small expression tree with resolved variable slots, and a tree-walking interpreter.
-//! Hostile scripts cannot hang or crash the host: every loop draws on a per-section fuel budget
-//! (a section that exhausts it faults the effect, which then passes audio through), memory accesses
-//! are bounds-checked, nesting depth is capped at parse time and the interpreter never allocates
-//! while processing.
+//! Hostile scripts cannot hang or crash the host: every loop iteration, and builtins in proportion
+//! to their work (FFTs, memory fills and copies), draw on a per-section fuel budget (a section that
+//! exhausts it faults the effect, which then passes audio through), memory accesses are
+//! bounds-checked, the tree height (counting into called functions, so the interpreter's stack)
+//! and how much code functions expand to are capped at compile time, and the interpreter never
+//! allocates while processing.
 //!
 //! Supported today: the `desc`/`sliderN`/`in_pin`/`out_pin`/`options`/`import` header, the `@init`,
 //! `@slider`, `@block` and `@sample` sections, operators, `mem[]`/`gmem[]` (gmem is per instance),

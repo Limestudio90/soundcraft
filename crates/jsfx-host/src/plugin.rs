@@ -3,7 +3,7 @@
 use crate::ast::{Expr, Func};
 use crate::header::{JsfxSource, SliderDef, parse_source};
 use crate::parse::{self, MAX_CH, Names, compile};
-use crate::vm::Machine;
+use crate::vm::{self, Machine};
 use crate::{ID_PREFIX, JsfxError};
 use soundcraft_dsp::{Category, ParamInfo, Plugin, PluginInfo, Taper, Unit};
 use std::collections::{HashMap, HashSet};
@@ -101,6 +101,17 @@ fn info_for(id: &str, text: &str, src: &JsfxSource) -> &'static PluginInfo {
     }));
     guard.insert(key, info);
     info
+}
+
+/// Reads an effect file (size-capped): its plugin id (`jsfx:` + the path relative to `root`) and text.
+fn read_effect(root: &Path, path: &Path) -> Result<(String, String), JsfxError> {
+    let io = |e: std::io::Error| JsfxError::Io(format!("{}: {e}", path.display()));
+    if std::fs::metadata(path).map_err(io)?.len() > MAX_FILE {
+        return Err(JsfxError::Io(format!("{}: file too large", path.display())));
+    }
+    let bytes = std::fs::read(path).map_err(io)?;
+    let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+    Ok((format!("{ID_PREFIX}{rel}"), String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 /// Compiles each imported file's code into `names` (so its functions become callable) and collects
@@ -212,14 +223,17 @@ impl JsfxPlugin {
         Self::load_file(root, path, false).map(drop)
     }
 
+    /// The description of a JSFX file from its header alone (name and sliders): nothing is compiled
+    /// or run. The same `PluginInfo` an instance of the file reports.
+    pub fn info_from_file(root: &Path, path: &Path) -> Result<&'static PluginInfo, JsfxError> {
+        let (id, text) = read_effect(root, path)?;
+        let mut src = parse_source(&text)?;
+        src.sliders.sort_by_key(|s| s.index);
+        Ok(info_for(&id, &text, &src))
+    }
+
     fn load_file(root: &Path, path: &Path, instantiate: bool) -> Result<Option<Self>, JsfxError> {
-        let io = |e: std::io::Error| JsfxError::Io(format!("{}: {e}", path.display()));
-        if std::fs::metadata(path).map_err(io)?.len() > MAX_FILE {
-            return Err(JsfxError::Io(format!("{}: file too large", path.display())));
-        }
-        let bytes = std::fs::read(path).map_err(io)?;
-        let text = String::from_utf8_lossy(&bytes);
-        let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+        let (id, text) = read_effect(root, path)?;
         // Imports are looked up next to the effect, then in the Effects folder. Names that climb out of
         // those folders (absolute paths, `..`) are refused: effects are untrusted input.
         // The effect's own folder, each parent folder up to the Effects folder, then the Effects folder.
@@ -238,7 +252,7 @@ impl JsfxPlugin {
                 std::fs::read(&p).ok().map(|b| String::from_utf8_lossy(&b).into_owned())
             })
         };
-        Self::build(&format!("{ID_PREFIX}{rel}"), &text, Some(&loader), instantiate)
+        Self::build(&id, &text, Some(&loader), instantiate)
     }
 
     /// `true` once a section ran out of its budget; the effect then passes audio through untouched.
@@ -257,12 +271,15 @@ impl JsfxPlugin {
     }
 
     fn run(&mut self, which: fn(&Sections) -> &Option<Expr>, fuel: u64) {
-        if let Some(e) = which(&self.code)
-            && !self.m.run(e, &self.funcs, fuel)
-        {
+        if !self.try_run(which, fuel) {
             log::warn!("jsfx {}: section ran out of its budget; bypassing", self.info.id);
             self.faulted = true;
         }
+    }
+
+    /// Runs a section; `false` when it ran out of its budget.
+    fn try_run(&mut self, which: fn(&Sections) -> &Option<Expr>, fuel: u64) -> bool {
+        which(&self.code).as_ref().is_none_or(|e| self.m.run(e, &self.funcs, fuel))
     }
 
     fn read_latency(&mut self) {
@@ -270,7 +287,8 @@ impl JsfxPlugin {
         self.latency = if d.is_finite() && d > 0.0 { (d as usize).min(self.sr as usize * 4) } else { 0 };
     }
 
-    /// (Re)starts the effect: clears state, publishes host variables, runs `@init` then `@slider`.
+    /// Starts the effect from scratch (`prepare`, on the control thread): clears variables and
+    /// memory, publishes host variables, runs `@init` then `@slider`.
     fn start(&mut self) {
         self.m.reset();
         self.faulted = false;
@@ -300,8 +318,22 @@ impl Plugin for JsfxPlugin {
         self.start();
     }
 
+    /// Play/Stop, on the audio thread: like REAPER at the start of playback, `@init` and `@slider`
+    /// run again (unless the effect set `ext_noinit`) over the variables and memory as they are.
+    /// Nothing is allocated or cleared, and `@init` gets a block's budget, not a load's: when it
+    /// runs out, what the load's `@init` built stays and the effect keeps playing.
     fn reset(&mut self) {
-        self.start();
+        self.m.clear_midi();
+        if self.faulted || vm::truthy(self.m.var(parse::EXT_NOINIT)) {
+            return;
+        }
+        self.push_sliders();
+        if !self.try_run(|c| &c.init, FUEL_BLOCK) {
+            log::warn!("jsfx {}: @init ran out of its budget at the start of playback", self.info.id);
+        }
+        self.run(|c| &c.slider, FUEL_SLIDER);
+        self.dirty = false;
+        self.read_latency();
     }
 
     fn set_param(&mut self, id: &str, value: f32) -> bool {
@@ -429,10 +461,34 @@ mod tests {
         let mut io = vec![vec![9.0], vec![0.0]];
         p.process(&mut io, 1);
         assert_eq!(io[0], [3.0]);
+        // Play/Stop keeps memory (REAPER does too); a new `prepare` starts from scratch.
         p.reset();
         let mut io = vec![vec![5.0], vec![0.0]];
         p.process(&mut io, 1);
+        assert_eq!(io[0], [9.0]);
+        p.prepare(48_000.0, 64, 2);
+        let mut io = vec![vec![5.0], vec![0.0]];
+        p.process(&mut io, 1);
         assert_eq!(io[0], [0.0]);
+    }
+
+    #[test]
+    fn play_stop_reruns_init_cheaply_on_the_audio_thread() {
+        // `@init` runs again at Play/Stop, over the variables as they are.
+        let mut p = load("desc:R\n@init\nruns += 1;\n@sample\nspl0 = runs;\n");
+        assert_eq!(run(&mut p, 0.0, 0.0, 1)[0][0], 1.0);
+        p.reset();
+        assert_eq!(run(&mut p, 0.0, 0.0, 1)[0][0], 2.0);
+        // `ext_noinit` turns that off.
+        let mut p = load("desc:N\n@init\next_noinit = 1; runs += 1;\n@sample\nspl0 = runs;\n");
+        p.reset();
+        assert_eq!(run(&mut p, 0.0, 0.0, 1)[0][0], 1.0);
+        // An `@init` that fits a load's budget but not a block's: the reset stops early, the table
+        // the load built stays, and the effect keeps playing.
+        let mut p = load("desc:H\n@init\ni = 0; loop(10000000, i += 1;); mem[5] = 0.25;\n@sample\nspl0 = mem[5];\n");
+        p.reset();
+        assert!(!p.is_faulted());
+        assert_eq!(run(&mut p, 0.0, 0.0, 1)[0][0], 0.25);
     }
 
     #[test]

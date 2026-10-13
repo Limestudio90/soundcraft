@@ -39,8 +39,18 @@ pub(crate) const EXT_NOINIT: usize = 142;
 pub(crate) const EXT_NODENORM: usize = 143;
 const FIRST_USER: usize = 144;
 
+/// Parser recursion: nested parentheses, assignments, unary operators.
 const MAX_DEPTH: u32 = 100;
 const MAX_CHAIN: u32 = 500;
+/// How deep evaluation may recurse (tree height, counting into called functions). The parser's
+/// limits do not bound it: `a+b+c+...` builds a left-leaning chain, chains nest inside
+/// parentheses, and function bodies stack up through calls. The deepest of 328 effects in a real
+/// REAPER library reaches 48.
+pub(crate) const MAX_HEIGHT: u32 = 256;
+/// Function bodies are compiled once per namespace they are called with, so a few small
+/// functions calling each other through several namespaces can multiply into a huge program.
+/// Caps the tokens compiled that way per effect (the most a real library needed was about 80k).
+const MAX_EXPANDED_TOKENS: usize = 1 << 19;
 
 /// A parsed `function` definition, kept as tokens until it is instantiated by a call.
 pub(crate) struct FnDef {
@@ -60,6 +70,8 @@ pub(crate) struct Names {
     defs: HashMap<String, Vec<Rc<FnDef>>>,
     instances: HashMap<String, usize>,
     in_progress: HashSet<String>,
+    /// Tokens compiled into function instances so far (see `MAX_EXPANDED_TOKENS`).
+    expanded: usize,
     /// Compiled function instances, indexed by `Expr::UserCall`.
     pub funcs: Vec<Func>,
     /// Initial contents of every string (named `#x`, literals, anonymous `#`); a string's handle is
@@ -105,6 +117,7 @@ impl Names {
             defs: HashMap::new(),
             instances: HashMap::new(),
             in_progress: HashSet::new(),
+            expanded: 0,
             funcs: Vec::new(),
             strings: Vec::new(),
             string_names: HashMap::new(),
@@ -257,7 +270,45 @@ pub(crate) fn compile(src: &str, first_line: u32, names: &mut Names) -> R<Expr> 
     if !matches!(p.peek(), Tok::Eof) {
         return Err(p.err("unexpected token"));
     }
+    check_height(&e, &names.funcs)?;
     Ok(e)
+}
+
+/// How deep evaluating `e` recurses: its tree height, where a call adds the height of the
+/// function's body. Walks with its own stack, so a hostile tree cannot overflow this either.
+pub(crate) fn height(e: &Expr, funcs: &[Func]) -> u32 {
+    let mut max = 0;
+    let mut stack = vec![(e, 1u32)];
+    while let Some((e, d)) = stack.pop() {
+        max = max.max(d);
+        let d1 = d.saturating_add(1);
+        match e {
+            Expr::Num(_) | Expr::StrRef(_) | Expr::Var(_) => {}
+            Expr::VarIdx { idx: x, .. } | Expr::Mem(x) | Expr::GMem(x) | Expr::Unary(_, x) | Expr::While(x) => stack.push((x, d1)),
+            Expr::Bin(_, a, b) | Expr::LogicAnd(a, b) | Expr::LogicOr(a, b) | Expr::Assign(a, _, b) | Expr::Loop(a, b) | Expr::WhileBody(a, b) => {
+                stack.push((a, d1));
+                stack.push((b, d1));
+            }
+            Expr::Cond(c, t, o) => {
+                stack.push((c, d1));
+                stack.push((t, d1));
+                if let Some(o) = o {
+                    stack.push((o, d1));
+                }
+            }
+            Expr::Seq(v) | Expr::Call(_, v) => stack.extend(v.iter().map(|x| (x, d1))),
+            Expr::UserCall(id, args) => {
+                stack.extend(args.iter().map(|x| (x, d1)));
+                max = max.max(d.saturating_add(funcs.get(*id).map_or(0, |f| f.height)));
+            }
+        }
+    }
+    max
+}
+
+fn check_height(e: &Expr, funcs: &[Func]) -> R<u32> {
+    let h = height(e, funcs);
+    if h > MAX_HEIGHT { Err(JsfxError::Unsupported(format!("code nested {h} levels deep (at most {MAX_HEIGHT})"))) } else { Ok(h) }
 }
 
 /// The function instance whose body is being parsed.
@@ -647,6 +698,10 @@ impl Parser<'_> {
         if !self.names.in_progress.insert(key.clone()) {
             return Err(JsfxError::Unsupported(format!("recursive function `{fname}`")));
         }
+        self.names.expanded = self.names.expanded.saturating_add(def.body.len());
+        if self.names.expanded > MAX_EXPANDED_TOKENS {
+            return Err(JsfxError::Unsupported("functions expand to too much code across namespaces".into()));
+        }
         let params: Vec<usize> = def.params.iter().map(|p| self.names.slot(&format!("{key}|{p}"))).collect();
         let body = {
             let mut child = Parser {
@@ -664,8 +719,9 @@ impl Parser<'_> {
             body
         };
         self.names.in_progress.remove(&key);
+        let height = check_height(&body, &self.names.funcs)?;
         let id = self.names.funcs.len();
-        self.names.funcs.push(Func { params, refs: def.refs.clone(), body });
+        self.names.funcs.push(Func { params, refs: def.refs.clone(), body, height });
         self.names.instances.insert(key, id);
         Ok(Expr::UserCall(id, args))
     }
@@ -772,6 +828,33 @@ mod tests {
     fn deep_nesting_is_rejected_not_overflowed() {
         let s = format!("{}1{}", "(".repeat(5000), ")".repeat(5000));
         assert!(parse(&s).is_err());
+    }
+
+    #[test]
+    fn long_chains_and_call_chains_count_toward_the_height() {
+        // Within the parser's chain limit, but too tall to evaluate safely.
+        assert!(matches!(parse(&format!("x = {}a;", "a+".repeat(300))), Err(JsfxError::Unsupported(_))));
+        assert!(parse(&format!("x = {}a;", "a+".repeat(200))).is_ok());
+        // Chains nested at the bottom of chains add up.
+        let nest = |levels: usize| (0..levels).fold("a".to_string(), |s, _| format!("({s}{})", "+a".repeat(100)));
+        assert!(parse(&format!("x = {};", nest(2))).is_ok());
+        assert!(matches!(parse(&format!("x = {};", nest(4))), Err(JsfxError::Unsupported(_))));
+        // A function's body stacks on its caller's height.
+        let chain = "+a".repeat(100);
+        let src = format!("function f0(x) ( x{chain}; );\nfunction f1(x) ( f0(x){chain}; );\nfunction f2(x) ( f1(x){chain}; );\n");
+        assert!(parse(&format!("{src}y = f1(1);")).is_ok());
+        assert!(matches!(parse(&format!("{src}y = f2(1);")), Err(JsfxError::Unsupported(_))));
+    }
+
+    #[test]
+    fn instantiation_across_namespaces_is_capped() {
+        // Each level calls the one below through two namespaces: 2^40 instances if nothing stopped it.
+        let mut src = String::from("function g0() instance(n) ( n += 1; );\n");
+        for k in 1..=40 {
+            src += &format!("function g{k}() ( this.a.g{p}(); this.b.g{p}(); );\n", p = k - 1);
+        }
+        let Err(JsfxError::Unsupported(m)) = parse(&(src + "g40();")) else { panic!("should be refused") };
+        assert!(m.contains("too much code"), "{m}");
     }
 
     #[test]

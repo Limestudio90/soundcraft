@@ -5,6 +5,7 @@
 use crate::scan::{JsfxEntry, default_effects_dirs, scan as scan_dir, soundcraft_effects_dir};
 use crate::{ID_PREFIX, JsfxPlugin};
 use soundcraft_dsp::{Plugin, PluginInfo};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -12,6 +13,8 @@ struct State {
     dirs: Vec<PathBuf>,
     /// Each effect with the Effects folder its id is relative to; `None` until the first scan.
     found: Option<Vec<(PathBuf, JsfxEntry)>>,
+    /// `plugin_info` answers by id, cleared with every new scan (`None`: unknown or fails to load).
+    infos: HashMap<String, Option<&'static PluginInfo>>,
 }
 
 fn state() -> MutexGuard<'static, State> {
@@ -24,7 +27,7 @@ fn state() -> MutexGuard<'static, State> {
         if let Some(extra) = std::env::var_os("JSFX_PATH") {
             dirs.extend(std::env::split_paths(&extra).filter(|d| d.is_dir()));
         }
-        Mutex::new(State { dirs, found: None })
+        Mutex::new(State { dirs, found: None, infos: HashMap::new() })
     });
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -42,6 +45,7 @@ fn scanned(st: &mut State) -> &[(PathBuf, JsfxEntry)] {
             }
         }
         st.found = Some(all);
+        st.infos.clear();
     }
     st.found.as_deref().unwrap_or(&[])
 }
@@ -97,10 +101,27 @@ pub fn create(id: &str) -> Option<Box<dyn Plugin>> {
     }
 }
 
-/// The description of a `jsfx:<path>` effect. The first call for an effect compiles it once to
-/// read its sliders; the result is cached (and leaked, see the crate docs).
+/// The description of a `jsfx:<path>` effect. The Mix window asks for it every frame, so it reads
+/// only the file's header (no compiling, no `@init`, no effect memory) and is cached per scan; the
+/// `PluginInfo` itself is leaked once per file contents (see the crate docs).
 pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
-    create(id).map(|p| p.info())
+    parse_id(id)?;
+    let mut st = state();
+    if let Some(&cached) = st.infos.get(id) {
+        return cached;
+    }
+    let info = match scanned(&mut st).iter().find(|(_, e)| e.id == id) {
+        Some((root, e)) if e.unsupported.is_none() => match JsfxPlugin::info_from_file(root, &e.path) {
+            Ok(i) => Some(i),
+            Err(err) => {
+                log::warn!("cannot read {id}: {err}");
+                None
+            }
+        },
+        _ => None,
+    };
+    st.infos.insert(id.to_string(), info);
+    info
 }
 
 #[cfg(test)]
@@ -134,9 +155,13 @@ mod tests {
         let info = plugin_info(id).unwrap();
         assert_eq!(info.name, "Half");
         let mut p = create(id).unwrap();
+        assert!(std::ptr::eq(info, p.info()), "the header-only description is the instance's");
         let mut io = vec![vec![1.0f32; 4], vec![-1.0f32; 4]];
         p.process(&mut io, 4);
         assert_eq!((io[0][0], io[1][3]), (0.5, -0.5));
+        // Later calls answer from the cache, without touching the file.
+        std::fs::remove_file(root.join("util/half")).unwrap();
+        assert!(std::ptr::eq(plugin_info(id).unwrap(), info));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
