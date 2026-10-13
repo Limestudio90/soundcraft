@@ -50,8 +50,9 @@ const MAX_CHAIN: u32 = 500;
 pub(crate) const MAX_HEIGHT: u32 = 256;
 /// Function bodies are compiled once per namespace they are called with, so a few small
 /// functions calling each other through several namespaces can multiply into a huge program.
-/// Caps the tokens compiled that way per effect (the most a real library needed was about 80k).
-const MAX_EXPANDED_TOKENS: usize = 1 << 19;
+/// Caps the tokens compiled that way per effect (a synth whose voices each hold filter objects,
+/// `voice1.filter.tick()`, needs more than half a million).
+const MAX_EXPANDED_TOKENS: usize = 1 << 21;
 
 /// A parsed `function` definition, kept as tokens until it is instantiated by a call.
 pub(crate) struct FnDef {
@@ -390,10 +391,15 @@ impl Parser<'_> {
             Some(sc) => {
                 if let Some(rest) = name.strip_prefix("this.") {
                     qualify(&sc.ns, rest)
+                } else if sc.def.params.iter().any(|p| p == name) {
+                    // A parameter hides an instance variable of the same name: `this.x = x;`.
+                    format!("{}|{name}", sc.key)
                 } else if sc.def.instance.contains(name) {
                     qualify(&sc.ns, name)
-                } else if sc.def.params.iter().any(|p| p == name) || sc.def.locals.contains(name) {
+                } else if sc.def.locals.contains(name) {
                     format!("{}|{name}", sc.key)
+                } else if let Some(q) = self.in_instance(name) {
+                    q
                 } else if !sc.def.globals_only || sc.def.globals.contains(name) || name.contains('.') {
                     name.to_string()
                 } else {
@@ -669,6 +675,15 @@ impl Parser<'_> {
         Ok(Expr::Num(0.0))
     }
 
+    /// Inside a function, a dotted name whose first part is one of its `instance(...)` names lives
+    /// in the caller's namespace: with `instance(filter)`, `filter.a1` in `band1.f()` is
+    /// `band1.filter.a1`.
+    fn in_instance(&self, name: &str) -> Option<String> {
+        let sc = self.scope.as_ref()?;
+        let first = name.split('.').next()?;
+        sc.def.instance.contains(first).then(|| qualify(&sc.ns, name))
+    }
+
     /// The user function a call refers to and the namespace it runs in.
     fn find_fn(&self, name: &str) -> Option<(String, String)> {
         let cur = self.scope.as_ref().map(|s| s.ns.as_str()).unwrap_or("");
@@ -685,7 +700,7 @@ impl Parser<'_> {
             let ns = match prefix.strip_prefix("this.") {
                 Some(rest) => qualify(cur, rest),
                 None if prefix == "this" => cur.to_string(),
-                None => prefix.to_string(),
+                None => self.in_instance(prefix).unwrap_or_else(|| prefix.to_string()),
             };
             Some((f.to_string(), ns))
         })

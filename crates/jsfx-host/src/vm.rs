@@ -1027,6 +1027,21 @@ mod tests {
     }
 
     #[test]
+    fn dotted_names_under_an_instance_name_follow_the_namespace() {
+        let src = "function f_init() ( this.k = 2; ); \
+                   function b_init() instance(filter) ( filter.f_init(); filter.m = 3; ); \
+                   band1.b_init(); x = band1.filter.k * 10 + band1.filter.m; y = filter.m;";
+        assert_eq!(val(src, "x"), 23.0);
+        assert_eq!(val(src, "y"), 0.0);
+    }
+
+    #[test]
+    fn parameters_hide_instance_variables_of_the_same_name() {
+        let src = "function set(v) instance(v) ( this.v = v; ); a.set(4); x = a.v;";
+        assert_eq!(val(src, "x"), 4.0);
+    }
+
+    #[test]
     fn instance_variables_live_in_a_namespace() {
         let src = "function inc() instance(n) ( n += 1; ); a.inc(); a.inc(); b.inc(); x = a.n; y = b.n;";
         assert_eq!(val(src, "x"), 2.0);

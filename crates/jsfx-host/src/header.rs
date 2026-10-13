@@ -74,7 +74,9 @@ fn parse_slider(index: usize, rest: &str) -> Option<SliderDef> {
     };
     let rest = rest.trim_start();
     let end = rest.find(['<', ',']).unwrap_or(rest.len());
-    let default = rest.get(..end)?.trim().parse::<f64>().ok()?;
+    // An empty default (`name=<0,1>`) is 0, as in REAPER.
+    let text = rest.get(..end)?.trim();
+    let default = if text.is_empty() { 0.0 } else { text.parse::<f64>().ok()? };
     let tail = rest.get(end..).unwrap_or("");
     let (inner, label) = if let Some(t) = tail.strip_prefix('<') {
         let (inner, label) = t.split_once('>').unwrap_or((t, ""));
@@ -272,6 +274,8 @@ mod tests {
         let s = parse_slider(5, "0<0,1>-secret").unwrap();
         assert!(s.hidden && s.label == "secret");
         assert!(parse_slider(6, "/presets:default.wav:Sample").is_none());
+        let s = parse_slider(7, "mode=<0,2,1{Off,On,Auto}>Mode").unwrap();
+        assert_eq!((s.var.as_deref(), s.default), (Some("mode"), 0.0));
     }
 
     #[test]
