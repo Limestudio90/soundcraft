@@ -378,7 +378,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
     if !open {
         return;
     }
-    egui::Window::new("MIDI Keyboard").id(window_id()).open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| body(app, ui));
+    egui::Window::new("MIDI Keyboard").id(window_id()).open(&mut open).auto_sized().collapsible(false).show(ctx, |ui| body(app, ui));
     app.ui.show_midi_keyboard = open;
 }
 
@@ -474,7 +474,9 @@ fn body(app: &mut SoundApp, ui: &mut Ui) {
     ui.add_space(6.0);
     controls(app, ui);
     ui.add_space(4.0);
-    readout(app, ui);
+    // As wide as the keys or the buttons, whichever is wider.
+    let width = ui.min_rect().width().max(size.x);
+    readout(app, ui, width);
 }
 
 /// A white key, lit from above with a lip at the bottom; it sinks and tints while down.
@@ -588,9 +590,10 @@ fn controls(app: &mut SoundApp, ui: &mut Ui) {
 }
 
 /// The dark readout bar: octave, velocity and transpose.
-fn readout(app: &mut SoundApp, ui: &mut Ui) {
+fn readout(app: &mut SoundApp, ui: &mut Ui, width: f32) {
     egui::Frame::new().fill(Color32::from_gray(22)).corner_radius(3.0).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
-        ui.set_width(ui.available_width());
+        // Not the available width: that would keep the window as wide as it ever was.
+        ui.set_width(width - 20.0);
         ui.horizontal(|ui| {
             let p = &mut app.ui.midi_keyboard;
             let low = u8::try_from(low_c(p).clamp(0, 127)).unwrap_or(60);
