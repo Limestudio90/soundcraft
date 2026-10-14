@@ -65,8 +65,8 @@ fn the_computer_rows_play_two_octaves_while_the_keyboard_is_open() {
 #[test]
 fn octave_velocity_and_transpose_move_the_notes() {
     let (mut h, keys) = harness();
-    key(&mut h, Key::Backslash, true);
-    key(&mut h, Key::Backslash, false);
+    key(&mut h, Key::Quote, true);
+    key(&mut h, Key::Quote, false);
     key(&mut h, Key::CloseBracket, true);
     assert_eq!(h.state().ui.midi_keyboard.octave, 4);
     assert_eq!(h.state().ui.midi_keyboard.velocity, 105);

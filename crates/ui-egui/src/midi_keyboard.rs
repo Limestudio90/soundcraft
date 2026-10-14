@@ -2,7 +2,7 @@
 //! with the computer keys, on the record-enabled MIDI and Instrument tracks.
 //!
 //! The computer keys play two octaves: Z to M is the lower one (black keys on S D, G H J) and Q to
-//! I the upper one (black keys on 2 3, 5 6 7). The keys right of P and L move the velocity and the
+//! I the upper one (black keys on 2 3, 5 6 7). The two keys right of P and L move the velocity and the
 //! octave. Keys are read by position, so the layout works whatever the keyboard's language. They
 //! belong to the keyboard only while it is active (the last click landed in its window); then the
 //! shortcuts on those keys wait until a click elsewhere.
@@ -50,7 +50,7 @@ impl Default for KeyboardPrefs {
             transpose: 0,
             step: false,
             step_ticks: TICKS_PER_QUARTER / 2,
-            control_labels: [";", "\\", "[", "]"].map(String::from),
+            control_labels: [";", "'", "[", "]"].map(String::from),
         }
     }
 }
@@ -118,9 +118,9 @@ const NOTE_KEYS: [(Key, i32); 25] = [
     (Key::I, 24),
 ];
 
-/// Octave down, octave up, velocity down, velocity up: the keys right of L and P (ò ù è + on an
-/// Italian keyboard, ; \ [ ] on a US one).
-const CONTROL_KEYS: [Key; 4] = [Key::Semicolon, Key::Backslash, Key::OpenBracket, Key::CloseBracket];
+/// Octave down, octave up, velocity down, velocity up: the two keys right of L and the two right
+/// of P (ò à è + on an Italian keyboard, ; ' [ ] on a US one).
+const CONTROL_KEYS: [Key; 4] = [Key::Semicolon, Key::Quote, Key::OpenBracket, Key::CloseBracket];
 
 fn action(key: Key) -> Option<Action> {
     if let Some((_, n)) = NOTE_KEYS.iter().find(|(k, _)| *k == key) {
