@@ -122,6 +122,18 @@ mod api {
     pub fn problems() -> Vec<(PathBuf, String)> {
         registry::problems()
     }
+    pub fn progress() -> Option<(usize, usize, PathBuf)> {
+        registry::progress()
+    }
+    pub fn set_scanner(program: Option<PathBuf>) {
+        registry::set_scanner(program)
+    }
+    pub fn scan_reply(file: &Path) -> String {
+        registry::scan_reply(file)
+    }
+    pub fn skip_scan() {
+        registry::skip_scan()
+    }
     pub fn add_search_dir(dir: &Path) -> usize {
         registry::add_search_dir(dir)
     }
@@ -165,6 +177,14 @@ mod api {
     pub fn problems() -> Vec<(PathBuf, String)> {
         Vec::new()
     }
+    pub fn progress() -> Option<(usize, usize, PathBuf)> {
+        None
+    }
+    pub fn set_scanner(_program: Option<PathBuf>) {}
+    pub fn scan_reply(_file: &Path) -> String {
+        String::new()
+    }
+    pub fn skip_scan() {}
     pub fn add_search_dir(_dir: &Path) -> usize {
         0
     }
@@ -237,6 +257,38 @@ pub fn set_extra_dirs(dirs: Vec<PathBuf>) {
 /// until they change or the cache is cleared ([`rescan`]).
 pub fn problems() -> Vec<(PathBuf, String)> {
     api::problems()
+}
+
+/// The argument that makes the scan program set with [`set_scanner`] load one file:
+/// `<program> --scan-clap <file>`; the program then prints [`scan_reply`] and exits.
+pub const SCAN_FLAG: &str = "--scan-clap";
+
+/// Makes scans load each plugin file in a child process, `program` --scan-clap `<file>`, rather than in
+/// this one. A plugin's start-up then never runs here: on Windows a library initialising holds the
+/// loader lock, which stalls every thread here that loads a library or starts one (a window stays
+/// black while it lasts), and a plugin that crashes while loading takes only the child down. The
+/// scan's plugins are then loaded here only when first used. `None` (the default) loads in-process.
+pub fn set_scanner(program: Option<PathBuf>) {
+    api::set_scanner(program)
+}
+
+/// The answer of a scan child process (see [`set_scanner`]) for one CLAP file: a line with its
+/// plugins or the reason it failed, to print to standard output.
+pub fn scan_reply(file: &Path) -> String {
+    api::scan_reply(file)
+}
+
+/// The plugin file a scan is loading now: its index among the files found, their number and its
+/// path. `None` when no scan runs or it only reuses the cache file.
+pub fn progress() -> Option<(usize, usize, PathBuf)> {
+    api::progress()
+}
+
+/// Makes the running scan load no more files. It ends after the file it is loading (a plugin's
+/// own start-up cannot be interrupted); the plugins found so far are listed, and the files
+/// skipped are left out of the cache file, so the next scan loads them.
+pub fn skip_scan() {
+    api::skip_scan()
 }
 
 /// Adds a folder to the search path and merges its plugins into the cache. Returns how many

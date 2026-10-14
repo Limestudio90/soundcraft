@@ -18,9 +18,14 @@ const MAX_CHOICES: f64 = 128.0;
 #[derive(Default)]
 struct Registry {
     scanned: Option<Vec<ClapDescriptor>>,
+    /// While a scan runs: the plugins of the cache file or of the scan before, so that a plugin
+    /// can be created without waiting for the scan.
+    remembered: Vec<ClapDescriptor>,
     extra_dirs: Vec<PathBuf>,
     /// Where scans are remembered across runs (see [`scan_cache`]); `None` keeps them in memory only.
     cache_file: Option<PathBuf>,
+    /// The program that loads files for scans in a child process (see [`set_scanner`]).
+    scanner: Option<PathBuf>,
     /// The files the last scan could not load, with the reason.
     problems: Vec<(PathBuf, String)>,
     /// One leaked `PluginInfo` per plugin type that was actually instantiated (bounded by the
@@ -49,6 +54,15 @@ fn scan_lock() -> MutexGuard<'static, ()> {
 /// Set while [`scan_in_background`]'s thread runs.
 static BACKGROUND: AtomicBool = AtomicBool::new(false);
 
+/// Set by [`skip_scan`]: the running scan loads no more files.
+static SKIP: AtomicBool = AtomicBool::new(false);
+
+/// The file a scan is loading: its index, the number of files, its path.
+fn loading() -> MutexGuard<'static, Option<(usize, usize, PathBuf)>> {
+    static L: Mutex<Option<(usize, usize, PathBuf)>> = Mutex::new(None);
+    L.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Descriptors of every plugin in one `.clap` file or bundle.
 pub fn load_bundle(path: &Path) -> Result<Vec<ClapDescriptor>, ClapError> {
     let b = Bundle::load(path)?;
@@ -72,7 +86,13 @@ pub fn load_bundle(path: &Path) -> Result<Vec<ClapDescriptor>, ClapError> {
 /// Scans `dirs` (uncached). Unloadable files are logged and skipped; the first plugin with a
 /// given id wins.
 pub fn scan_paths(dirs: &[PathBuf]) -> Vec<ClapDescriptor> {
-    merge(scan_cache::scan(paths::find_bundles(dirs), &[], paths::bundle_executable, |p| load_bundle(p).map_err(|e| e.to_string())))
+    merge(scan_cache::scan(
+        paths::find_bundles(dirs),
+        &[],
+        paths::bundle_executable,
+        |p| Some(load_bundle(p).map_err(|e| e.to_string())),
+        |_, _, _| true,
+    ))
 }
 
 /// The plugins of every file, the first plugin with a given id winning, sorted by name.
@@ -90,17 +110,31 @@ fn merge(files: Vec<scan_cache::Entry<ClapDescriptor>>) -> Vec<ClapDescriptor> {
 /// Scans the search folders and keeps the result. With `reuse`, files the cache file knows are
 /// not loaded again unless they changed; either way the cache file is rewritten.
 fn scan_now(reuse: bool) -> Vec<ClapDescriptor> {
-    let (dirs, cache_file) = {
+    let (dirs, cache_file, scanner) = {
         let r = lock();
         let mut dirs = paths::default_search_paths();
         dirs.extend(r.extra_dirs.iter().cloned());
-        (dirs, r.cache_file.clone())
+        (dirs, r.cache_file.clone(), r.scanner.clone())
+    };
+    let load = |p: &Path| match &scanner {
+        // Skip kills a child that is loading; a file loading here has to finish.
+        Some(program) => scan_cache::load_in_child(program, SCAN_FLAG, p, || SKIP.load(Ordering::Acquire)),
+        None => Some(load_bundle(p).map_err(|e| e.to_string())),
     };
     let known = match &cache_file {
         Some(f) if reuse => scan_cache::read(f),
         _ => Vec::new(),
     };
-    let files = scan_cache::scan(paths::find_bundles(&dirs), &known, paths::bundle_executable, |p| load_bundle(p).map_err(|e| e.to_string()));
+    if !known.is_empty() {
+        lock().remembered = merge(known.clone());
+    }
+    SKIP.store(false, Ordering::Release);
+    let ahead = |i: usize, n: usize, p: &Path| {
+        *loading() = Some((i, n, p.to_path_buf()));
+        !SKIP.load(Ordering::Acquire)
+    };
+    let files = scan_cache::scan(paths::find_bundles(&dirs), &known, paths::bundle_executable, load, ahead);
+    *loading() = None;
     if let Some(f) = &cache_file {
         scan_cache::write(f, &files);
     }
@@ -130,7 +164,9 @@ fn rescan_with(reuse: bool) -> Vec<ClapDescriptor> {
     let _one_at_a_time = scan_lock();
     {
         let mut r = lock();
-        r.scanned = None;
+        if let Some(before) = r.scanned.take() {
+            r.remembered = before;
+        }
         r.failed.clear();
     }
     scan_now(reuse)
@@ -179,6 +215,25 @@ pub fn search_dirs() -> (Vec<PathBuf>, Vec<PathBuf>) {
 
 pub fn set_extra_dirs(dirs: Vec<PathBuf>) {
     lock().extra_dirs = dirs;
+}
+
+/// The argument that makes the scan program load one file: `<program> --scan-clap <file>`.
+pub const SCAN_FLAG: &str = "--scan-clap";
+
+pub fn set_scanner(program: Option<PathBuf>) {
+    lock().scanner = program;
+}
+
+pub fn scan_reply(file: &Path) -> String {
+    scan_cache::reply(load_bundle(file))
+}
+
+pub fn progress() -> Option<(usize, usize, PathBuf)> {
+    loading().clone()
+}
+
+pub fn skip_scan() {
+    SKIP.store(true, Ordering::Release);
 }
 
 pub fn problems() -> Vec<(PathBuf, String)> {
@@ -264,7 +319,14 @@ fn instantiate_raw(id: &str) -> Result<(Instance, &'static PluginInfo), ClapErro
     if lock().failed.contains(id) {
         return Err(ClapError::Instantiate(plugin_id.to_string(), "failed before".into()));
     }
-    let desc = scan().into_iter().find(|d| d.id == id).ok_or_else(|| ClapError::NotFound(id.to_string()))?;
+    let known = {
+        let r = lock();
+        r.scanned.iter().flatten().chain(&r.remembered).find(|d| d.id == id).cloned()
+    };
+    let desc = match known {
+        Some(d) => d,
+        None => scan().into_iter().find(|d| d.id == id).ok_or_else(|| ClapError::NotFound(id.to_string()))?,
+    };
     let made = Bundle::load(&desc.path).and_then(|b| b.instantiate(plugin_id));
     let mut r = lock();
     match made {

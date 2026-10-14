@@ -39,7 +39,7 @@ User report #152: a saved instrument level does not reach the bounce.
 |---|---|---|---|
 | Plugin format | AAX only (Native and DSP) | CLAP, VST3, Audio Units (macOS) | Users' libraries mostly ship VST3/AU too. AAX (#109) needs Avid's SDK licence and PACE signing: owner decision, likely never |
 | VST2, LV2, LADSPA | — | ❌ (#30) | Beyond Pro Tools; VST2 SDK is no longer licensable |
-| Scan, vendor menus, instrument picker | ✅ | ✅ | #23. VST3/CLAP scan on a background thread from launch; a cache file keeps what each plugin file held, so later launches load only new or changed files (like REAPER) |
+| Scan, vendor menus, instrument picker | ✅ | ✅ | #23. VST3/CLAP scan from launch in the background, each new plugin file loaded in a child process (a plugin's start-up never stalls or crashes the app); a cache file keeps what each file held, so later launches load only new or changed files (like REAPER). A notice shows the file being loaded, with Skip |
 | Plugin folders, rescan, failed files | — (one fixed folder) | ✅ | Setup ▸ Plug-in Folders: the user's own VST3/CLAP folders, Rescan, Clear Cache & Rescan, files that would not load |
 | Audio, parameters, automation, latency (PDC) | ✅ | ✅ | |
 | Notes / MIDI to instruments | ✅ | ✅ | But no live MIDI input (G-02) |

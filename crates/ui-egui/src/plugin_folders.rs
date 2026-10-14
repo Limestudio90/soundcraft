@@ -69,6 +69,18 @@ impl Format {
             Format::Clap => soundcraft_clap_host::rescan_in_background(clear_cache),
         }
     }
+    fn progress(self) -> Option<(usize, usize, PathBuf)> {
+        match self {
+            Format::Vst3 => soundcraft_vst3_host::progress(),
+            Format::Clap => soundcraft_clap_host::progress(),
+        }
+    }
+    fn skip(self) {
+        match self {
+            Format::Vst3 => soundcraft_vst3_host::skip_scan(),
+            Format::Clap => soundcraft_clap_host::skip_scan(),
+        }
+    }
     fn problems(self) -> Vec<(PathBuf, String)> {
         match self {
             Format::Vst3 => soundcraft_vst3_host::problems(),
@@ -79,14 +91,32 @@ impl Format {
 
 /// At launch: remembers scans in `settings_dir` (when there is one), adds the user's folders and
 /// starts scanning on a background thread, so that the plugin menus are ready when first opened.
-pub fn start(dirs: &PluginDirs, settings_dir: Option<&Path>) {
+/// Plugin files are loaded for the scan by `scanner` (this app's own program, run with
+/// [`scan_child`]'s arguments) in a child process, never in the app.
+pub fn start(dirs: &PluginDirs, settings_dir: Option<&Path>, scanner: Option<PathBuf>) {
     Format::Vst3.set_extra_dirs(&dirs.vst3);
     Format::Clap.set_extra_dirs(&dirs.clap);
+    soundcraft_vst3_host::set_scanner(scanner.clone());
+    soundcraft_clap_host::set_scanner(scanner);
     if let Some(dir) = settings_dir {
         soundcraft_vst3_host::set_cache_file(Some(dir.join("plugins-vst3.json")));
         soundcraft_clap_host::set_cache_file(Some(dir.join("plugins-clap.json")));
         soundcraft_vst3_host::scan_in_background();
         soundcraft_clap_host::scan_in_background();
+    }
+}
+
+/// The scan child process's work: with `<flag> <file>` arguments (see [`start`]), loads that one
+/// plugin file and returns the line to print; `None` for any other arguments.
+pub fn scan_child(args: &[String]) -> Option<String> {
+    let [flag, file] = args else { return None };
+    let file = Path::new(file);
+    if flag == soundcraft_vst3_host::SCAN_FLAG {
+        Some(soundcraft_vst3_host::scan_reply(file))
+    } else if flag == soundcraft_clap_host::SCAN_FLAG {
+        Some(soundcraft_clap_host::scan_reply(file))
+    } else {
+        None
     }
 }
 
@@ -97,6 +127,50 @@ pub(crate) fn scanning_label(ui: &mut egui::Ui, what: &str) {
         ui.weak(format!("Scanning {what}…"));
     });
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+}
+
+/// How long a scan runs before its notice shows (a scan that only reads the cache is quicker).
+const NOTICE_DELAY_S: f64 = 0.5;
+
+/// While a scan loads plugin files, a notice at the bottom right of the main window says which
+/// one ("Scanning VST3 plug-ins 5/17: Clear"), whatever window is shown, with Skip: the app stays
+/// usable meanwhile, but the plugin menus wait for the list. Skip ends the scan after the file it
+/// is loading; the skipped files are loaded at the next scan.
+pub fn scan_notice(ctx: &egui::Context) {
+    let since_id = egui::Id::new("plugin_scan_since");
+    let now = ctx.input(|i| i.time);
+    let Some((format, (i, n, file))) = [Format::Vst3, Format::Clap].into_iter().find_map(|f| f.progress().map(|p| (f, p))) else {
+        ctx.data_mut(|d| d.remove_temp::<f64>(since_id));
+        if soundcraft_vst3_host::scanning() || soundcraft_clap_host::scanning() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        return;
+    };
+    let since = ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(since_id, || now));
+    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    if now - since < NOTICE_DELAY_S {
+        return;
+    }
+    let name = file.file_stem().map_or_else(|| file.display().to_string(), |s| s.to_string_lossy().into_owned());
+    egui::Area::new(egui::Id::new("plugin_scan_notice")).anchor(egui::Align2::RIGHT_BOTTOM, vec2(-12.0, -30.0)).order(egui::Order::Foreground).show(
+        ctx,
+        |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("Scanning {} plug-ins {}/{n}: {name}", format.name(), i + 1));
+                    if ui
+                        .button("Skip")
+                        .on_hover_text("Stop after this file; the rest load at the next scan (Setup ▸ Plug-in Folders ▸ Rescan)")
+                        .clicked()
+                    {
+                        Format::Vst3.skip();
+                        Format::Clap.skip();
+                    }
+                });
+            });
+        },
+    );
 }
 
 pub fn window(app: &mut SoundApp, ctx: &egui::Context) {
