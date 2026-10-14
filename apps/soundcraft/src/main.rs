@@ -275,6 +275,9 @@ fn main() -> eframe::Result {
             app.preset_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Presets")));
             app.extra.ui_scale = prefs.ui_scale;
             app.ui = prefs;
+            // Runs without preferences (agents' tests) keep no scan cache and scan when a menu asks.
+            let settings = config_dir().filter(|_| prefs_enabled());
+            soundcraft_ui_egui::plugin_folders::start(&app.ui.plugin_dirs, settings.as_deref());
             if let Some(port) = control_port {
                 let rx = control_server::start(port, cc.egui_ctx.clone());
                 app = app.with_control(rx);
