@@ -179,7 +179,32 @@ pub(crate) fn host(cfg: &AudioConfig) -> Option<&'static cpal::Host> {
 }
 
 /// The named output (or input) device of `host`, else its default device.
+///
+/// On ASIO the input of the open driver is taken from the output's own `cpal::Device`. cpal keeps
+/// the driver's buffers per `Device` value, and the SDK makes one set of buffers for the whole
+/// driver: an input opened from a freshly listed `Device` did not know about the running output,
+/// so it remade the buffers for the input alone and the output went silent (arming a track
+/// silenced the SSL 2+). From the same `Device`, cpal makes the buffers for both.
 pub(crate) fn device(host: &cpal::Host, name: Option<&str>, output: bool) -> Option<cpal::Device> {
+    static ASIO_OUTPUT: Mutex<Option<cpal::Device>> = Mutex::new(None);
+    if host.id().name() != ASIO_SYSTEM {
+        return find_device(host, name, output);
+    }
+    let mut open = ASIO_OUTPUT.lock().unwrap_or_else(PoisonError::into_inner);
+    if output {
+        // A new output starts from fresh buffers (the previous player is closed first).
+        let d = find_device(host, name, true);
+        open.clone_from(&d);
+        return d;
+    }
+    // No name: the open driver is the only one ASIO can use anyway.
+    match open.as_ref() {
+        Some(d) if name.is_none() || device_name(d).as_deref() == name => Some(d.clone()),
+        _ => find_device(host, name, false),
+    }
+}
+
+fn find_device(host: &cpal::Host, name: Option<&str>, output: bool) -> Option<cpal::Device> {
     if let Some(want) = name {
         let found = if output { host.output_devices().ok() } else { host.input_devices().ok() }
             .and_then(|mut ds| ds.find(|d| device_name(d).as_deref() == Some(want)));
