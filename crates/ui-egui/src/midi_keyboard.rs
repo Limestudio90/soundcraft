@@ -228,6 +228,11 @@ fn release_all(app: &mut SoundApp) {
 /// Step input: the note goes into the target clip at the insertion point (or with the chord being
 /// held), and the insertion point moves on by one step.
 fn step_enter(app: &mut SoundApp, pitch: u8, velocity: u8) {
+    // Step input is for a stopped transport, as in Pro Tools: while playing or recording the keys
+    // only play (moving the insertion point would also locate the playhead and cut the note).
+    if app.is_playing() {
+        return;
+    }
     let Some(cid) = crate::midi_editor::target_clip(app) else {
         app.ui.status = "Step input: select a MIDI clip or a MIDI track".into();
         return;

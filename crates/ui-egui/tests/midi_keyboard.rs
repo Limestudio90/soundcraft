@@ -119,3 +119,16 @@ fn step_mode_writes_notes_and_chords_at_the_insertion_point() {
     assert_eq!(start(67) - start(60), soundcraft_time::TICKS_PER_QUARTER / 2, "G follows one eighth later");
     assert!(h.state().engine.session().edit.selection.start > at, "the insertion point moved on");
 }
+
+#[test]
+fn step_mode_only_plays_while_the_transport_runs() {
+    let (mut h, keys) = harness();
+    h.state_mut().ui.midi_keyboard.step = true;
+    let before = notes(&h, keys);
+    // No audio device here: mark the transport as running.
+    h.state_mut().engine.transport.playing = true;
+    key(&mut h, Key::Z, true);
+    assert_eq!(sounding(&h), vec![(keys, 60)], "the key still plays");
+    key(&mut h, Key::Z, false);
+    assert_eq!(notes(&h, keys), before, "nothing is written while playing");
+}
