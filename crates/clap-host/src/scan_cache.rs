@@ -11,6 +11,8 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Bumped when the layout changes; a file of another version is ignored (everything is loaded).
@@ -160,7 +162,6 @@ pub fn load_in_child<D: DeserializeOwned>(program: &Path, flag: &str, file: &Pat
 }
 
 fn run_child<D: DeserializeOwned>(program: &Path, flag: &str, file: &Path, mut stop: impl FnMut() -> bool) -> Result<Vec<D>, String> {
-    use std::io::Read as _;
     use std::process::{Command, Stdio};
     let fail = |m: String| format!("{}: {m}", file.display());
     let mut command = Command::new(program);
@@ -173,17 +174,44 @@ fn run_child<D: DeserializeOwned>(program: &Path, flag: &str, file: &Path, mut s
         command.creation_flags(CREATE_NO_WINDOW);
     }
     let mut child = command.spawn().map_err(|e| fail(format!("the scan process did not start: {e}")))?;
-    // Read while it runs, so that a chatty plugin cannot fill the pipe and stall it.
-    let mut out = child.stdout.take().ok_or_else(|| fail("no output from the scan process".into()))?;
-    let reader = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = out.read_to_string(&mut text);
-        text
-    });
+    // Read while it runs, so that a chatty plugin cannot fill the pipe and stall it. The reader
+    // also flags the answer line the moment it arrives: a plugin that answers and then hangs the
+    // process on exit (Native Instruments' plug-ins do, in their library unload) must not cost
+    // the whole timeout, so the parent stops waiting on the answer, not on the exit.
+    let out = child.stdout.take().ok_or_else(|| fail("no output from the scan process".into()))?;
+    let answered = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let answered = Arc::clone(&answered);
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            let mut reader = std::io::BufReader::new(out);
+            let mut text = String::new();
+            let mut line = Vec::new();
+            // Bytes, converted lossily: a plugin printing non-UTF-8 cannot hide the answer.
+            while let Ok(n) = reader.read_until(b'\n', &mut line) {
+                if n == 0 {
+                    break;
+                }
+                let s = String::from_utf8_lossy(&line);
+                if s.starts_with(REPLY) {
+                    answered.store(true, Ordering::Release);
+                }
+                text.push_str(&s);
+                line.clear();
+            }
+            text
+        })
+    };
     let started = Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
+            // Answered: the plugin's start-up is done; its unload is not waited for.
+            Ok(None) if answered.load(Ordering::Acquire) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
             Ok(None) if started.elapsed() < CHILD_TIMEOUT && !stop() => std::thread::sleep(Duration::from_millis(10)),
             _ => {
                 let _ = child.kill();
@@ -301,5 +329,19 @@ mod tests {
     fn a_missing_scan_program_is_a_load_error() {
         let r = load_in_child::<String>(Path::new("no-such-soundcraft-scanner.exe"), "--scan", Path::new("x.plug"), || false);
         assert!(r.is_some_and(|r| r.is_err_and(|e| e.contains("did not start"))));
+    }
+
+    #[test]
+    fn a_child_that_answers_and_then_hangs_is_not_waited_for() {
+        // Like a plugin hanging in its library unload: the answer, then no exit.
+        let answer = reply::<String, String>(Ok(vec!["Bite".into()]));
+        #[cfg(windows)]
+        let (program, flag, script) = ("powershell", "-Command", format!("Write-Output '{answer}'; Start-Sleep 60"));
+        #[cfg(not(windows))]
+        let (program, flag, script) = ("sh", "-c", format!("echo '{answer}'; exec sleep 60"));
+        let started = Instant::now();
+        let r = load_in_child::<String>(Path::new(program), flag, Path::new(&script), || false);
+        assert_eq!(r, Some(Ok(vec!["Bite".to_string()])));
+        assert!(started.elapsed() < Duration::from_secs(30), "waited {:?}", started.elapsed());
     }
 }
