@@ -653,6 +653,11 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
                         if let Err(error) = ns.docking.validate().and_then(|()| ns.mix_docking.validate_mix()) {
                             return Some(Err(error));
                         }
+                        // Plugin folders are loaded from at the next launch: only the user, in the
+                        // Plug-in Folders window, may change them, never the control channel or MCP.
+                        if ns.plugin_dirs != app.ui.plugin_dirs {
+                            return Some(Err("plugin folders can be changed only in Setup › Plug-in Folders".into()));
+                        }
                         crate::docking::cancel_replaced_state(app, &ns);
                         app.ui = ns;
                         json!({"ui": app.ui})
@@ -722,5 +727,21 @@ mod tests {
         assert!(app.dialogs.open.is_none());
         assert!(!app.engine.is_dirty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ui_set_cannot_change_the_plugin_folders() {
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
+        app.ui.plugin_dirs.vst3.push("C:/Mine".into());
+        let err = app.run("ui.set", json!({"plugin_dirs": {"vst3": ["C:/Elsewhere"]}})).unwrap_err();
+        assert!(err.contains("Plug-in Folders"), "{err}");
+        assert!(app.run("ui.set", json!({"plugin_dirs": {"clap": ["C:/Elsewhere"]}})).is_err());
+        assert_eq!(app.ui.plugin_dirs.vst3, ["C:/Mine"]);
+        assert!(app.ui.plugin_dirs.clap.is_empty());
+        // Setting the whole state back, as read, still works.
+        let state = serde_json::to_value(&app.ui).unwrap();
+        app.run("ui.set", state).unwrap();
+        app.run("ui.set", json!({"show_transport": true})).unwrap();
+        assert!(app.ui.show_transport);
     }
 }
