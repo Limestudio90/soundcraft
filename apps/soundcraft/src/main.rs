@@ -209,6 +209,11 @@ fn main() -> eframe::Result {
     if let Some(reply) = soundcraft_ui_egui::plugin_folders::scan_child(&args) {
         use std::io::Write as _;
         let _ = writeln!(std::io::stdout(), "{reply}");
+        let _ = std::io::stdout().flush();
+        // Run the module exits now, from `main`, not from the exit handler: a plugin whose
+        // `ExitDll` waits for its own threads deadlocks inside `exit()` (Native Instruments' Bite
+        // never ends the process and the scan waits for its timeout), but ends in a second here.
+        soundcraft_engine::shutdown_plugin_hosts();
         return Ok(());
     }
     // First, so every start-up record (and the engine's panic hook, installed with the first
