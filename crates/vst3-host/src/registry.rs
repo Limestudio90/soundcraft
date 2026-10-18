@@ -3,9 +3,9 @@
 use crate::ffi::{Bundle, Instance, PARAM_BYPASS, PARAM_HIDDEN, PARAM_READ_ONLY, RawParam};
 use crate::plugin::Vst3Plugin;
 use crate::scan as paths;
-use crate::scan_cache;
 use crate::{AUDIO_MODULE_CLASS, Vst3Descriptor, Vst3Error, parse_id};
 use soundcraft_dsp::{ParamInfo, Plugin, PluginInfo, Taper, Unit};
+use soundcraft_plugin_scan as scan_cache;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -38,8 +38,6 @@ mod ffi;
 mod plugin;
 #[cfg(not(target_arch = "wasm32"))]
 mod registry;
-#[cfg(not(target_arch = "wasm32"))]
-mod scan_cache;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use plugin::ClapPlugin;

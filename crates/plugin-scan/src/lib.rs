@@ -11,8 +11,6 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Bumped when the layout changes; a file of another version is ignored (everything is loaded).
@@ -26,6 +24,9 @@ const REPLY: &str = "SOUNDCRAFT-SCAN ";
 
 /// Longest wait for a child process; a plugin that takes longer (or waits on a dialog) is killed.
 const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Longest wait, once the child has ended, for an answer it printed just before.
+const REPLY_GRACE: Duration = Duration::from_secs(2);
 
 /// One plugin file: the plugins it holds, or why it did not load.
 #[derive(Clone, Serialize, Deserialize)]
@@ -178,36 +179,35 @@ fn run_child<D: DeserializeOwned>(program: &Path, flag: &str, file: &Path, mut s
     // also flags the answer line the moment it arrives: a plugin that answers and then hangs the
     // process on exit (Native Instruments' plug-ins do, in their library unload) must not cost
     // the whole timeout, so the parent stops waiting on the answer, not on the exit.
+    // The reader is never joined: a helper process the plugin started (a licence or update agent)
+    // inherits the output and can hold it open long after the child is gone.
     let out = child.stdout.take().ok_or_else(|| fail("no output from the scan process".into()))?;
-    let answered = Arc::new(AtomicBool::new(false));
-    let reader = {
-        let answered = Arc::clone(&answered);
-        std::thread::spawn(move || {
-            use std::io::BufRead as _;
-            let mut reader = std::io::BufReader::new(out);
-            let mut text = String::new();
-            let mut line = Vec::new();
-            // Bytes, converted lossily: a plugin printing non-UTF-8 cannot hide the answer.
-            while let Ok(n) = reader.read_until(b'\n', &mut line) {
-                if n == 0 {
-                    break;
-                }
-                let s = String::from_utf8_lossy(&line);
-                if s.starts_with(REPLY) {
-                    answered.store(true, Ordering::Release);
-                }
-                text.push_str(&s);
-                line.clear();
+    let (send, answers) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        let mut reader = std::io::BufReader::new(out);
+        let mut line = Vec::new();
+        // Bytes, converted lossily: a plugin printing non-UTF-8 cannot hide the answer.
+        while let Ok(n) = reader.read_until(b'\n', &mut line) {
+            if n == 0 {
+                break;
             }
-            text
-        })
-    };
+            if let Some(json) = String::from_utf8_lossy(&line).trim_end().strip_prefix(REPLY)
+                && send.send(json.to_string()).is_err()
+            {
+                break;
+            }
+            line.clear();
+        }
+    });
     let started = Instant::now();
+    let mut answer = None;
     let status = loop {
+        answer = answer.or_else(|| answers.try_recv().ok());
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             // Answered: the plugin's start-up is done; its unload is not waited for.
-            Ok(None) if answered.load(Ordering::Acquire) => {
+            Ok(None) if answer.is_some() => {
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
@@ -220,9 +220,12 @@ fn run_child<D: DeserializeOwned>(program: &Path, flag: &str, file: &Path, mut s
             }
         }
     };
-    let text = reader.join().unwrap_or_default();
-    let answer = text.lines().rev().find_map(|l| l.strip_prefix(REPLY));
-    match (answer, status) {
+    // A child that answered and ended at once can leave its answer still on the way through the
+    // reader: wait for it a moment (the reader ends at once when the pipe closes), never longer.
+    if answer.is_none() && status.is_some() {
+        answer = answers.recv_timeout(REPLY_GRACE).ok();
+    }
+    match (answer.as_deref(), status) {
         (Some(json), _) => {
             let r: Reply<D> = serde_json::from_str(json).map_err(|e| fail(format!("unreadable scan reply: {e}")))?;
             match (r.plugins, r.error) {
@@ -339,6 +342,26 @@ mod tests {
         let (program, flag, script) = ("powershell", "-Command", format!("Write-Output '{answer}'; Start-Sleep 60"));
         #[cfg(not(windows))]
         let (program, flag, script) = ("sh", "-c", format!("echo '{answer}'; exec sleep 60"));
+        let started = Instant::now();
+        let r = load_in_child::<String>(Path::new(program), flag, Path::new(&script), || false);
+        assert_eq!(r, Some(Ok(vec!["Bite".to_string()])));
+        assert!(started.elapsed() < Duration::from_secs(30), "waited {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_helper_process_holding_the_output_open_is_not_waited_for() {
+        // Like a plugin starting a helper (a licence or update agent) that inherits the child's
+        // output and outlives it: the helper starts, the child answers and ends, the pipe stays open.
+        let answer = reply::<String, String>(Ok(vec!["Bite".into()]));
+        #[cfg(windows)]
+        let (program, flag, script) = {
+            let d = dir("helper");
+            let script = d.join("scan.cmd");
+            std::fs::write(&script, format!("@start /b \"\" ping -n 60 127.0.0.1 >nul\r\n@echo {answer}\r\n")).ok();
+            ("cmd", "/c", script.display().to_string())
+        };
+        #[cfg(not(windows))]
+        let (program, flag, script) = ("sh", "-c", format!("sleep 60 & echo '{answer}'"));
         let started = Instant::now();
         let r = load_in_child::<String>(Path::new(program), flag, Path::new(&script), || false);
         assert_eq!(r, Some(Ok(vec!["Bite".to_string()])));
