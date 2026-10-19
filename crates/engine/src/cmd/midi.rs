@@ -138,8 +138,8 @@ fn notes_move(e: &mut Engine, p: &Value) -> Result<Value> {
     for (i, n) in seq.notes.iter_mut().enumerate() {
         if idx.contains(&i) {
             let mut m = *n;
-            m.start = (m.start + dt).max(0);
-            m.pitch = (i64::from(m.pitch) + ds).clamp(0, 127) as u8;
+            m.start = m.start.saturating_add(dt).max(0);
+            m.pitch = i64::from(m.pitch).saturating_add(ds).clamp(0, 127) as u8;
             if !copy {
                 *n = m;
             }
@@ -270,6 +270,21 @@ mod tests {
         assert_eq!(starts_pitches_lengths(&mut e, clip), vec![(0, 60, 1080), (360, 64, 960)]);
         e.execute("midi.notes_trim", &json!({"clip": clip, "indices": [1], "start": 5000, "end": -5000})).unwrap();
         assert_eq!(starts_pitches_lengths(&mut e, clip)[1].2, 1);
+    }
+
+    #[test]
+    fn notes_move_huge_params_do_not_overflow() {
+        let mut e = Engine::default();
+        let t = e.session_mut().add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some("Keys"));
+        let r = e.execute("midi.new_clip", &json!({"track": t.0})).unwrap();
+        let clip = r["clip"].as_u64().unwrap();
+        e.execute("midi.note_add", &json!({"clip": clip, "pitch": 60, "start_ticks": 480})).unwrap();
+        e.execute("midi.notes_move", &json!({"clip": clip, "indices": [0], "ticks": i64::MAX})).unwrap();
+        let n = e.execute("midi.notes", &json!({"clip": clip})).unwrap();
+        assert_eq!(n["notes"][0]["start"], i64::MAX);
+        e.execute("midi.notes_move", &json!({"clip": clip, "indices": [0], "semitones": i64::MAX})).unwrap();
+        let n = e.execute("midi.notes", &json!({"clip": clip})).unwrap();
+        assert_eq!(n["notes"][0]["pitch"], 127);
     }
 
     #[test]
