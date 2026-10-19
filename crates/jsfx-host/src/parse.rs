@@ -318,6 +318,31 @@ pub(crate) fn height(e: &Expr, funcs: &[Func]) -> u32 {
     max
 }
 
+/// How many nodes `e` has, at least 1: what a call of a function with this body costs from the
+/// budget. Calls inside count their arguments only; the called body pays when it runs.
+pub(crate) fn size(e: &Expr) -> u64 {
+    let mut n = 0u64;
+    let mut stack = vec![e];
+    while let Some(e) = stack.pop() {
+        n += 1;
+        match e {
+            Expr::Num(_) | Expr::StrRef(_) | Expr::Var(_) => {}
+            Expr::VarIdx { idx: x, .. } | Expr::Mem(x) | Expr::GMem(x) | Expr::Unary(_, x) | Expr::While(x) => stack.push(x),
+            Expr::Bin(_, a, b) | Expr::LogicAnd(a, b) | Expr::LogicOr(a, b) | Expr::Assign(a, _, b) | Expr::Loop(a, b) | Expr::WhileBody(a, b) => {
+                stack.push(a);
+                stack.push(b);
+            }
+            Expr::Cond(c, t, o) => {
+                stack.push(c);
+                stack.push(t);
+                stack.extend(o.as_deref());
+            }
+            Expr::Seq(v) | Expr::Call(_, v) | Expr::UserCall(_, v) => stack.extend(v),
+        }
+    }
+    n
+}
+
 fn check_height(e: &Expr, funcs: &[Func]) -> R<u32> {
     let h = height(e, funcs);
     if h > MAX_HEIGHT { Err(JsfxError::Unsupported(format!("code nested {h} levels deep (at most {MAX_HEIGHT})"))) } else { Ok(h) }
@@ -780,7 +805,8 @@ impl Parser<'_> {
         self.names.in_progress.remove(&key);
         let height = check_height(&body, &self.names.funcs)?;
         let id = self.names.funcs.len();
-        self.names.funcs.push(Func { params, refs: def.refs.clone(), body, height });
+        let cost = size(&body);
+        self.names.funcs.push(Func { params, refs: def.refs.clone(), body, height, cost });
         self.names.instances.insert(key, id);
         Ok(Expr::UserCall(id, args))
     }

@@ -426,6 +426,9 @@ impl Machine {
             *slot = self.eval(a, f);
         }
         let Some(func) = f.get(id) else { return 0.0 };
+        if !self.charge(func.cost as usize) {
+            return 0.0;
+        }
         for (slot, v) in func.params.iter().zip(tmp) {
             self.set_var(*slot, v);
         }
@@ -534,7 +537,12 @@ impl Machine {
             m.hay.extend_from_slice(s);
         }
         let cost = m.needle.len() + m.hay.len();
-        if !self.charge(cost) || !matches(&mut self.matching, fold) {
+        if !self.charge(cost) {
+            return 0.0;
+        }
+        // Backtracking can do far more than the strings' length: the steps taken are paid too.
+        let (hit, steps) = matches(&mut self.matching, fold);
+        if !self.charge(steps) || !hit {
             return 0.0;
         }
         for k in 0..self.matching.caps.len() {
@@ -941,6 +949,38 @@ mod tests {
         // The same work fits a budget sized for it.
         let e = compile("loop(2, fft(0, 1024));", 1, &mut names).unwrap();
         assert!(Machine::new(names.len(), 4096).run(&e, &names.funcs, 10_000));
+    }
+
+    #[test]
+    fn a_match_pays_for_its_backtracking() {
+        // A short pattern that backtracks a lot over a short haystack (and never fits): cheap by
+        // length, so a thousand of them used to fit a budget of 100 000.
+        let fits = |src: &str| {
+            let mut names = Names::new();
+            let e = compile(src, 1, &mut names).unwrap();
+            Machine::new(names.len(), 16).with_strings(names.strings.clone()).run(&e, &names.funcs, 100_000)
+        };
+        let needle = "%s".repeat(12) + "X";
+        assert!(!fits(&format!("loop(1000, match(\"{needle}\", \"{}\"));", "a".repeat(40))));
+        // An ordinary match still costs about its length.
+        assert!(fits("loop(1000, match(\"%ddB\", \"12dB\", v));"));
+    }
+
+    #[test]
+    fn calls_fanning_out_through_nested_functions_draw_on_the_budget() {
+        // No loop anywhere: each level calls the one below ten times, so `f6()` runs a million
+        // `f0` bodies. Calls pay for their bodies, so the budget still cuts this off.
+        let mut src = String::from("function f0() ( x += 1; x += 1; x += 1; x += 1; x += 1; );\n");
+        for k in 1..=6 {
+            src += &format!("function f{k}() ( {} );\n", format!("f{}();", k - 1).repeat(10));
+        }
+        src += "f6();";
+        let mut names = Names::new();
+        let e = compile(&src, 1, &mut names).unwrap();
+        assert!(!Machine::new(names.len(), 16).run(&e, &names.funcs, 100_000));
+        // An ordinary call fits.
+        let e = compile("function sq(a) ( a * a; ); y = sq(3);", 1, &mut names).unwrap();
+        assert!(Machine::new(names.len(), 16).run(&e, &names.funcs, 100));
     }
 
     #[test]

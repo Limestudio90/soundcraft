@@ -152,6 +152,11 @@ impl Matcher<'_> {
                     (None, _) => (1, rest),
                 };
                 for n in (lo..=hi.min(rest)).rev() {
+                    // Converting a candidate reads it: that work counts too.
+                    self.steps += n;
+                    if self.steps > MAX_STEPS {
+                        return false;
+                    }
                     if self.hay.get(h..h + n).and_then(|t| convert(kind, t)).is_none() {
                         continue;
                     }
@@ -171,16 +176,18 @@ impl Matcher<'_> {
     }
 }
 
-/// True when `scratch.hay` fits `scratch.needle` (ignoring ASCII case when `fold`); the
-/// conversions' captures are then in `scratch.caps`.
-pub(crate) fn matches(scratch: &mut MatchScratch, fold: bool) -> bool {
+/// Whether `scratch.hay` fits `scratch.needle` (ignoring ASCII case when `fold`), and the work
+/// that took in steps (at most a little over `MAX_STEPS`); the conversions' captures are then
+/// in `scratch.caps`.
+pub(crate) fn matches(scratch: &mut MatchScratch, fold: bool) -> (bool, usize) {
     scratch.caps.clear();
     let MatchScratch { elems, caps, needle, hay } = scratch;
     if parse(needle, elems).is_none() {
-        return false;
+        return (false, 0);
     }
     let mut m = Matcher { elems, hay, fold, steps: 0, caps };
-    m.go(0, 0)
+    let hit = m.go(0, 0);
+    (hit, m.steps)
 }
 
 #[cfg(test)]
@@ -192,7 +199,7 @@ mod tests {
         let mut sc = MatchScratch::new(64);
         sc.needle.extend_from_slice(needle);
         sc.hay.extend_from_slice(hay);
-        if !matches(&mut sc, fold) {
+        if !matches(&mut sc, fold).0 {
             return None;
         }
         Some(

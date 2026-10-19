@@ -106,6 +106,9 @@ pub(crate) struct Func {
     pub body: Expr,
     /// How deep evaluating the body recurses (see `parse::height`).
     pub height: u32,
+    /// What each call draws from the budget: the body's size (see `parse::size`), so calls that
+    /// fan out through nested functions can't run unbounded work without a loop.
+    pub cost: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
