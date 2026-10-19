@@ -155,7 +155,8 @@ fn notes_move(e: &mut Engine, p: &Value) -> Result<Value> {
 }
 
 /// Trim the start and/or end of several notes at once: `start` and `end` are tick offsets for the
-/// note edges (a start trim keeps the note's end in place). Notes never shrink below one tick.
+/// note edges (a start trim keeps the note's end in place, an end trim its start). Notes never
+/// shrink below one tick.
 fn notes_trim(e: &mut Engine, p: &Value) -> Result<Value> {
     let id = clip_id(p, "midi.notes_trim")?;
     let idx = indices(p);
@@ -165,9 +166,13 @@ fn notes_trim(e: &mut Engine, p: &Value) -> Result<Value> {
     let mut trimmed = Vec::with_capacity(idx.len());
     for (i, n) in seq.notes.iter_mut().enumerate() {
         if idx.contains(&i) {
-            let end = n.end().saturating_add(de).max(1);
-            n.start = n.start.saturating_add(ds).clamp(0, end - 1);
-            n.length = (end - n.start).max(1);
+            // The start is limited by the old end and the end by the new start, so a trim past the
+            // other edge leaves a one-tick note there instead of moving it.
+            let old_end = n.end();
+            let start = n.start.saturating_add(ds).clamp(0, (old_end - 1).max(0));
+            let end = old_end.saturating_add(de).max(start + 1);
+            n.start = start;
+            n.length = end - start;
             trimmed.push(*n);
         }
     }
@@ -269,7 +274,15 @@ mod tests {
         e.execute("midi.notes_trim", &json!({"clip": clip, "indices": [0, 1], "start": -600})).unwrap();
         assert_eq!(starts_pitches_lengths(&mut e, clip), vec![(0, 60, 1080), (360, 64, 960)]);
         e.execute("midi.notes_trim", &json!({"clip": clip, "indices": [1], "start": 5000, "end": -5000})).unwrap();
-        assert_eq!(starts_pitches_lengths(&mut e, clip)[1].2, 1);
+        assert_eq!(starts_pitches_lengths(&mut e, clip)[1], (1319, 64, 1));
+    }
+
+    #[test]
+    fn notes_trim_past_the_start_keeps_the_note_where_it_is() {
+        let mut e = Engine::default();
+        let clip = keys_clip(&mut e, &[(60, 960, 120)]);
+        e.execute("midi.notes_trim", &json!({"clip": clip, "indices": [0], "end": -240})).unwrap();
+        assert_eq!(starts_pitches_lengths(&mut e, clip), vec![(960, 60, 1)], "like the editor's end-trim preview");
     }
 
     #[test]
