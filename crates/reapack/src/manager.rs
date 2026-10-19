@@ -394,6 +394,14 @@ impl Manager {
         if plan.len() > MAX_FILES {
             return Err(ReapackError::Invalid(format!("`{package}` has more than {MAX_FILES} files")));
         }
+        // A file another installed package owns would be overwritten now and deleted with this
+        // package later: a conflict, refused like ReaPack does.
+        let this = |i: &Installed| i.repo == repo.url && i.category == category && i.package == package;
+        for i in self.load_installed().iter().filter(|i| !this(i)) {
+            if let Some((rel, _)) = plan.iter().find(|(rel, _)| i.files.iter().any(|f| f.eq_ignore_ascii_case(rel))) {
+                return Err(ReapackError::Invalid(format!("`{rel}` belongs to the installed package `{}/{}`", i.category, i.package)));
+            }
+        }
 
         // Download and verify everything in memory first.
         let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
@@ -720,6 +728,33 @@ mod tests {
         assert!(!eff.join("old.jsfx-inc").exists(), "stale file removed");
         assert_eq!(std::fs::read_to_string(eff.join("comp.jsfx")).unwrap(), "desc:Comp 2\n");
         assert_eq!(m.installed().len(), 1);
+    }
+
+    #[test]
+    fn a_file_another_installed_package_owns_refuses_the_install() {
+        let (m, f, root) = setup();
+        let helper = r#"<source file="lib/helper.jsfx-inc">https://repo.test/helper</source>"#;
+        f.put(
+            REPO,
+            &format!(
+                r#"<index version="1" name="Test Repo"><category name="Dynamics">
+                  <reapack name="comp.jsfx" type="effect"><version name="1"><source>https://repo.test/comp.jsfx</source>{helper}</version></reapack>
+                  <reapack name="gate.jsfx" type="effect"><version name="1"><source>https://repo.test/gate.jsfx</source>{helper}</version></reapack>
+                </category></index>"#
+            ),
+        );
+        f.put("https://repo.test/comp.jsfx", "desc:Comp\n");
+        f.put("https://repo.test/gate.jsfx", "desc:Gate\n");
+        f.put("https://repo.test/helper", "// helper\n");
+        m.add_repo(REPO).unwrap();
+        m.install(REPO, "Dynamics", "comp.jsfx").unwrap();
+        let err = m.install(REPO, "Dynamics", "gate.jsfx").unwrap_err();
+        assert!(matches!(&err, ReapackError::Invalid(s) if s.contains("comp.jsfx")), "{err:?}");
+        assert!(!f.calls().iter().any(|c| c.ends_with("/gate.jsfx")), "refused before any download");
+        assert_eq!(m.installed().len(), 1);
+        // Uninstalling the owner leaves nothing behind, as before.
+        m.uninstall(REPO, "Dynamics", "comp.jsfx").unwrap();
+        assert!(!root.join("Effects/Test Repo").exists());
     }
 
     #[test]
