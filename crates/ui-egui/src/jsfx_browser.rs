@@ -1,6 +1,7 @@
 //! The JSFX Browser: search ReaPack repositories and install JSFX effects into SoundCraft's own
-//! Effects folder. Downloads run on a worker thread (the window stays responsive); searching only
-//! reads the indexes already downloaded.
+//! Effects folder. Downloads, installs and removals run on a worker thread (the window stays
+//! responsive); searching only reads the indexes already downloaded, and waits while the worker
+//! holds the repositories.
 
 use crate::SoundApp;
 use crate::theme::{Tokens, bold, regular};
@@ -17,6 +18,8 @@ enum Msg {
     Refreshed(Result<Vec<RefreshOutcome>, String>),
     Installed(Result<Installed, String>),
     RepoAdded(Result<Repo, String>),
+    /// The package removed and how many files went.
+    Uninstalled(Result<(String, usize), String>),
 }
 
 #[derive(Default)]
@@ -85,7 +88,8 @@ impl JsfxBrowser {
             }
             Msg::Installed(Ok(rec)) => format!("Installed {} {} — find it in Insert › JSFX", rec.package, rec.version),
             Msg::RepoAdded(Ok(repo)) => format!("Added {}", repo.name),
-            Msg::Refreshed(Err(e)) | Msg::Installed(Err(e)) | Msg::RepoAdded(Err(e)) => e,
+            Msg::Uninstalled(Ok((package, n))) => format!("Removed {package} ({n} files)"),
+            Msg::Refreshed(Err(e)) | Msg::Installed(Err(e)) | Msg::RepoAdded(Err(e)) | Msg::Uninstalled(Err(e)) => e,
         };
         self.reload();
     }
@@ -118,7 +122,8 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         .hint_text("Search name, description, category or author")
                         .desired_width(ui.available_width() - 170.0),
                 );
-                if edit.changed() {
+                // While the worker downloads it holds the repositories: the search runs when it's done.
+                if edit.changed() && idle {
                     b.reload();
                 }
                 if ui.add_enabled(idle, Button::new("Refresh repositories")).on_hover_text("Download the latest index of every repository").clicked()
@@ -137,7 +142,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         ui.label(RichText::new(&r.name).font(bold(11.0)));
                         let state = if r.cached { format!("{} effects", r.packages) } else { "not downloaded yet".to_string() };
                         ui.label(RichText::new(format!("{state}  ·  {}", r.url)).font(regular(10.0)).color(t.text_dim));
-                        if ui.small_button("Remove").clicked() {
+                        if ui.add_enabled(idle, Button::new("Remove").small()).clicked() {
                             remove = Some(r.url.clone());
                         }
                     });
@@ -222,15 +227,12 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                     Msg::Installed(r.map_err(|e| e.to_string()))
                 });
             }
-            if let Some(h) = uninstall
-                && let Ok(m) = soundcraft_reapack::system()
-            {
-                b.status = match m.uninstall(&h.repo, &h.category, &h.package) {
-                    Ok(n) => format!("Removed {} ({n} files)", h.package),
-                    Err(e) => e.to_string(),
-                };
-                soundcraft_jsfx_host::rescan();
-                b.reload();
+            if let Some(h) = uninstall {
+                b.spawn(&format!("Removing {}…", h.package), move || {
+                    let r = soundcraft_reapack::system().and_then(|m| m.uninstall(&h.repo, &h.category, &h.package));
+                    soundcraft_jsfx_host::rescan();
+                    Msg::Uninstalled(r.map(|n| (h.package.clone(), n)).map_err(|e| e.to_string()))
+                });
             }
         },
     );

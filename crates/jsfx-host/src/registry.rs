@@ -7,12 +7,17 @@ use crate::{ID_PREFIX, JsfxPlugin};
 use soundcraft_dsp::{Plugin, PluginInfo};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+type Found = Arc<Vec<(PathBuf, JsfxEntry)>>;
 
 struct State {
     dirs: Vec<PathBuf>,
+    /// Bumped whenever `dirs` changes, so a scan of the old folders isn't stored.
+    generation: u64,
     /// Each effect with the Effects folder its id is relative to; `None` until the first scan.
-    found: Option<Vec<(PathBuf, JsfxEntry)>>,
+    /// A rescan replaces it only once done, so lookups keep answering meanwhile.
+    found: Option<Found>,
     /// `plugin_info` answers by id, cleared with every new scan (`None`: unknown or fails to load).
     infos: HashMap<String, Option<&'static PluginInfo>>,
 }
@@ -27,27 +32,50 @@ fn state() -> MutexGuard<'static, State> {
         if let Some(extra) = std::env::var_os("JSFX_PATH") {
             dirs.extend(std::env::split_paths(&extra).filter(|d| d.is_dir()));
         }
-        Mutex::new(State { dirs, found: None, infos: HashMap::new() })
+        Mutex::new(State { dirs, generation: 0, found: None, infos: HashMap::new() })
     });
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn scanned(st: &mut State) -> &[(PathBuf, JsfxEntry)] {
-    if st.found.is_none() {
-        let mut all: Vec<(PathBuf, JsfxEntry)> = Vec::new();
-        for root in &st.dirs {
-            for mut e in scan_dir(root) {
-                // An earlier folder wins when two hold the same relative path.
-                if !all.iter().any(|(_, x)| x.id == e.id) {
-                    e.unsupported = JsfxPlugin::check_file(root, &e.path).err().map(|x| x.to_string());
-                    all.push((root.clone(), e));
-                }
+/// Scans `dirs` and compiles each effect to see whether it loads. Slow (every file is read and
+/// compiled), so it runs without the registry's lock: the Mix window asks it every frame.
+fn build(dirs: &[PathBuf]) -> Vec<(PathBuf, JsfxEntry)> {
+    let mut all: Vec<(PathBuf, JsfxEntry)> = Vec::new();
+    for root in dirs {
+        for mut e in scan_dir(root) {
+            // An earlier folder wins when two hold the same relative path.
+            if !all.iter().any(|(_, x)| x.id == e.id) {
+                e.unsupported = JsfxPlugin::check_file(root, &e.path).err().map(|x| x.to_string());
+                all.push((root.clone(), e));
             }
         }
-        st.found = Some(all);
-        st.infos.clear();
     }
-    st.found.as_deref().unwrap_or(&[])
+    all
+}
+
+/// Scans the current folders and stores the result, again if the folders changed meanwhile.
+fn scan_and_store() -> Found {
+    loop {
+        let (dirs, generation) = {
+            let st = state();
+            (st.dirs.clone(), st.generation)
+        };
+        let all: Found = Arc::new(build(&dirs));
+        let mut st = state();
+        if st.generation == generation {
+            st.found = Some(Arc::clone(&all));
+            st.infos.clear();
+            return all;
+        }
+    }
+}
+
+/// The scan, made on first use.
+fn scanned() -> Found {
+    if let Some(f) = &state().found {
+        return Arc::clone(f);
+    }
+    scan_and_store()
 }
 
 /// The JSFX id's path part (`None` for other ids or an empty path).
@@ -57,13 +85,12 @@ pub fn parse_id(id: &str) -> Option<&str> {
 
 /// Every installed JSFX effect, scanned on the first call and cached.
 pub fn scan() -> Vec<JsfxEntry> {
-    scanned(&mut state()).iter().map(|(_, e)| e.clone()).collect()
+    scanned().iter().map(|(_, e)| e.clone()).collect()
 }
 
-/// Forgets the cached scan and scans again.
+/// Scans again; lookups answer from the previous scan until this one is done.
 pub fn rescan() -> Vec<JsfxEntry> {
-    state().found = None;
-    scan()
+    scan_and_store().iter().map(|(_, e)| e.clone()).collect()
 }
 
 /// Adds an Effects folder to the search path. Returns how many effects the folder holds.
@@ -71,6 +98,7 @@ pub fn add_search_dir(dir: &Path) -> usize {
     let mut st = state();
     if !st.dirs.iter().any(|d| d == dir) {
         st.dirs.push(dir.to_path_buf());
+        st.generation += 1;
         st.found = None;
     }
     scan_dir(dir).len()
@@ -81,8 +109,8 @@ pub fn add_search_dir(dir: &Path) -> usize {
 pub fn create(id: &str) -> Option<Box<dyn Plugin>> {
     parse_id(id)?;
     let (root, path) = {
-        let mut st = state();
-        let (r, e) = scanned(&mut st).iter().find(|(_, e)| e.id == id)?;
+        let found = scanned();
+        let (r, e) = found.iter().find(|(_, e)| e.id == id)?;
         if let Some(why) = &e.unsupported {
             log::warn!("cannot load {id}: {why}");
             return None;
@@ -106,11 +134,11 @@ pub fn create(id: &str) -> Option<Box<dyn Plugin>> {
 /// `PluginInfo` itself is leaked once per file contents (see the crate docs).
 pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
     parse_id(id)?;
-    let mut st = state();
-    if let Some(&cached) = st.infos.get(id) {
+    if let Some(&cached) = state().infos.get(id) {
         return cached;
     }
-    let info = match scanned(&mut st).iter().find(|(_, e)| e.id == id) {
+    let found = scanned();
+    let info = match found.iter().find(|(_, e)| e.id == id) {
         Some((root, e)) if e.unsupported.is_none() => match JsfxPlugin::info_from_file(root, &e.path) {
             Ok(i) => Some(i),
             Err(err) => {
@@ -120,7 +148,7 @@ pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
         },
         _ => None,
     };
-    st.infos.insert(id.to_string(), info);
+    state().infos.insert(id.to_string(), info);
     info
 }
 
