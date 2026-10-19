@@ -695,6 +695,7 @@ mod tests {
             frame_rate: 23.976,
             duration: 12.5,
             codec: "prores".into(),
+            offline: None,
         });
         let cid = s.new_clip_id();
         if let Some(p) = s.track_mut(t).and_then(Track::playlist_mut) {
@@ -747,6 +748,17 @@ mod tests {
         v["tempo"]["tempos"] = serde_json::json!([{"tick": 0, "bpm": 4e9}]);
         let s = Session::from_json(&v.to_string()).unwrap();
         assert_eq!((s.sample_rate, s.tempo), (SampleRate::HZ_48000, TempoMap::default()));
+    }
+
+    #[test]
+    fn a_meter_change_far_beyond_the_position_range_is_dropped_on_load() {
+        let mut v = serde_json::to_value(Session::default()).unwrap();
+        v["tempo"]["meters"] = serde_json::json!([
+            {"tick": 0, "numerator": 4, "denominator": 4},
+            {"tick": i64::MAX, "numerator": 3, "denominator": 4}
+        ]);
+        let s = Session::from_json(&v.to_string()).unwrap();
+        assert_eq!(s.parse_position("2|1|000", TimeFormat::BarsBeats), Ok(96_000));
     }
 
     #[test]

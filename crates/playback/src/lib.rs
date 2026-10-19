@@ -9,8 +9,8 @@
 //!
 //! Surround: the device is opened with as many output channels as it offers, up to the width of
 //! the session's main format. Main channels (SMPTE/WAV order) go to device channels in order; when
-//! the device has fewer channels than the main mix, the mix is folded down to stereo (ITU-R
-//! BS.775) on the first two device channels.
+//! the device has fewer channels than the main mix, surround is folded down to stereo (ITU-R
+//! BS.775). A mono device receives the average of the stereo channels, before output clipping.
 //!
 //! Plugins and threads: hosted third-party plugins (CLAP/VST3) are created, given their stored
 //! state and prepared on the thread that calls [`Player::update_session`] (the UI thread), and
@@ -365,18 +365,26 @@ impl AudioState {
                 let b = ch.and_then(|v| v.get(i0 + 1)).copied().unwrap_or(a);
                 a + (b - a) * fr
             };
-            if nch > 2 && channels < nch {
-                // Fewer device channels than the main mix: ITU fold-down to stereo.
+            if channels < nch {
+                // Fold surround to stereo first; a mono device averages the two sides.
                 let (mut l, mut r) = (0.0f32, 0.0f32);
                 if sounding {
-                    for (c, (gl, gr)) in self.fold.iter().enumerate().take(nch) {
-                        let v = sample(c);
-                        l += v * gl;
-                        r += v * gr;
+                    if nch == 2 {
+                        (l, r) = (sample(0), sample(1));
+                    } else {
+                        for (c, (gl, gr)) in self.fold.iter().enumerate().take(nch) {
+                            let v = sample(c);
+                            l += v * gl;
+                            r += v * gr;
+                        }
                     }
                 }
                 for (c, o) in frame.iter_mut().enumerate() {
                     *o = match c {
+                        0 if channels == 1 => {
+                            let mono = (0.5 * l + 0.5 * r).clamp(-1.0, 1.0);
+                            if mono.is_finite() { mono } else { 0.0 }
+                        }
                         0 => l.clamp(-1.0, 1.0),
                         1 => r.clamp(-1.0, 1.0),
                         _ => 0.0,
@@ -384,7 +392,6 @@ impl AudioState {
                 }
             } else {
                 for (c, o) in frame.iter_mut().enumerate() {
-                    // Stereo mixes on a mono device play the left channel (as before).
                     *o = if c < nch.max(1) && sounding { sample(c).clamp(-1.0, 1.0) } else { 0.0 };
                 }
             }
@@ -519,54 +526,58 @@ impl Player {
                 if config.buffer_size != cpal::BufferSize::Default {
                     attempts.push(cpal::StreamConfig { buffer_size: cpal::BufferSize::Default, ..config });
                 }
-                for config in attempts {
-                    let rate = config.sample_rate.0;
-                    let channels = usize::from(config.channels);
-                    let (tx, rx) = channel();
-                    let (gtx, grx) = channel();
-                    let state = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&session), f64::from(rate), gtx);
-                    let fault = Arc::new(Fault::default());
-                    use cpal::traits::StreamTrait;
-                    let built = match format {
-                        cpal::SampleFormat::I32 => build_output::<i32>(&device, &config, state, channels, &fault, &shared),
-                        cpal::SampleFormat::I16 => build_output::<i16>(&device, &config, state, channels, &fault, &shared),
-                        _ => build_output::<f32>(&device, &config, state, channels, &fault, &shared),
-                    };
-                    match built {
-                        Ok(stream) => {
-                            if let Err(e) = stream.play() {
-                                log::warn!("audio stream failed to start: {e}");
-                            }
-                            let buffer = match config.buffer_size {
-                                cpal::BufferSize::Fixed(n) => Some(n),
-                                cpal::BufferSize::Default => None,
-                            };
-                            log::info!(
-                                "audio device: {name} @ {rate} Hz, {channels} ch, {format}, buffer {}",
-                                buffer.map_or("default".to_string(), |n| n.to_string())
-                            );
-                            return Player {
-                                shared,
-                                fault,
-                                #[cfg(not(target_arch = "wasm32"))]
-                                watch: Mutex::new(None),
-                                tx,
-                                side: new_side(grx),
-                                _stream: Some(stream),
-                                device_name: name,
-                                device_rate: rate,
-                                device_channels: config.channels,
-                                device_buffer: buffer,
-                                silent: false,
-                            };
+                let opened = first_started(
+                    attempts,
+                    |config: &cpal::StreamConfig| -> Result<Opened, cpal::BuildStreamError> {
+                        let rate = config.sample_rate.0;
+                        let channels = usize::from(config.channels);
+                        let (tx, rx) = channel();
+                        let (gtx, grx) = channel();
+                        let state = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&session), f64::from(rate), gtx);
+                        let fault = Arc::new(Fault::default());
+                        let stream = match format {
+                            cpal::SampleFormat::I32 => build_output::<i32>(&device, config, state, channels, &fault, &shared),
+                            cpal::SampleFormat::I16 => build_output::<i16>(&device, config, state, channels, &fault, &shared),
+                            _ => build_output::<f32>(&device, config, state, channels, &fault, &shared),
+                        }?;
+                        Ok(Opened { stream, tx, grx, fault })
+                    },
+                    |opened| start_stream(&opened.stream),
+                );
+                match opened {
+                    Some((config, Opened { stream, tx, grx, fault })) => {
+                        let rate = config.sample_rate.0;
+                        let channels = usize::from(config.channels);
+                        let buffer = match config.buffer_size {
+                            cpal::BufferSize::Fixed(n) => Some(n),
+                            cpal::BufferSize::Default => None,
+                        };
+                        log::info!(
+                            "audio device: {name} @ {rate} Hz, {channels} ch, {format}, buffer {}",
+                            buffer.map_or("default".to_string(), |n| n.to_string())
+                        );
+                        Player {
+                            shared,
+                            fault,
+                            #[cfg(not(target_arch = "wasm32"))]
+                            watch: Mutex::new(None),
+                            tx,
+                            side: new_side(grx),
+                            _stream: Some(stream),
+                            device_name: name,
+                            device_rate: rate,
+                            device_channels: config.channels,
+                            device_buffer: buffer,
+                            silent: false,
                         }
-                        Err(e) => log::warn!("cannot open audio stream ({:?}): {e}", config.buffer_size),
+                    }
+                    None => {
+                        log::warn!("no usable audio stream; using a silent clock");
+                        let (tx, rx) = channel();
+                        let (gtx, grx) = channel();
+                        Player::silent_clock(shared, tx, rx, want, new_side(grx), gtx)
                     }
                 }
-                log::warn!("no usable audio stream; using a silent clock");
-                let (tx, rx) = channel();
-                let (gtx, grx) = channel();
-                Player::silent_clock(shared, tx, rx, want, new_side(grx), gtx)
             }
             Err(e) => {
                 log::warn!("no audio output: {e}; using a silent clock");
@@ -726,6 +737,12 @@ impl Player {
         }
     }
 
+    /// The plugin's own text for a parameter value when SoundCraft's format would be wrong for it
+    /// (see `PluginEditor::value_text`). Main thread only.
+    pub fn editor_value_text(&self, track: TrackId, slot: usize, id: &str, value: f32) -> Option<String> {
+        self.side().editors.get_mut(&(track, slot))?.value_text(id, value)
+    }
+
     /// Start playback at `from`, stopping at `end`, or looping `looped`.
     pub fn play(&self, from: Samples, end: Option<Samples>, looped: Option<Range>) {
         self.shared.position.store(from, Ordering::Relaxed);
@@ -862,6 +879,44 @@ fn fold_gains(s: &Session) -> [(f32, f32); MAX_CHANNELS] {
     g
 }
 
+/// Start a freshly built output stream. `false` when the device refuses to start it, so the caller
+/// treats it like a stream that failed to build and tries the next configuration.
+fn start_stream(stream: &impl cpal::traits::StreamTrait) -> bool {
+    match stream.play() {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("audio stream failed to start: {e}");
+            false
+        }
+    }
+}
+
+/// A built output stream and the channels and fault flag its callback shares with the player.
+struct Opened {
+    stream: cpal::Stream,
+    tx: Sender<Cmd>,
+    grx: Receiver<Vec<Box<dyn Plugin>>>,
+    fault: Arc<Fault>,
+}
+
+/// Build and start the attempts in order; the first that builds and starts wins. A build error or
+/// a stream that will not start is logged, and the next attempt is tried. `None` when none works.
+fn first_started<A: std::fmt::Debug, S, E: std::fmt::Display>(
+    attempts: impl IntoIterator<Item = A>,
+    mut build: impl FnMut(&A) -> Result<S, E>,
+    start: impl Fn(&S) -> bool,
+) -> Option<(A, S)> {
+    for attempt in attempts {
+        match build(&attempt) {
+            Ok(built) if start(&built) => return Some((attempt, built)),
+            // `start` has already logged why the stream would not start.
+            Ok(_) => {}
+            Err(e) => log::warn!("cannot open audio stream ({attempt:?}): {e}"),
+        }
+    }
+    None
+}
+
 /// The output stream: the mix renders f32 into a scratch buffer allocated here (so the callback
 /// never allocates), converted to the device's sample type.
 fn build_output<T>(
@@ -967,6 +1022,64 @@ fn open_device(want_rate: u32, want_ch: u16, cfg: &AudioConfig) -> Result<(cpal:
 mod tests {
     use super::*;
 
+    /// A stream that builds; `starts` says whether the device lets it play (it can refuse after a
+    /// reconnect).
+    struct Fake {
+        starts: bool,
+    }
+
+    impl cpal::traits::StreamTrait for Fake {
+        fn play(&self) -> Result<(), cpal::PlayStreamError> {
+            if self.starts { Ok(()) } else { Err(cpal::PlayStreamError::DeviceNotAvailable) }
+        }
+        fn pause(&self) -> Result<(), cpal::PauseStreamError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_stream_that_will_not_start_is_reported_as_failed() {
+        assert!(!start_stream(&Fake { starts: false }));
+        assert!(start_stream(&Fake { starts: true }));
+    }
+
+    #[test]
+    fn the_first_config_that_starts_wins_and_later_ones_are_not_tried() {
+        let mut tried = Vec::new();
+        let won = first_started(
+            [1u32, 2, 3],
+            |&n| {
+                tried.push(n);
+                Ok::<_, String>(Fake { starts: n != 1 })
+            },
+            start_stream,
+        );
+        assert_eq!(won.map(|(n, _)| n), Some(2));
+        assert_eq!(tried, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_config_that_fails_to_build_falls_through_to_the_next() {
+        let won =
+            first_started([1u32, 2], |&n| if n == 1 { Err("no such buffer size".to_string()) } else { Ok(Fake { starts: true }) }, start_stream);
+        assert_eq!(won.map(|(n, _)| n), Some(2));
+    }
+
+    #[test]
+    fn no_config_that_starts_yields_none_so_the_caller_falls_back_to_a_silent_clock() {
+        let mut tried = 0;
+        let won = first_started(
+            [1u32, 2],
+            |_| {
+                tried += 1;
+                Ok::<_, String>(Fake { starts: false })
+            },
+            start_stream,
+        );
+        assert!(won.is_none());
+        assert_eq!(tried, 2);
+    }
+
     #[test]
     fn reusable_meter_snapshot_updates_and_drops_stale_tracks() {
         let keep = TrackId(1);
@@ -1055,6 +1168,80 @@ mod tests {
         let mut out = vec![0.0f32; 2 * 64];
         st.fill(&mut out, 2);
         assert_eq!(shared.position.load(Ordering::Relaxed), 64);
+    }
+
+    fn audio_output_state(format: soundcraft_model::ChannelFormat, channels: Vec<Vec<f32>>) -> AudioState {
+        use soundcraft_model::{Clip, SourceAudio, SourceId, TrackKind};
+        let mut s = Session::default();
+        s.edit.click = false;
+        s.outputs[0].format = format;
+        let t = s.add_track(TrackKind::Audio, format, None);
+        let frames = channels[0].len();
+        s.pool.insert(SourceId(5), Arc::new(SourceAudio::new(soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels })));
+        let id = s.new_clip_id();
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "output", SourceId(5), 0, 0, frames as i64));
+        let shared = Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+        });
+        let (tx, rx) = channel();
+        let st = AudioState::new(rx, shared, Arc::new(s), 48_000.0, channel().0);
+        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        st
+    }
+
+    #[test]
+    fn mono_device_averages_stereo_before_clipping() {
+        use soundcraft_model::ChannelFormat;
+        // Right only, left only, identical, opposite polarity, and levels that must be averaged
+        // before clipping either side to the device's range.
+        let left = [0.0, 0.8, 0.8, 0.8, 2.0, -2.0, 2.0];
+        let right = [0.8, 0.0, 0.8, -0.8, -0.5, 0.5, 2.0];
+        let expected = [0.4, 0.4, 0.8, 0.0, 0.75, -0.75, 1.0];
+        for callback in [1, 37, 512] {
+            let channels = [left, right].map(|pattern| (0..2048).map(|i| pattern[i % pattern.len()]).collect());
+            let mut st = audio_output_state(ChannelFormat::Stereo, channels.into());
+            let mut out = vec![0.0; callback];
+            for block in 0..3 {
+                st.fill(&mut out, 1);
+                for (i, actual) in out.iter().enumerate() {
+                    let at = block * callback + i;
+                    assert!((actual - expected[at % expected.len()]).abs() < 1e-6, "callback {callback}, sample {at}: {actual}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mono_device_preserves_centered_mono_level_and_includes_surround_right_channels() {
+        use soundcraft_model::ChannelFormat;
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        let mut mono = audio_output_state(ChannelFormat::Mono, vec![vec![0.8; 512]]);
+        let mut out = [0.0; 128];
+        mono.fill(&mut out, 1);
+        let centered = 0.8 * soundcraft_dsp::db_to_gain(-3.0);
+        assert!(out.iter().all(|x| (*x - centered).abs() < 1e-6), "a centered mono track keeps its rendered level under the -3 dB pan law");
+
+        // Independently exercise each SMPTE 5.1 channel: L, R, C, LFE, Ls, Rs.
+        let channels = (0..6).map(|c| (0..512).map(|i| if i % 6 == c { 0.8 } else { 0.0 }).collect()).collect();
+        let mut surround = audio_output_state(ChannelFormat::Surround51, channels);
+        surround.fill(&mut out, 1);
+        let expected = [0.4, 0.4, 0.8 * h, 0.0, 0.4 * h, 0.4 * h];
+        for (i, actual) in out.iter().enumerate() {
+            assert!((actual - expected[i % expected.len()]).abs() < 1e-6, "surround sample {i}: {actual}");
+        }
+    }
+
+    #[test]
+    fn mono_device_contains_overflow_from_opposite_surround_sides() {
+        use soundcraft_model::ChannelFormat;
+        let channels = [f32::MAX, -f32::MAX, 0.0, 0.0, f32::MAX, -f32::MAX].map(|v| vec![v; 128]);
+        let mut st = audio_output_state(ChannelFormat::Surround51, channels.into());
+        let mut out = [0.5; 128];
+        st.fill(&mut out, 1);
+        assert!(out.iter().all(|x| *x == 0.0), "overflow in the stereo fold-down must not send NaN to a mono device");
     }
 
     #[test]
