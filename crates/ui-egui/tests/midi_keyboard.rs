@@ -25,7 +25,11 @@ fn harness() -> (Harness<'static, SoundApp>, TrackId) {
 }
 
 fn key(h: &mut Harness<'_, SoundApp>, key: Key, pressed: bool) {
-    h.input_mut().events.push(Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers: Modifiers::NONE });
+    key_with(h, key, pressed, Modifiers::NONE);
+}
+
+fn key_with(h: &mut Harness<'_, SoundApp>, key: Key, pressed: bool, modifiers: Modifiers) {
+    h.input_mut().events.push(Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers });
     h.step();
 }
 
@@ -77,6 +81,23 @@ fn octave_velocity_and_transpose_move_the_notes() {
     key(&mut h, Key::Semicolon, true);
     key(&mut h, Key::Q, false);
     assert!(sounding(&h).is_empty());
+}
+
+#[test]
+fn a_key_let_go_with_a_modifier_or_while_a_field_has_the_keys_still_stops_its_note() {
+    let (mut h, keys) = harness();
+    key(&mut h, Key::Z, true);
+    key_with(&mut h, Key::Z, false, Modifiers::CTRL);
+    assert!(sounding(&h).is_empty(), "Ctrl pressed while Z was down");
+    key(&mut h, Key::X, true);
+    assert_eq!(sounding(&h), vec![(keys, 62)]);
+    // A dialog (like a text field taking the keyboard) stops the keys from playing, not the
+    // release of one already down.
+    let app = h.state_mut();
+    assert!(app.dialogs.open_for_command(&app.engine, "file.bounce_mix"));
+    h.step();
+    key(&mut h, Key::X, false);
+    assert!(sounding(&h).is_empty(), "X let go while a dialog was open");
 }
 
 #[test]

@@ -244,7 +244,13 @@ fn step_enter(app: &mut SoundApp, pitch: u8, velocity: u8) {
     let at_ticks = s.tempo.samples_to_ticks(at, s.sample_rate);
     let rel = at_ticks - s.tempo.samples_to_ticks(clip_start, s.sample_rate);
     let next = s.tempo.tick_to_samples(at_ticks + len, s.sample_rate);
-    let _ = app.run("midi.note_add", json!({"clip": cid.0, "pitch": pitch, "start_ticks": rel.max(0), "length_ticks": len, "velocity": velocity}));
+    // The insertion point moves on only once the note is written (a clip can refuse it).
+    if let Err(e) =
+        app.run("midi.note_add", json!({"clip": cid.0, "pitch": pitch, "start_ticks": rel.max(0), "length_ticks": len, "velocity": velocity}))
+    {
+        app.ui.status = format!("Step input: {e}");
+        return;
+    }
     if app.keyboard.chord_at.is_none() {
         app.keyboard.chord_at = Some(at);
         let _ = app.run("transport.locate", json!({"at": next}));
@@ -294,6 +300,22 @@ pub fn capture(app: &mut SoundApp, ctx: &egui::Context) {
     }
     if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(false)))) {
         release_all(app);
+    }
+    // A held key's release stops its note on every path (a modifier pressed meanwhile, a field
+    // or a dialog that took the keyboard): shortcuts act on presses, so it costs them nothing.
+    let released: Vec<&'static str> = ctx.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::Key { key, physical_key, pressed: false, .. } => Some(physical_key.unwrap_or(*key).name()),
+                _ => None,
+            })
+            .collect()
+    });
+    for name in released {
+        if let Some(held) = app.keyboard.keys.remove(name) {
+            stop(app, held);
+        }
     }
     if !app.keyboard.active || ctx.egui_wants_keyboard_input() || app.dialogs.open.is_some() {
         return;
