@@ -759,17 +759,17 @@ fn plugin_search(ui: &mut Ui, search: &MenuSearch, instruments: bool) -> Option<
     }
     if clap.is_none() || vst3.is_none() {
         ui.separator();
-        if soundcraft_clap_host::scanning() || soundcraft_vst3_host::scanning() {
-            crate::plugin_folders::scanning_label(ui, "plugins");
-        } else {
-            ui.horizontal(|ui| {
-                if clap.is_none() && ui.small_button("Scan CLAP").clicked() {
-                    soundcraft_clap_host::scan_in_background();
-                }
-                if vst3.is_none() && ui.small_button("Scan VST3").clicked() {
-                    soundcraft_vst3_host::scan_in_background();
-                }
-            });
+        // Each missing format has its own button, so a scan of one leaves the other startable.
+        let formats: [(&str, bool, bool, fn()); 2] = [
+            ("CLAP", clap.is_none(), soundcraft_clap_host::scanning(), soundcraft_clap_host::scan_in_background),
+            ("VST3", vst3.is_none(), soundcraft_vst3_host::scanning(), soundcraft_vst3_host::scan_in_background),
+        ];
+        for (format, missing, scanning, scan) in formats {
+            if scanning {
+                crate::plugin_folders::scanning_label(ui, &format!("{format} plugins"));
+            } else if missing && ui.small_button(format!("Scan {format}")).clicked() {
+                scan();
+            }
         }
     }
     picked.map(|i| built_in.get(i).map_or_else(|| hosted[i - built_in.len()].0.id.clone(), |p| p.id.to_string()))
