@@ -527,11 +527,15 @@ impl Manager {
     fn commit_install(&self, tmps: &[(PathBuf, PathBuf)], stale: &[String], installed: Vec<Installed>) -> R<()> {
         let mut aside = Aside::default();
         let step = (|| -> R<()> {
-            for (tmp, dest) in tmps {
-                aside.swap_in(tmp, dest)?;
-            }
+            // The stale files go first: on a case-insensitive filesystem (Windows, and macOS by
+            // default) a file the new version only renames in case is the very file about to be
+            // written, so swapping in first would move the NEW file aside and then delete it with
+            // the backups, losing both versions.
             for rel in stale.iter().filter(|r| safe_rel(r).is_some()) {
                 aside.move_aside(&self.effects.join(rel))?;
+            }
+            for (tmp, dest) in tmps {
+                aside.swap_in(tmp, dest)?;
             }
             self.save_installed(installed)
         })();
@@ -842,6 +846,35 @@ mod tests {
         assert_eq!(names, ["comp.jsfx", "old.jsfx-inc"], "no temporary or backup files are left behind");
         assert_eq!(m.installed().len(), 1);
         assert_eq!(m.installed()[0].version, "1.0", "the old record stays");
+    }
+
+    #[test]
+    fn a_case_only_rename_keeps_the_new_file_and_drops_the_old_one() {
+        let (m, f, root) = setup();
+        let index = |file: &str, version: &str| {
+            format!(
+                r#"<index version="1" name="Test Repo"><category name="Dynamics">
+                  <reapack name="comp.jsfx" type="effect"><version name="{version}"><source file="{file}">https://repo.test/comp.jsfx</source></version></reapack>
+                </category></index>"#
+            )
+        };
+        f.put(REPO, &index("Comp.jsfx", "1"));
+        f.put("https://repo.test/comp.jsfx", "desc:Old\n");
+        m.add_repo(REPO).unwrap();
+        m.install(REPO, "Dynamics", "comp.jsfx").unwrap();
+
+        // Only the case of the file name changes: on a case-insensitive filesystem this is the
+        // same file the install is about to write, and the old one must not come back.
+        f.put(REPO, &index("comp.jsfx", "2"));
+        f.put("https://repo.test/comp.jsfx", "desc:New\n");
+        m.refresh(None).unwrap();
+        m.install(REPO, "Dynamics", "comp.jsfx").unwrap();
+
+        let eff = root.join("Effects/Test Repo/Dynamics");
+        let names: Vec<String> = std::fs::read_dir(&eff).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names.len(), 1, "one file, no backups left: {names:?}");
+        assert_eq!(std::fs::read_to_string(eff.join("comp.jsfx")).unwrap(), "desc:New\n");
+        assert_eq!(m.installed()[0].files, ["Test Repo/Dynamics/comp.jsfx"]);
     }
 
     #[test]
