@@ -135,6 +135,62 @@ fn tmp_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Where a file this install replaces is kept while the install is in flight (same folder, so the
+/// move back is a rename on the same volume).
+fn backup_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".scbak");
+    path.with_file_name(name)
+}
+
+/// Files an install has moved out of the way, so a failure half way puts the folder back exactly
+/// as it was: the old version's files, and the ones the new version no longer has.
+#[derive(Default)]
+struct Aside {
+    /// `(backup, original)`: `original` was renamed to `backup`.
+    moved: Vec<(PathBuf, PathBuf)>,
+    /// Files this install put in place; undoing removes them before restoring the backups.
+    placed: Vec<PathBuf>,
+}
+
+impl Aside {
+    /// Moves `dest` aside when it exists, then puts `tmp` in its place.
+    fn swap_in(&mut self, tmp: &Path, dest: &Path) -> R<()> {
+        self.move_aside(dest)?;
+        io(std::fs::rename(tmp, dest), &format!("installing {}", dest.display()))?;
+        self.placed.push(dest.to_path_buf());
+        Ok(())
+    }
+
+    /// Renames a file aside; a file that is not there is nothing to keep.
+    fn move_aside(&mut self, path: &Path) -> R<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let backup = backup_path(path);
+        io(std::fs::rename(path, &backup), &format!("replacing {}", path.display()))?;
+        self.moved.push((backup, path.to_path_buf()));
+        Ok(())
+    }
+
+    /// Undoes the install: removes the new files, then puts the old ones back.
+    fn restore(self) {
+        for path in &self.placed {
+            let _ = std::fs::remove_file(path);
+        }
+        for (backup, original) in &self.moved {
+            let _ = std::fs::rename(backup, original);
+        }
+    }
+
+    /// The install succeeded: the files kept aside are no longer needed.
+    fn discard(self) {
+        for (backup, _) in &self.moved {
+            let _ = std::fs::remove_file(backup);
+        }
+    }
+}
+
 fn read_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> T {
     std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
@@ -416,7 +472,8 @@ impl Manager {
             blobs.push((rel.clone(), bytes));
         }
 
-        // Write every file next to its destination, then move them all into place.
+        // Write every file next to its destination first, so no existing file is touched until all
+        // the new bytes are on disk.
         let mut tmps: Vec<(PathBuf, PathBuf)> = Vec::new();
         let cleanup = |tmps: &[(PathBuf, PathBuf)]| {
             for (t, _) in tmps {
@@ -433,12 +490,6 @@ impl Manager {
                 return Err(ReapackError::Io(format!("writing {rel}: {e}")));
             }
         }
-        for (tmp, dest) in &tmps {
-            if let Err(e) = std::fs::rename(tmp, dest) {
-                cleanup(&tmps);
-                return Err(ReapackError::Io(format!("installing {}: {e}", dest.display())));
-            }
-        }
 
         let main =
             plan.iter().find(|(_, s)| s.file.as_deref().is_none_or(|f| f == pkg.name)).or(plan.first()).map(|(r, _)| r.clone()).unwrap_or_default();
@@ -452,15 +503,47 @@ impl Manager {
             files: plan.iter().map(|(r, _)| r.clone()).collect(),
         };
         let mut installed = self.load_installed();
-        if let Some(old) = installed.iter().find(|i| i.repo == record.repo && i.category == record.category && i.package == record.package) {
-            // Files the previous version had and this one does not are stale.
-            let stale: Vec<String> = old.files.iter().filter(|f| !record.files.contains(f)).cloned().collect();
-            self.delete_files(&stale);
-        }
+        // Files the previous version had and this one does not are stale.
+        let stale: Vec<String> = installed
+            .iter()
+            .find(|i| i.repo == record.repo && i.category == record.category && i.package == record.package)
+            .map(|old| old.files.iter().filter(|f| !record.files.contains(f)).cloned().collect())
+            .unwrap_or_default();
         installed.retain(|i| !(i.repo == record.repo && i.category == record.category && i.package == record.package));
         installed.push(record.clone());
-        self.save_installed(installed)?;
+
+        // Move the files in with everything they replace (and the stale ones) kept aside: a failed
+        // rename, deletion or record save puts the folder back as it was, never a mix of both
+        // versions next to the old record.
+        if let Err(e) = self.commit_install(&tmps, &stale, installed) {
+            cleanup(&tmps);
+            return Err(e);
+        }
         Ok(record)
+    }
+
+    /// Moves the staged files into place and saves the new record, undoing every step if any of
+    /// them fails, so an interrupted update never leaves half of a version installed.
+    fn commit_install(&self, tmps: &[(PathBuf, PathBuf)], stale: &[String], installed: Vec<Installed>) -> R<()> {
+        let mut aside = Aside::default();
+        let step = (|| -> R<()> {
+            for (tmp, dest) in tmps {
+                aside.swap_in(tmp, dest)?;
+            }
+            for rel in stale.iter().filter(|r| safe_rel(r).is_some()) {
+                aside.move_aside(&self.effects.join(rel))?;
+            }
+            self.save_installed(installed)
+        })();
+        if let Err(e) = step {
+            aside.restore();
+            return Err(e);
+        }
+        aside.discard();
+        for rel in stale.iter().filter(|r| safe_rel(r).is_some()) {
+            self.prune_dirs(&self.effects.join(rel));
+        }
+        Ok(())
     }
 
     /// Removes an installed package's files (and any folders that become empty).
@@ -489,15 +572,20 @@ impl Manager {
             if std::fs::remove_file(&path).is_ok() {
                 n += 1;
             }
-            let mut dir = path.parent();
-            while let Some(d) = dir {
-                if d == self.effects || std::fs::remove_dir(d).is_err() {
-                    break;
-                }
-                dir = d.parent();
-            }
+            self.prune_dirs(&path);
         }
         n
+    }
+
+    /// Removes `path`'s folder and its parents while they are empty, never the Effects folder.
+    fn prune_dirs(&self, path: &Path) {
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            if d == self.effects || std::fs::remove_dir(d).is_err() {
+                break;
+            }
+            dir = d.parent();
+        }
     }
 }
 
@@ -728,6 +816,32 @@ mod tests {
         assert!(!eff.join("old.jsfx-inc").exists(), "stale file removed");
         assert_eq!(std::fs::read_to_string(eff.join("comp.jsfx")).unwrap(), "desc:Comp 2\n");
         assert_eq!(m.installed().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_record_save_puts_the_previous_version_back() {
+        let (m, f, root) = with_repo(r#"<source file="old.jsfx-inc">https://repo.test/old</source>"#, "1.0");
+        f.put("https://repo.test/old", "// old\n");
+        m.install(REPO, "Dynamics", "comp.jsfx").unwrap();
+        let eff = root.join("Effects/Test Repo/Dynamics");
+        let before = std::fs::read_to_string(eff.join("comp.jsfx")).unwrap();
+
+        // The record cannot be written (a folder sits where its temporary file goes) but it can
+        // still be read, so the update gets as far as swapping the files in.
+        std::fs::create_dir_all(root.join("state/installed.json.sctmp")).unwrap();
+        f.put(REPO, &index_xml("", "1.1"));
+        f.put("https://repo.test/comp.jsfx", "desc:Comp 2\n");
+        m.refresh(None).unwrap();
+        let err = m.install(REPO, "Dynamics", "comp.jsfx").unwrap_err();
+        assert!(matches!(err, ReapackError::Io(_)), "{err:?}");
+
+        assert_eq!(std::fs::read_to_string(eff.join("comp.jsfx")).unwrap(), before, "the old file is back");
+        assert!(eff.join("old.jsfx-inc").exists(), "the stale file was put back too");
+        let mut names: Vec<String> = std::fs::read_dir(&eff).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["comp.jsfx", "old.jsfx-inc"], "no temporary or backup files are left behind");
+        assert_eq!(m.installed().len(), 1);
+        assert_eq!(m.installed()[0].version, "1.0", "the old record stays");
     }
 
     #[test]
