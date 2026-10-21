@@ -192,15 +192,29 @@ pub(crate) fn device(host: &cpal::Host, name: Option<&str>, output: bool) -> Opt
     }
     let mut open = ASIO_OUTPUT.lock().unwrap_or_else(PoisonError::into_inner);
     if output {
-        // A new output starts from fresh buffers (the previous player is closed first).
+        // A new output starts from fresh buffers (the previous player is closed first). The cache
+        // must be cleared *before* the lookup: it holds the driver the old stream opened, and
+        // `asio-sys` refuses to load a different driver while one is loaded, so looking up the new
+        // driver first would fall back to the old one and changing it in the settings would
+        // silently do nothing.
+        *open = None;
         let d = find_device(host, name, true);
         open.clone_from(&d);
         return d;
     }
-    // No name: the open driver is the only one ASIO can use anyway.
+    // No name: the open driver is the only one ASIO can use anyway. A named input that is not the
+    // open driver is ignored instead of looked up: a freshly listed `cpal::Device` carries its own
+    // ASIO stream state, so opening input from it rebuilds the driver's buffers without the output
+    // ones and playback goes silent — the failure this cache exists to prevent.
     match open.as_ref() {
         Some(d) if name.is_none() || device_name(d).as_deref() == name => Some(d.clone()),
-        _ => find_device(host, name, false),
+        Some(d) => {
+            if let Some(want) = name {
+                log::warn!("ASIO drives one device: input `{want}` is ignored, using the open one");
+            }
+            Some(d.clone())
+        }
+        None => find_device(host, name, false),
     }
 }
 
