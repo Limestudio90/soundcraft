@@ -510,8 +510,10 @@ pub fn lane_headers(app: &mut SoundApp, ui: &mut Ui, cx: &LaneCtx, lanes: &[Lane
     let x1 = cx.rv.roll.min.x;
     let present: HashSet<CtrlKind> = cx.seq.ctrls.iter().map(|c| c.kind).collect();
     let kinds: Vec<CtrlKind> = lanes.iter().map(|l| l.kind).collect();
-    let header = |ui: &mut Ui, r: Rect, name: &str, salt: (u64, usize)| -> Response {
+    let header = |ui: &mut Ui, r: Rect, name: &str, full_name: &str, salt: (u64, usize)| -> Response {
         let resp = ui.interact(r, ui.id().with(("lane_header", salt)), Sense::click());
+        let label = format!("{full_name} lane");
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
         let fill = if resp.hovered() { t.panel_bg2.lerp_to_gamma(t.accent, 0.15) } else { t.panel_bg2 };
         ui.painter().rect_filled(r, 0.0, fill);
         let p = ui.painter().with_clip_rect(r);
@@ -525,7 +527,7 @@ pub fn lane_headers(app: &mut SoundApp, ui: &mut Ui, cx: &LaneCtx, lanes: &[Lane
         resp
     };
     let vel_r = Rect::from_min_max(pos2(x0, cx.rv.vel.min.y), pos2(x1 - HEADER_GAP, cx.rv.vel.max.y));
-    let vresp = header(ui, vel_r, "Velocity", (cx.cid.0, usize::MAX)).on_hover_text("Add a controller lane");
+    let vresp = header(ui, vel_r, "Velocity", "Velocity", (cx.cid.0, usize::MAX)).on_hover_text("Add a controller lane");
     egui::Popup::menu(&vresp).show(|ui| {
         ui.menu_button("Add Controller Lane", |ui| {
             if let Some(k) = kind_menu(ui, &present, None)
@@ -548,7 +550,7 @@ pub fn lane_headers(app: &mut SoundApp, ui: &mut Ui, cx: &LaneCtx, lanes: &[Lane
     });
     for (i, lane) in lanes.iter().enumerate() {
         let r = Rect::from_min_max(pos2(x0, lane.rect.min.y), pos2(x1 - HEADER_GAP, lane.rect.max.y));
-        let resp = header(ui, r, &lane.kind.short(), (cx.cid.0, i)).on_hover_text(lane.kind.label());
+        let resp = header(ui, r, &lane.kind.short(), &lane.kind.label(), (cx.cid.0, i)).on_hover_text(lane.kind.label());
         egui::Popup::menu(&resp).show(|ui| {
             if let Some(k) = kind_menu(ui, &present, Some(lane.kind)) {
                 // This lane shows `k` now; another lane that showed it goes away.
