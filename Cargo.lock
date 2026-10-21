@@ -3682,7 +3682,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-jsfx-host"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "log",
  "serde",
@@ -3747,7 +3747,7 @@ dependencies = [
 
 [[package]]
 name = "soundcraft-reapack"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "log",
  "serde",
