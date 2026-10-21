@@ -1664,35 +1664,35 @@ fn apply_params(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, t: &Track
     // Automation lanes address insert slots; the instrument (`INSTRUMENT_SLOT`) has none, so it
     // must not pick up slot A's lanes.
     let Ok(slot_u8) = u8::try_from(i) else {
-        return apply_values(slot, ins, |_, v| v);
+        return apply_values(slot, ins, |_, v| v, |_| false);
     };
-    let automated = t.mixer.automation_mode.reads()
-        && t.automation.iter().any(|l| matches!(&l.param, AutoParam::Plugin { slot, .. } if *slot == slot_u8) && !l.points.is_empty());
-    apply_values(slot, ins, |k, val| {
-        if automated
-            && let Some(l) = t.automation.iter().find(|l| matches!(&l.param, AutoParam::Plugin { slot, param } if *slot == slot_u8 && param == k))
-            && !l.points.is_empty()
-        {
-            return l.value_at(pos, val);
-        }
-        val
-    });
+    let lane = |k: &str| {
+        t.automation
+            .iter()
+            .find(|l| matches!(&l.param, AutoParam::Plugin { slot, param } if *slot == slot_u8 && param == k))
+            .filter(|l| !l.points.is_empty())
+    };
+    let read = t.mixer.automation_mode.reads();
+    apply_values(slot, ins, |k, val| if read { lane(k).map_or(val, |l| l.value_at(pos, val)) } else { val }, |k| read && lane(k).is_some());
 }
 
 /// Sends each stored param (as mapped by `value`) to the plugin when it changed since last time.
-fn apply_values(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, value: impl Fn(&str, f32) -> f32) {
+/// `intentional` marks the parameters the session definitely chose (an automation lane), which are
+/// always sent even when the value happens to equal the plugin's default.
+fn apply_values(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, value: impl Fn(&str, f32) -> f32, intentional: impl Fn(&str) -> bool) {
     if slot.applied.len() != ins.params.len() {
         slot.applied = vec![f32::NAN; ins.params.len()];
     }
     // First pass over a hosted plugin: it has just loaded its own settings, so a stored value equal to
     // the default it reports is not a choice and is left alone. Older sessions store every parameter
     // at that default, often 0, and pushing them over a restored plugin silenced Rhapsody (volume and
-    // pan at minimum). Values that differ from the default, and every later change, are pushed.
+    // pan at minimum). Values that differ from the default, every later change, and the automated
+    // ones are pushed: an automation lane is a choice even when its value is the default.
     let first = std::mem::take(&mut slot.fresh);
     for ((k, v), last) in ins.params.iter().zip(slot.applied.iter_mut()) {
         let val = value(k, *v);
         if val.to_bits() != last.to_bits() {
-            let untouched = first && slot.plugin.info().param(k).is_some_and(|pi| pi.default.to_bits() == val.to_bits());
+            let untouched = first && !intentional(k) && slot.plugin.info().param(k).is_some_and(|pi| pi.default.to_bits() == val.to_bits());
             if !untouched {
                 slot.plugin.set_param(k, val);
             }
@@ -2998,6 +2998,28 @@ mod tests {
         s.track_mut(t).unwrap().mixer.inserts[0].as_mut().unwrap().params.insert("gain".into(), 0.0);
         render_block(&mut eng, &s, 1536);
         assert_eq!(count(), 2);
+    }
+
+    #[test]
+    fn an_automated_value_equal_to_the_default_is_sent_on_the_first_pass() {
+        let (mut s, t) = session_with_dc(0.5, 48_000);
+        let id = "vst3:00000000000000000000000000000003";
+        let mut ins = Insert::new(id);
+        // Older sessions store every parameter at the default the plugin reports (0 for gain).
+        ins.params.insert("gain".into(), 0.0);
+        s.track_mut(t).unwrap().mixer.inserts[0] = Some(ins);
+        // An automation lane is a choice even when its value is that same default.
+        let mut lane = soundcraft_model::AutomationLane::new(AutoParam::Plugin { slot: 0, param: "gain".into() });
+        lane.set_point(0, 0.0);
+        s.track_mut(t).unwrap().automation.push(lane);
+
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        let sets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fake = Stateful { inner: soundcraft_dsp::create("gain").unwrap(), blob: Vec::new(), sets: Arc::clone(&sets) };
+        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: id.into(), ch: 1, plugin: Box::new(fake) }]);
+        render_block(&mut eng, &s, 0);
+        assert_eq!(sets.load(std::sync::atomic::Ordering::Relaxed), 1, "an automated param is sent even at its default");
     }
 
     #[test]
