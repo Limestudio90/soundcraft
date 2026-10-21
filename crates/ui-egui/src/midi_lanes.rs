@@ -38,8 +38,15 @@ pub fn lane_heights(avail: f32, n: usize) -> (f32, f32) {
     if want <= cap {
         (VEL_LANE_H, LANE_H)
     } else {
+        // The floors must not push the lanes past the cap: the editor gives the roll whatever is
+        // left, and a non-positive roll returns before the headers are drawn, so a track with many
+        // lanes could not remove any of them. The Velocity lane keeps its floor first, and the
+        // lanes share what remains: they may shrink below LANE_MIN, because an empty lane still
+        // shows its header and a header is what the user needs to remove it.
         let k = cap / want;
-        ((VEL_LANE_H * k).max(VEL_MIN), (LANE_H * k).max(LANE_MIN))
+        let vel = (VEL_LANE_H * k).max(VEL_MIN).min(cap);
+        let lane = ((cap - vel) / n as f32 - LANE_GAP).max(0.0).min((LANE_H * k).max(LANE_MIN));
+        (vel, lane)
     }
 }
 
@@ -565,5 +572,42 @@ pub fn lane_headers(app: &mut SoundApp, ui: &mut Ui, cx: &LaneCtx, lanes: &[Lane
                 ui.close();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lanes stay inside the 60% cap. `midi_editor::show` gives the roll what is left, and a
+    /// roll with no height returns before the lane headers are drawn, so breaking the cap would
+    /// leave no way to remove a lane.
+    #[test]
+    fn lane_heights_stay_inside_the_cap() {
+        for avail in [300.0f32, 600.0, 1200.0] {
+            let cap = avail * 0.6;
+            // Beyond this the gaps alone fill the cap; `show` shrinks the band for that case.
+            let max_n = ((cap - VEL_MIN) / LANE_GAP).floor().max(1.0) as usize;
+            for n in [1, 2, 5, 12, 25, max_n].into_iter().filter(|n| *n <= max_n) {
+                let (vel, lane) = lane_heights(avail, n);
+                let band = vel + n as f32 * (lane + LANE_GAP);
+                assert!(band <= cap + 0.01, "avail {avail} n {n}: band {band} over cap {cap}");
+                assert!(lane <= LANE_H, "avail {avail} n {n}: lane {lane} over {LANE_H}");
+                assert!(vel <= VEL_LANE_H, "avail {avail} n {n}: velocity {vel} over {VEL_LANE_H}");
+            }
+        }
+    }
+
+    /// The case the finding names: 600 px of editor and 25 lanes used to need more than the cap.
+    #[test]
+    fn twenty_five_lanes_fit_a_600px_editor() {
+        let (vel, lane) = lane_heights(600.0, 25);
+        let band = vel + 25.0 * (lane + LANE_GAP);
+        assert!(band <= 360.0 + 0.01, "band {band} over the 360 px cap");
+    }
+
+    #[test]
+    fn no_lanes_leaves_only_the_velocity_lane() {
+        assert_eq!(lane_heights(600.0, 0), (VEL_LANE_H, 0.0));
     }
 }

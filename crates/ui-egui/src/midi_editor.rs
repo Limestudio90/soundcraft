@@ -12,6 +12,9 @@ use soundcraft_time::{TICKS_PER_QUARTER, TempoMap};
 
 const KEY_W: f32 = 48.0;
 const RULER_H: f32 = 18.0;
+/// The least height the note roll keeps: the lane headers are drawn after it, so a roll with no
+/// height would hide them and leave no way to remove a lane.
+const MIN_ROLL_H: f32 = 80.0;
 /// Default, smallest and largest key row height (the vertical zoom).
 const ROW_H: f32 = 9.0;
 const ROW_MIN: f32 = 4.0;
@@ -365,8 +368,18 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     let ruler = Rect::from_min_max(pos2(full.min.x + KEY_W, header.max.y), pos2(full.max.x - 4.0, header.max.y + RULER_H));
     // Under the roll: the Velocity lane, then the track's controller lanes.
     let lane_kinds = s.track(track).map(|t| t.midi_lanes.clone()).unwrap_or_default();
-    let (vel_h, lane_h) = lane_heights(full.max.y - 2.0 - ruler.max.y, lane_kinds.len());
-    let lanes_h = vel_h + lane_kinds.len() as f32 * (lane_h + LANE_GAP);
+    let avail_h = full.max.y - 2.0 - ruler.max.y;
+    let (mut vel_h, mut lane_h) = lane_heights(avail_h, lane_kinds.len());
+    let mut lanes_h = vel_h + lane_kinds.len() as f32 * (lane_h + LANE_GAP);
+    // The lanes never take the whole editor: the roll is what is left over, and a roll without
+    // height returns below before the lane headers are drawn, so a track with more lanes than fit
+    // could not remove any of them. Shrink the band until the roll keeps `MIN_ROLL_H`.
+    let max_lanes_h = (avail_h - MIN_ROLL_H).max(0.0);
+    if lanes_h > max_lanes_h {
+        vel_h *= (max_lanes_h / lanes_h).max(0.0);
+        lane_h = ((max_lanes_h - vel_h) / lane_kinds.len() as f32 - LANE_GAP).max(0.0);
+        lanes_h = vel_h + lane_kinds.len() as f32 * (lane_h + LANE_GAP);
+    }
     let roll = Rect::from_min_max(pos2(ruler.min.x, ruler.max.y), pos2(ruler.max.x, full.max.y - 2.0 - lanes_h - LANE_GAP));
     let keys = Rect::from_min_max(pos2(full.min.x, roll.min.y), pos2(roll.min.x, roll.max.y));
     let vel = Rect::from_min_max(pos2(roll.min.x, roll.max.y + LANE_GAP), pos2(roll.max.x, roll.max.y + LANE_GAP + vel_h));
