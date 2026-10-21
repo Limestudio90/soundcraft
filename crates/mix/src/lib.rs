@@ -212,6 +212,8 @@ struct PluginSlot {
     plugin: Box<dyn Plugin>,
     /// Last values pushed to the plugin, in the insert's parameter-map order.
     applied: Vec<f32>,
+    /// Which of those the first parameter pass held back as a stored default (see `apply_values`).
+    skipped: Vec<bool>,
     failed: bool,
     /// A hosted plugin that has not had its first parameter pass yet (see `apply_values`).
     fresh: bool,
@@ -413,7 +415,7 @@ impl SlotCtx<'_> {
             let state = if third { ins.state_bytes() } else { None };
             create_instance(&ins.plugin, state.as_deref(), self.sr, self.mb, ch).map(|n| n.plugin)
         }?;
-        Some(PluginSlot { id: ins.plugin.clone(), ch, plugin, applied: Vec::new(), failed: false, fresh: third })
+        Some(PluginSlot { id: ins.plugin.clone(), ch, plugin, applied: Vec::new(), skipped: Vec::new(), failed: false, fresh: third })
     }
 }
 
@@ -1683,22 +1685,40 @@ fn apply_values(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, value: im
     if slot.applied.len() != ins.params.len() {
         slot.applied = vec![f32::NAN; ins.params.len()];
     }
+    if slot.skipped.len() != ins.params.len() {
+        slot.skipped = vec![false; ins.params.len()];
+    }
     // First pass over a hosted plugin: it has just loaded its own settings, so a stored value equal to
     // the default it reports is not a choice and is left alone. Older sessions store every parameter
     // at that default, often 0, and pushing them over a restored plugin silenced Rhapsody (volume and
     // pan at minimum). Values that differ from the default, every later change, and the automated
     // ones are pushed: an automation lane is a choice even when its value is the default.
     let first = std::mem::take(&mut slot.fresh);
-    for ((k, v), last) in ins.params.iter().zip(slot.applied.iter_mut()) {
+    let mut applied = std::mem::take(&mut slot.applied);
+    let mut skipped = std::mem::take(&mut slot.skipped);
+    for (i, ((k, v), last)) in ins.params.iter().zip(applied.iter_mut()).enumerate() {
         let val = value(k, *v);
-        if val.to_bits() != last.to_bits() {
-            let untouched = first && !intentional(k) && slot.plugin.info().param(k).is_some_and(|pi| pi.default.to_bits() == val.to_bits());
-            if !untouched {
-                slot.plugin.set_param(k, val);
-            }
-            *last = val;
+        // A value held back on the first pass is sent as soon as the session makes it a choice —
+        // read automation switched on afterwards — even though it still equals the default.
+        let held_back = skipped.get(i).copied().unwrap_or(false);
+        if val.to_bits() == last.to_bits() && !(held_back && intentional(k)) {
+            continue;
         }
+        let untouched = first && !intentional(k) && slot.plugin.info().param(k).is_some_and(|pi| pi.default.to_bits() == val.to_bits());
+        if untouched {
+            if let Some(s) = skipped.get_mut(i) {
+                *s = true;
+            }
+        } else {
+            slot.plugin.set_param(k, val);
+            if let Some(s) = skipped.get_mut(i) {
+                *s = false;
+            }
+        }
+        *last = val;
     }
+    slot.applied = applied;
+    slot.skipped = skipped;
 }
 
 fn transport_at(s: &Session, pos: Samples, playing: bool, recording: bool) -> Transport {
@@ -3020,6 +3040,32 @@ mod tests {
         eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: id.into(), ch: 1, plugin: Box::new(fake) }]);
         render_block(&mut eng, &s, 0);
         assert_eq!(sets.load(std::sync::atomic::Ordering::Relaxed), 1, "an automated param is sent even at its default");
+    }
+
+    #[test]
+    fn a_value_held_back_before_read_automation_is_sent_when_it_turns_on() {
+        let (mut s, t) = session_with_dc(0.5, 48_000);
+        let id = "vst3:00000000000000000000000000000004";
+        let mut ins = Insert::new(id);
+        ins.params.insert("gain".into(), 0.0);
+        s.track_mut(t).unwrap().mixer.inserts[0] = Some(ins);
+        let mut lane = soundcraft_model::AutomationLane::new(AutoParam::Plugin { slot: 0, param: "gain".into() });
+        lane.set_point(0, 0.0);
+        let tr = s.track_mut(t).unwrap();
+        tr.automation.push(lane);
+        tr.mixer.automation_mode = soundcraft_model::AutomationMode::Off;
+
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.set_external_instances(true);
+        let sets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fake = Stateful { inner: soundcraft_dsp::create("gain").unwrap(), blob: Vec::new(), sets: Arc::clone(&sets) };
+        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: id.into(), ch: 1, plugin: Box::new(fake) }]);
+        render_block(&mut eng, &s, 0);
+        assert_eq!(sets.load(std::sync::atomic::Ordering::Relaxed), 0, "automation off: the stored default is held back");
+        // Turning read automation on makes the lane a choice: its value goes out although unchanged.
+        s.track_mut(t).unwrap().mixer.automation_mode = soundcraft_model::AutomationMode::Read;
+        render_block(&mut eng, &s, 512);
+        assert_eq!(sets.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]
