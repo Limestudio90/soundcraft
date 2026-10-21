@@ -1,6 +1,8 @@
-//! The MIDI Editor: a piano roll with a ruler and a velocity lane, docked under the Edit window.
+//! The MIDI Editor: a piano roll with a ruler, a velocity lane and the track's controller lanes,
+//! docked under the Edit window.
 
 use crate::SoundApp;
+use crate::midi_lanes::{LANE_GAP, LaneCtx, LaneGesture, LaneView, lane_heights};
 use crate::theme::{Tokens, bold, regular};
 use egui::{Align2, Color32, CursorIcon, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use serde_json::json;
@@ -10,7 +12,6 @@ use soundcraft_time::{TICKS_PER_QUARTER, TempoMap};
 
 const KEY_W: f32 = 48.0;
 const RULER_H: f32 = 18.0;
-const VEL_H: f32 = 64.0;
 /// Default, smallest and largest key row height (the vertical zoom).
 const ROW_H: f32 = 9.0;
 const ROW_MIN: f32 = 4.0;
@@ -44,6 +45,13 @@ pub struct MidiEditorState {
     pub vel_last: Option<Pos2>,
     /// Where everything was drawn on the last frame.
     pub view: Option<RollView>,
+    /// Selected controller events (indices into the clip's controller list). Notes and controller
+    /// events are never selected together.
+    pub ctrl_selected: Vec<usize>,
+    /// A gesture in a controller lane (or a Pencil shape in the velocity lane).
+    pub lane_gesture: Option<LaneGesture>,
+    /// The controller lanes drawn on the last frame.
+    pub lanes: Vec<LaneView>,
 }
 
 impl MidiEditorState {
@@ -56,6 +64,8 @@ impl MidiEditorState {
             self.band = None;
             self.draft = None;
             self.vel_last = None;
+            self.ctrl_selected.clear();
+            self.lane_gesture = None;
             self.px_per_tick = 0.0;
             self.view_tick = 0.0;
         }
@@ -156,7 +166,7 @@ fn edge_kind(r: Rect, x: f32) -> DragKind {
 
 /// The nearest grid line to a clip-relative tick. Lines are counted from the session start, so
 /// notes land on the bars and beats of the timeline wherever the clip starts.
-fn snap_tick(tick: f64, base: i64, grid: i64) -> i64 {
+pub(crate) fn snap_tick(tick: f64, base: i64, grid: i64) -> i64 {
     let g = grid.max(1) as f64;
     let abs = tick + base as f64;
     if !abs.is_finite() {
@@ -189,7 +199,7 @@ fn length_label(map: &TempoMap, at: i64, len: i64) -> String {
 }
 
 /// A position as bars|beats|ticks.
-fn position_label(map: &TempoMap, at: i64) -> String {
+pub(crate) fn position_label(map: &TempoMap, at: i64) -> String {
     let bb = map.bar_beat_at_tick(at);
     format!("{}|{}|{:03}", bb.bar, bb.beat, bb.tick)
 }
@@ -235,9 +245,31 @@ fn audition(app: &mut SoundApp, want: Option<(TrackId, u8, u8)>) {
     app.midi.audition = want.map(|(t, p, _)| (t, p));
 }
 
-/// Indices returned by a note command, for keeping the touched notes selected.
-fn returned_indices(r: Result<serde_json::Value, String>) -> Vec<usize> {
+/// Indices returned by a note or controller command, for keeping the touched events selected.
+pub(crate) fn returned_indices(r: Result<serde_json::Value, String>) -> Vec<usize> {
     r.ok().and_then(|v| serde_json::from_value(v["indices"].clone()).ok()).unwrap_or_default()
+}
+
+/// A one-line readout next to the pointer.
+pub(crate) fn tooltip(ui: &Ui, full: Rect, p: Pos2, text: String) {
+    let t = Tokens::current();
+    let tip = ui.painter().with_clip_rect(full);
+    let galley = tip.layout_no_wrap(text, regular(10.5), t.text);
+    let at = pos2((p.x + 14.0).min(full.max.x - galley.size().x - 6.0), (p.y - 20.0).max(full.min.y + 2.0));
+    tip.rect_filled(Rect::from_min_size(at, galley.size()).expand(3.0), 3.0, t.panel_bg2.gamma_multiply(0.95));
+    tip.galley(at, galley, t.text);
+}
+
+/// The Pencil's shape, also on the Pencil tool's right-click menu in the toolbar.
+fn pencil_shape_combo(app: &mut SoundApp, ui: &mut Ui) {
+    let cur = app.engine.session().edit.pencil_shape;
+    egui::ComboBox::from_id_salt("midi_pencil_shape").selected_text(format!("Pencil: {}", cur.label())).width(118.0).show_ui(ui, |ui| {
+        for s in soundcraft_midi::PencilShape::ALL {
+            if ui.selectable_label(cur == s, s.label()).clicked() {
+                let _ = app.run("edit.pencil_shape", json!({"shape": s.id()}));
+            }
+        }
+    });
 }
 
 pub fn show(app: &mut SoundApp, ui: &mut Ui) {
@@ -305,7 +337,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         _ => TICKS_PER_QUARTER / 4,
     };
     // Header toolbar: whole-clip MIDI operations.
-    let bar = Rect::from_min_max(pos2(header.max.x - 330.0, header.min.y + 1.0), pos2(header.max.x - 6.0, header.max.y - 1.0));
+    let bar = Rect::from_min_max(pos2(header.max.x - 450.0, header.min.y + 1.0), pos2(header.max.x - 6.0, header.max.y - 1.0));
     let mut tb = ui.new_child(egui::UiBuilder::new().max_rect(bar).layout(egui::Layout::right_to_left(egui::Align::Center)));
     tb.spacing_mut().item_spacing.x = 4.0;
     let mut op: Option<(&str, serde_json::Value)> = None;
@@ -321,6 +353,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     if tb.small_button("Quantize").on_hover_text("Quantize to the grid").clicked() {
         op = Some(("event.quantize", json!({"grid": grid_ticks, "strength": 100})));
     }
+    pencil_shape_combo(app, &mut tb);
     if let Some((id, mut p)) = op {
         p["clips"] = json!([cid.0]);
         let _ = app.run(id, p);
@@ -330,9 +363,21 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     let base_tick = s.tempo.samples_to_ticks(clip.start, sr);
     let len_ticks = (s.tempo.samples_to_ticks(clip.end(), sr) - base_tick).max(1);
     let ruler = Rect::from_min_max(pos2(full.min.x + KEY_W, header.max.y), pos2(full.max.x - 4.0, header.max.y + RULER_H));
-    let roll = Rect::from_min_max(pos2(ruler.min.x, ruler.max.y), pos2(ruler.max.x, full.max.y - VEL_H - 4.0));
+    // Under the roll: the Velocity lane, then the track's controller lanes.
+    let lane_kinds = s.track(track).map(|t| t.midi_lanes.clone()).unwrap_or_default();
+    let (vel_h, lane_h) = lane_heights(full.max.y - 2.0 - ruler.max.y, lane_kinds.len());
+    let lanes_h = vel_h + lane_kinds.len() as f32 * (lane_h + LANE_GAP);
+    let roll = Rect::from_min_max(pos2(ruler.min.x, ruler.max.y), pos2(ruler.max.x, full.max.y - 2.0 - lanes_h - LANE_GAP));
     let keys = Rect::from_min_max(pos2(full.min.x, roll.min.y), pos2(roll.min.x, roll.max.y));
-    let vel = Rect::from_min_max(pos2(roll.min.x, roll.max.y + 4.0), pos2(roll.max.x, full.max.y - 2.0));
+    let vel = Rect::from_min_max(pos2(roll.min.x, roll.max.y + LANE_GAP), pos2(roll.max.x, roll.max.y + LANE_GAP + vel_h));
+    let lanes: Vec<LaneView> = lane_kinds
+        .iter()
+        .enumerate()
+        .map(|(i, &kind)| {
+            let top = vel.max.y + LANE_GAP + i as f32 * (lane_h + LANE_GAP);
+            LaneView { kind, rect: Rect::from_min_max(pos2(roll.min.x, top), pos2(roll.max.x, top + lane_h)) }
+        })
+        .collect();
     if !roll.is_positive() {
         return;
     }
@@ -452,6 +497,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         let px = m.ticks_per_bar() as f32 * rv.px_per_tick;
         (40.0 / px.max(0.01)).ceil().max(1.0) as i64
     };
+    let mut bars: Vec<f32> = Vec::new();
     for bar in (first_bar..).take(4096) {
         let at = s.tempo.bar_start_tick(bar);
         if at - base_tick > tick_hi {
@@ -467,6 +513,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
             }
         }
         let x = rv.x_of(at - base_tick);
+        bars.push(x);
         painter.line_segment([pos2(x, roll.min.y), pos2(x, roll.max.y)], Stroke::new(1.0, t.bar_line));
         rp.line_segment([pos2(x, ruler.min.y + 3.0), pos2(x, ruler.max.y)], Stroke::new(1.0, t.ruler_tick));
         if bar.rem_euclid(label_every) == 1 % label_every {
@@ -536,7 +583,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     let px = rv.x_of(play_tick.round() as i64);
     if (roll.min.x..=roll.max.x).contains(&px) {
         let (col, w) = if playing { (t.playhead, 1.5) } else { (t.insertion, 1.0) };
-        ui.painter().line_segment([pos2(px, ruler.min.y), pos2(px, roll.max.y)], Stroke::new(w, col));
+        ui.painter().line_segment([pos2(px, ruler.min.y), pos2(px, full.max.y - 2.0)], Stroke::new(w, col));
     }
     // Interaction.
     let hit = |pos: Pos2| rv.hit(&sequence.notes, pos);
@@ -572,6 +619,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     if resp.drag_started()
         && let Some(p) = origin.or_else(|| resp.interact_pointer_pos())
     {
+        app.midi.ctrl_selected.clear();
         match hit(p) {
             Some((i, kind)) => {
                 if !app.midi.selected.contains(&i) {
@@ -692,6 +740,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     if resp.clicked()
         && let Some(p) = resp.interact_pointer_pos()
     {
+        app.midi.ctrl_selected.clear();
         match hit(p) {
             Some((i, _)) => {
                 if mods.shift {
@@ -733,11 +782,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         });
     }
     if let (Some(text), Some(p)) = (info, pointer) {
-        let tip = ui.painter().with_clip_rect(full);
-        let galley = tip.layout_no_wrap(text, regular(10.5), t.text);
-        let at = pos2((p.x + 14.0).min(full.max.x - galley.size().x - 6.0), (p.y - 20.0).max(full.min.y + 2.0));
-        tip.rect_filled(Rect::from_min_size(at, galley.size()).expand(3.0), 3.0, t.panel_bg2.gamma_multiply(0.95));
-        tip.galley(at, galley, t.text);
+        tooltip(ui, full, p, text);
     }
     // Keyboard: Cmd+A select all; arrows transpose (Shift = octave) and move by the grid.
     if ui.rect_contains_pointer(roll) && !ui.ctx().egui_wants_keyboard_input() {
@@ -776,23 +821,50 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
             app.midi.selected = returned_indices(moved);
         }
     }
-    if !app.midi.selected.is_empty()
+    if (!app.midi.selected.is_empty() || !app.midi.ctrl_selected.is_empty())
         && !ui.ctx().egui_wants_keyboard_input()
         && ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
     {
-        let _ = app.run("midi.note_delete", json!({"clip": cid.0, "indices": app.midi.selected}));
+        if app.midi.ctrl_selected.is_empty() {
+            let _ = app.run("midi.note_delete", json!({"clip": cid.0, "indices": app.midi.selected}));
+        } else {
+            let _ = app.run("midi.ctrl_delete", json!({"clip": cid.0, "indices": app.midi.ctrl_selected}));
+        }
         app.midi.selected.clear();
+        app.midi.ctrl_selected.clear();
     }
-    velocity_lane(app, ui, &rv, cid, &sequence.notes, base, full);
+    let cx = LaneCtx {
+        rv,
+        full,
+        cid,
+        track,
+        seq: sequence,
+        color: base,
+        base_tick,
+        len_ticks,
+        grid: grid_ticks,
+        snapping,
+        tool: s.edit.tool,
+        shape: s.edit.pencil_shape,
+        tempo: &s.tempo,
+        bars: &bars,
+    };
+    velocity_lane(app, ui, &cx);
+    for (i, lane) in lanes.iter().enumerate() {
+        crate::midi_lanes::ctrl_lane(app, ui, &cx, i, *lane);
+    }
+    crate::midi_lanes::lane_headers(app, ui, &cx, &lanes);
+    app.midi.lanes = lanes;
 }
 
 /// The velocity lane: one stem per note. Dragging draws the velocity of every stem the pointer
 /// passes; with notes selected only theirs change, so one note of a chord can be set on its own.
-fn velocity_lane(app: &mut SoundApp, ui: &mut Ui, rv: &RollView, cid: ClipId, notes: &[Note], base: Color32, full: Rect) {
+/// The Pencil's other shapes draw a line or curve across the stems instead.
+fn velocity_lane(app: &mut SoundApp, ui: &mut Ui, cx: &LaneCtx) {
     let t = Tokens::current();
+    let (rv, cid, notes, base) = (&cx.rv, cx.cid, &cx.seq.notes, cx.color);
     let vel = rv.vel;
     ui.painter().rect_filled(vel, 0.0, t.playlist_bg.lerp_to_gamma(Color32::BLACK, 0.25));
-    ui.painter().text(pos2(full.min.x + 6.0, vel.center().y), Align2::LEFT_CENTER, "Velocity", regular(10.0), t.text_dim);
     let painter = ui.painter().with_clip_rect(vel);
     let selected = app.midi.selected.clone();
     let editable = |i: usize| selected.is_empty() || selected.contains(&i);
@@ -810,6 +882,13 @@ fn velocity_lane(app: &mut SoundApp, ui: &mut Ui, rv: &RollView, cid: ClipId, no
         painter.circle_filled(pos2(x, vel.max.y - 2.0 - h), 2.5, col);
     }
     let vresp = ui.interact(vel, ui.id().with(("vel", cid.0)), Sense::click_and_drag());
+    if vresp.drag_started() || vresp.clicked() {
+        app.midi.ctrl_selected.clear();
+    }
+    if cx.tool == Tool::Pencil && cx.shape != soundcraft_midi::PencilShape::FreeHand {
+        crate::midi_lanes::velocity_shape(app, ui, cx, &vresp, &editable);
+        return;
+    }
     let down = vresp.is_pointer_button_down_on() || vresp.clicked();
     let Some(p) = vresp.interact_pointer_pos().filter(|_| down) else {
         if app.midi.vel_last.take().is_some() {

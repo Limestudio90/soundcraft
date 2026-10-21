@@ -35,7 +35,7 @@ pub fn specs() -> Vec<CommandSpec> {
     ]
 }
 
-fn seq_mut<'a>(e: &'a mut Engine, id: ClipId, cmd: &str) -> Result<&'a mut Sequence> {
+pub(super) fn seq_mut<'a>(e: &'a mut Engine, id: ClipId, cmd: &str) -> Result<&'a mut Sequence> {
     match e.session_mut().find_clip_mut(id).map(|c| &mut c.content) {
         Some(ClipContent::Midi { sequence }) => Ok(sequence),
         Some(_) => Err(bad(cmd, "not a MIDI clip")),
@@ -109,7 +109,7 @@ fn note_edit(e: &mut Engine, p: &Value) -> Result<Value> {
     Ok(json!({"note": edited, "index": seq.notes.iter().position(|x| *x == edited)}))
 }
 
-fn indices(p: &Value) -> Vec<usize> {
+pub(super) fn indices(p: &Value) -> Vec<usize> {
     p.get("indices").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).map(|x| x as usize).collect()).unwrap_or_default()
 }
 

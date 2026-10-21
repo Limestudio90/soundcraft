@@ -221,6 +221,9 @@ pub struct EditState {
     /// Numeric settings keyed by id (e.g. `click.volume_db`, `engine.buffer_size`).
     #[serde(default)]
     pub values: std::collections::BTreeMap<String, f64>,
+    /// What the Pencil draws (Free Hand, Line, Triangle, Square, Random, Parabolic, S-Curve).
+    #[serde(default)]
+    pub pencil_shape: soundcraft_midi::PencilShape,
 }
 
 impl EditState {
@@ -291,6 +294,7 @@ impl Default for EditState {
                 .map(|s| s.to_string())
                 .collect(),
             values: std::collections::BTreeMap::new(),
+            pencil_shape: soundcraft_midi::PencilShape::FreeHand,
         }
     }
 }
