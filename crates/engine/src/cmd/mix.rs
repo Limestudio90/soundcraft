@@ -1,6 +1,7 @@
 //! Mixer, insert, send and automation commands.
 use super::{
-    CommandSpec, always, bad, bool_or, f32_or, fill_default_params, has_range, has_selection, has_tracks, i64_or, position_param, range_param, str_param, tracks_required,
+    CommandSpec, always, bad, bool_or, f32_or, fill_default_params, has_range, has_selection, has_tracks, i64_or, position_param, range_param,
+    str_param, tracks_required,
 };
 
 use crate::{Engine, EngineError, Result, cmd};
