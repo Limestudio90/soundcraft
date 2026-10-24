@@ -315,12 +315,24 @@ fn main() -> eframe::Result {
 
 /// A saved window size, or the default when the prefs file holds nonsense (NaN, negative, tiny).
 fn sane_window_size([w, h]: [f32; 2]) -> [f32; 2] {
-    if w.is_finite() && h.is_finite() && w >= 960.0 && h >= 600.0 { [w.min(16_384.0), h.min(16_384.0)] } else { [1600.0, 1000.0] }
+    // Capped here as well as per frame: eframe makes the first surface before the app exists, so a
+    // restored window wider than the GPU can draw failed at launch, before the guard could shrink it.
+    let max = soundcraft_ui_egui::MAX_WINDOW_SIDE;
+    if w.is_finite() && h.is_finite() && w >= 960.0 && h >= 600.0 { [w.min(max), h.min(max)] } else { [1600.0, 1000.0] }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::set_title;
+    use super::{sane_window_size, set_title};
+
+    #[test]
+    fn a_restored_window_never_starts_wider_than_the_gpu_can_draw() {
+        let max = soundcraft_ui_egui::MAX_WINDOW_SIDE;
+        assert_eq!(sane_window_size([29_423.0, 1200.0]), [max, 1200.0], "a saved size past the limit is cut at launch");
+        assert_eq!(sane_window_size([1200.0, 29_423.0]), [1200.0, max]);
+        assert_eq!(sane_window_size([1600.0, 1000.0]), [1600.0, 1000.0], "a sane size is left alone");
+        assert_eq!(sane_window_size([f32::NAN, 1000.0]), [1600.0, 1000.0], "a broken value falls back");
+    }
 
     #[test]
     fn the_title_is_sent_only_when_it_changes() {
