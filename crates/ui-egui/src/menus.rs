@@ -70,6 +70,7 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.io_setup", "I/O Setup", "", None),
     ("window.shortcuts", "Keyboard Shortcuts", "", None),
     ("view.mix_section", "Mix Window View", "", None),
+    ("view.scroll_into_view", "Scroll Into View", "", None),
     ("ui.new_tracks_dialog", "New Tracks…", "", None),
     ("ui.bounce_dialog", "Bounce Mix…", "", None),
     ("ui.set", "Set UI State", "", None),
@@ -87,7 +88,7 @@ pub fn ui_aliases() -> Vec<(&'static str, &'static str)> {
 
 /// Mix-view menu paths, allocated once. Rebuilding them on every menu draw leaked a copy per frame.
 fn mix_view_aliases() -> &'static [(&'static str, &'static str)] {
-    static ALIASES: std::sync::OnceLock<Vec<(&'static str, &'static str)>> = std::sync::OnceLock::new();
+    static ALIASES: std::sync::OnceLock<Vec<(&str, &str)>> = std::sync::OnceLock::new();
     ALIASES.get_or_init(|| {
         [
             "Inserts A-E",
@@ -131,7 +132,7 @@ pub const AUDIOSUITE: &[(&str, &str)] = &[
     ("AudioSuite > Pitch Shift > Vari-Fi", "varispeed"),
     ("AudioSuite > Reverb > D-Verb", "room_reverb"),
     ("AudioSuite > Delay > Mod Delay III", "mod_delay"),
-    ("AudioSuite > Modulation > Sci-Fi", "flanger"),
+    ("AudioSuite > Modulation > Sci-Fi", "ring_mod"),
     ("AudioSuite > Harmonic > Eleven Lite", "saturator"),
     ("AudioSuite > Harmonic > Lo-Fi", "lofi"),
     ("AudioSuite > Harmonic > Recti-Fi", "rectifier"),
@@ -636,7 +637,7 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
             match sec {
                 "all" => {
                     app.ui.mix_views =
-                        ["inserts_ae", "inserts_fj", "sends_ae", "sends_fj", "io", "comments", "color"].iter().map(|s| s.to_string()).collect()
+                        ["inserts_ae", "inserts_fj", "sends_ae", "sends_fj", "io", "comments", "color"].iter().map(ToString::to_string).collect()
                 }
                 "minimal" => app.ui.mix_views.clear(),
                 "" => return Some(Err("`section` required".into())),
@@ -649,6 +650,20 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
                 }
             }
             json!({"mix_views": app.ui.mix_views})
+        }
+        "view.scroll_into_view" => {
+            // `track` (id or name), else the first selected track: the palette passes no params.
+            let track = match soundcraft_engine::cmd::track_param(&app.engine, id, p, "track") {
+                Ok(Some(t)) => t,
+                Ok(None) => match app.engine.session().edit.selected_tracks.first() {
+                    Some(t) => *t,
+                    None => return Some(Err("view.scroll_into_view: pass `track` or select a track".into())),
+                },
+                Err(e) => return Some(Err(e.to_string())),
+            };
+            app.edit_scroll_into_view = Some(track);
+            app.mix_scroll_into_view = Some(track);
+            json!({"track": track.0})
         }
         "ui.new_tracks_dialog" => {
             return Some(Err("ui.new_tracks_dialog opens a dialog from the menu only; call track.new with parameters".into()));
@@ -780,5 +795,14 @@ mod tests {
         assert_eq!(instrument_track(e.session()), None, "an audio track has no instrument");
         e.execute("edit.select", &json!({"tracks": [audio, inst]})).unwrap();
         assert_eq!(instrument_track(e.session()).map(|t| t.0), Some(inst));
+    }
+
+    #[test]
+    fn audiosuite_sci_fi_opens_the_ring_modulator() {
+        let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
+        invoke_menu(&mut app, "audiosuite.process", "AudioSuite > Modulation > Sci-Fi");
+        assert_eq!(app.ui.audiosuite.as_deref(), Some("ring_mod"));
+        let info = soundcraft_dsp::plugin_info("ring_mod").unwrap();
+        assert!(info.audiosuite && info.category == soundcraft_dsp::Category::Modulation);
     }
 }
