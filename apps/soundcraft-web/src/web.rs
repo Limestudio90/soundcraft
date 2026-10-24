@@ -121,18 +121,38 @@ impl WebShell {
     /// File > Open Session… / Import > Audio… / MIDI… would show a text box for a path, which the
     /// browser can't read (#63, #64). Show the browser's file picker instead.
     fn take_path_prompt(&mut self, ctx: &egui::Context) {
+        // The Import Audio dialog can't work here: its "Add Files…" wants paths, which a browser
+        // has none of. Keep the picker instead, taking any number of files at once.
+        if matches!(self.app.dialogs.open, Some(Dialog::ImportAudio(_))) {
+            self.app.dialogs.open = None;
+            self.pick(Purpose::Audio, ctx);
+            return;
+        }
         let purpose = match &self.app.dialogs.open {
             Some(Dialog::PathPrompt { cmd, .. }) => Purpose::for_command(cmd),
             _ => None,
         };
         let Some(purpose) = purpose else { return };
         self.app.dialogs.open = None;
+        self.pick(purpose, ctx);
+    }
+
+    /// Takes the files from the browser's picker: one for a session or a MIDI file, any number
+    /// for audio.
+    fn pick(&mut self, purpose: Purpose, ctx: &egui::Context) {
         let (inbox, ctx) = (self.inbox.clone(), ctx.clone());
         wasm_bindgen_futures::spawn_local(async move {
             let (label, exts) = purpose.filter();
-            let Some(file) = rfd::AsyncFileDialog::new().add_filter(label, exts).pick_file().await else { return };
-            let bytes = file.read().await;
-            inbox.borrow_mut().push((purpose, file.file_name(), bytes));
+            let dialog = rfd::AsyncFileDialog::new().add_filter(label, exts);
+            let files = match purpose {
+                Purpose::Audio => dialog.pick_files().await.unwrap_or_default(),
+                Purpose::Session | Purpose::Midi => dialog.pick_file().await.into_iter().collect(),
+            };
+            for file in files {
+                let name = file.file_name();
+                let bytes = file.read().await;
+                inbox.borrow_mut().push((purpose, name, bytes));
+            }
             ctx.request_repaint();
         });
     }

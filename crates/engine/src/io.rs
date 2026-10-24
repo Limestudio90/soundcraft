@@ -231,6 +231,16 @@ fn place_import(
     let file_rate = info.sample_rate;
     let s = e.session_mut();
     let session_rate = s.sample_rate.hz();
+    // A file's width has to match the track it lands on: playback reads `channels[ch % n]`, so a
+    // stereo file on a mono track would lose its right channel without a word.
+    if let Some(tr) = target.and_then(|t| s.track(t)) {
+        let (t_name, t_width) = (tr.name.clone(), tr.channels());
+        if t_width != channels {
+            return Err(EngineError::Io(format!(
+                "{name}: {channels} channels on the {t_width}-channel track {t_name} — import it below the tracks, as a new track of its width"
+            )));
+        }
+    }
     let src = add_source_audio(s, name, audio, path, info.format);
     if let (Some(bwf), Some(sx)) = (info.bwf.as_ref(), s.sources.last_mut()) {
         sx.time_reference = stamp_at_rate(bwf.time_reference, file_rate, session_rate);

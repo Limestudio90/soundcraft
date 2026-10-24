@@ -270,7 +270,20 @@ impl SoundApp {
         let paths: Vec<String> = audio.iter().map(|f| f.path().to_string_lossy().into_owned()).collect();
         let done = target.describe(self.engine.session(), paths.len());
         self.ui.status = match self.run("file.import_audio", target.params(&paths)) {
-            Ok(_) => done.replacen("Import ", "Imported ", 1).replacen("Add ", "Added ", 1),
+            Ok(v) => {
+                let mut msg = done.replacen("Import ", "Imported ", 1).replacen("Add ", "Added ", 1);
+                // Files the command had to skip are named, so a bad one is not silently gone.
+                let failed = v.get("failed").and_then(Value::as_array).cloned().unwrap_or_default();
+                if !failed.is_empty() {
+                    let names: Vec<String> = failed
+                        .iter()
+                        .filter_map(|f| f.get("path").and_then(Value::as_str))
+                        .map(|p| std::path::Path::new(p).file_name().map_or_else(|| p.to_string(), |n| n.to_string_lossy().into_owned()))
+                        .collect();
+                    msg = format!("{msg}; {} not imported: {}", failed.len(), names.join(", "));
+                }
+                msg
+            }
             Err(e) => e,
         };
         rest

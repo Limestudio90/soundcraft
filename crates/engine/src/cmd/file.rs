@@ -243,29 +243,43 @@ fn import_audio(e: &mut Engine, p: &Value) -> Result<Value> {
     // Several files on one track would stack at the same spot: they go one after another.
     let sequential = target.is_some() && bool_or(p, "sequential", true);
     let mut out = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
     for path in &paths {
         let name = std::path::Path::new(path).file_name().and_then(std::ffi::OsStr::to_str).unwrap_or("Audio").to_string();
-        // Audio the app decoded on a worker thread (`Engine::offer_import`) is only placed here;
-        // the path is checked the same way either way.
-        crate::file_access::check_read(std::path::Path::new(path)).map_err(crate::EngineError::Io)?;
-        let r = if clip_list {
-            let bytes = crate::io::read_file(path)?;
-            crate::io::import_audio_to_clip_list(e, &name, &bytes, Some(path.as_str()))?
-        } else {
-            match e.take_import(std::path::Path::new(path)) {
-                Some(d) => crate::io::place_decoded(e, &name, d, Some(path.as_str()), target, at)?,
-                None => {
-                    let bytes = crate::io::read_file(path)?;
-                    crate::io::import_audio_bytes(e, &name, &bytes, Some(path.as_str()), target, at)?
+        // One file that can't be read or decoded doesn't take the others with it: it is reported
+        // back and the rest is imported as one undo step.
+        let one = (|| -> Result<Value> {
+            // Audio the app decoded on a worker thread (`Engine::offer_import`) is only placed
+            // here; the path is checked the same way either way.
+            crate::file_access::check_read(std::path::Path::new(path)).map_err(crate::EngineError::Io)?;
+            if clip_list {
+                let bytes = crate::io::read_file(path)?;
+                Ok(crate::io::import_audio_to_clip_list(e, &name, &bytes, Some(path.as_str()))?)
+            } else {
+                match e.take_import(std::path::Path::new(path)) {
+                    Some(d) => Ok(crate::io::place_decoded(e, &name, d, Some(path.as_str()), target, at)?),
+                    None => {
+                        let bytes = crate::io::read_file(path)?;
+                        Ok(crate::io::import_audio_bytes(e, &name, &bytes, Some(path.as_str()), target, at)?)
+                    }
                 }
             }
-        };
-        if sequential {
-            at = at.saturating_add(r.get("frames").and_then(Value::as_i64).unwrap_or(0)).min(MAX_POSITION);
+        })();
+        match one {
+            Ok(r) => {
+                if sequential {
+                    at = at.saturating_add(r.get("frames").and_then(Value::as_i64).unwrap_or(0)).min(MAX_POSITION);
+                }
+                out.push(r);
+            }
+            Err(err) => failed.push(json!({"path": path, "error": err.to_string()})),
         }
-        out.push(r);
     }
-    Ok(json!({"imported": out}))
+    if out.is_empty() && !failed.is_empty() {
+        let first = failed[0]["error"].as_str().unwrap_or("nothing imported");
+        return Err(bad("file.import_audio", first));
+    }
+    Ok(if failed.is_empty() { json!({"imported": out}) } else { json!({"imported": out, "failed": failed}) })
 }
 
 /// Destination for `file.import_audio`: an explicit `track` wins; otherwise `new_tracks`
@@ -361,7 +375,7 @@ fn write_score(e: &mut Engine, p: &Value, id: &str, svg: bool) -> Result<Value> 
 mod tests {
     use super::*;
     use crate::Engine;
-    use soundcraft_audio_io::{AudioBuffer, EncodeOptions};
+    use soundcraft_audio_io::{AudioBuffer, BitDepth, EncodeOptions, FileFormat};
     use soundcraft_model::ChannelFormat;
 
     fn tone_wav(dir: &std::path::Path, name: &str) -> String {
@@ -511,6 +525,65 @@ mod tests {
         assert!(e.session().tracks.is_empty());
         assert_eq!(e.session().sources.len(), 2);
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_decoded_is_skipped_and_the_rest_land() {
+        let dir = std::env::temp_dir().join(format!("sc-import-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = tone_wav(&dir, "good.wav");
+        let bad = dir.join("bad.wav");
+        std::fs::write(&bad, b"not audio at all").unwrap();
+        let missing = dir.join("gone.wav").to_string_lossy().into_owned();
+
+        let mut e = Engine::default();
+        e.execute("track.new", &json!({"count": 1, "name": "Target", "format": "mono"})).unwrap();
+        let r = e
+            .execute("file.import_audio", &json!({"paths": [bad.to_string_lossy(), good.clone(), missing.clone()], "track": "Target", "at": 0}))
+            .unwrap();
+        let imported = r["imported"].as_array().map(Vec::len).unwrap_or(0);
+        let failed = r["failed"].as_array().cloned().unwrap_or_default();
+        assert_eq!((imported, failed.len()), (1, 2), "{r}");
+        assert!(failed.iter().any(|f| f["path"].as_str() == Some(missing.as_str())), "{r}");
+        let clips = e.session().tracks[0].clips();
+        assert_eq!(clips.len(), 1, "the readable file still lands");
+        assert!(e.undo(), "the import is still one undo step");
+        assert!(e.session().tracks[0].clips().is_empty());
+
+        // Nothing readable at all: the command fails with the file's error instead of silence.
+        let mut e = Engine::default();
+        let err = e.execute("file.import_audio", &json!({"paths": [bad.to_string_lossy()]})).unwrap_err();
+        assert!(err.to_string().contains("bad.wav"), "{err}");
+        assert!(e.session().tracks.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_file_wider_than_the_target_track_is_refused() {
+        let dir = std::env::temp_dir().join(format!("sc-import-width-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("stereo.wav");
+        let one: Vec<f32> = (0..4_800).map(|i| 0.3 * (std::f32::consts::TAU * 330.0 * i as f32 / 48_000.0).sin()).collect();
+        let buf = AudioBuffer { sample_rate: 48_000, channels: vec![one.clone(), one] };
+        let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: BitDepth::Int16, dither: false, bwf: None };
+        std::fs::write(&path, soundcraft_audio_io::encode(&buf, &opts).unwrap()).unwrap();
+
+        let mut e = Engine::default();
+        e.execute("track.new", &json!({"count": 1, "name": "Mono", "format": "mono"})).unwrap();
+        let err = e.execute("file.import_audio", &json!({"paths": [path.to_string_lossy()], "track": "Mono"})).unwrap_err().to_string();
+        assert!(err.contains("2 channels on the 1-channel track Mono"), "{err}");
+        assert!(err.contains("new track of its width"), "{err}");
+        assert!(e.session().tracks[0].clips().is_empty());
+        assert!(e.session().sources.is_empty(), "nothing was added either");
+        // The same file below the tracks makes a stereo track of its own.
+        e.execute("file.import_audio", &json!({"paths": [path.to_string_lossy()], "new_tracks": true})).unwrap();
+        assert_eq!(e.session().tracks.len(), 2);
+        assert_eq!(e.session().tracks[1].channels(), 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 

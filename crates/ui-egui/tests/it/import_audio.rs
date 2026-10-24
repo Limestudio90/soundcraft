@@ -162,3 +162,94 @@ fn import_with_an_empty_list_does_nothing() {
     assert_eq!(h.state().engine.session().tracks.len(), tracks);
     assert!(h.state().dialogs.open.is_some(), "still open, waiting for files");
 }
+
+/// Half a second of tone at `rate` with `channels` channels.
+fn wav_at(dir: &Path, name: &str, rate: u32, channels: usize) -> PathBuf {
+    let frames = rate / 2;
+    let chans: Vec<Vec<f32>> = (0..channels)
+        .map(|c| {
+            let gain = 0.3 / (c as f32 + 1.0);
+            (0..frames).map(|i| gain * (std::f32::consts::TAU * 330.0 * i as f32 / rate as f32).sin()).collect()
+        })
+        .collect();
+    let buf = AudioBuffer { sample_rate: rate, channels: chans };
+    let opts = EncodeOptions { format: FileFormat::Wav, bit_depth: BitDepth::Int16, dither: false, bwf: None };
+    let path = dir.join(name);
+    std::fs::write(&path, soundcraft_audio_io::encode(&buf, &opts).unwrap()).unwrap();
+    path
+}
+
+/// The Bass row's point `dx` pixels into the timeline, and what dropping there would do.
+fn bass_drop(h: &Harness<'_, SoundApp>, dx: f32) -> (Pos2, DropTarget) {
+    let bass = track_named(h, "Bass");
+    let row = h.state().edit_layout.rows.iter().find(|(id, _)| *id == bass.0).map(|(_, r)| rect(*r)).unwrap();
+    let tl = rect(h.state().edit_layout.timeline);
+    let p = pos2(tl.min.x + dx, row.center().y);
+    let target = drop_target(h.state(), Some(p)).expect("the Edit window takes the drop");
+    assert!(matches!(target, DropTarget::Track(t, _) if t == bass), "{target:?}");
+    (p, target)
+}
+
+#[test]
+fn a_drop_onto_a_clip_lands_on_it_and_leaves_the_rest_of_it_in_place() {
+    let d = dir("onto-clip");
+    let file = wav(&d, "hit.wav");
+    let mut h = harness();
+    let (p, target) = bass_drop(&h, 300.0);
+    let DropTarget::Track(_, at) = target else { panic!() };
+    let before: Vec<(i64, i64)> = {
+        let s = h.state().engine.session();
+        s.track(track_named(&h, "Bass")).unwrap().clips().iter().map(|c| (c.start, c.length)).collect()
+    };
+    drop_at(&mut h, p, &[file]);
+    let s = h.state().engine.session();
+    let clips = s.track(track_named(&h, "Bass")).unwrap().clips();
+    let new = clips.iter().find(|c| c.name == "hit").expect("the dropped clip");
+    assert_eq!((new.start, new.length), (at, 24_000), "it lands where it was dropped");
+    // The clip it landed on is cut either side: its material stays before and after the drop.
+    let cut = before.iter().find(|(start, len)| *start <= at && start + len > at).map(|(start, len)| (*start, *len));
+    let (c_start, c_len) = cut.expect("the drop lands on a clip");
+    assert_eq!(clips.len(), before.len() + 2, "the drop adds a clip and splits the one under it");
+    assert!(clips.iter().any(|c| c.name == "Bass" && c.start == c_start && c.start + c.length == at), "the part before the drop stays");
+    assert!(clips.iter().any(|c| c.name == "Bass" && c.start == at + 24_000 && c.start + c.length == c_start + c_len), "and the part after");
+    for (start, len) in before.iter().filter(|(start, len)| start + len <= at || *start > at) {
+        assert!(clips.iter().any(|c| c.start == *start && c.length == *len), "the clip at {start} is untouched");
+    }
+    assert!(h.state_mut().engine.undo(), "one undo step");
+    let after: Vec<(i64, i64)> =
+        h.state().engine.session().track(track_named(&h, "Bass")).unwrap().clips().iter().map(|c| (c.start, c.length)).collect();
+    assert_eq!(after, before, "one undo puts the clip back together");
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn a_44k_file_in_a_48k_session_takes_its_resampled_length() {
+    let d = dir("rate");
+    let files = [wav_at(&d, "a.wav", 44_100, 1), wav_at(&d, "b.wav", 44_100, 1)];
+    let mut h = harness();
+    let (p, target) = bass_drop(&h, 300.0);
+    let DropTarget::Track(_, at) = target else { panic!() };
+    drop_at(&mut h, p, &files);
+    let s = h.state().engine.session();
+    let mut starts: Vec<i64> =
+        s.track(track_named(&h, "Bass")).unwrap().clips().iter().filter(|c| c.name == "a" || c.name == "b").map(|c| c.start).collect();
+    starts.sort_unstable();
+    // 22 050 frames at 44.1 kHz are 24 000 at 48 kHz.
+    assert_eq!(starts, [at, at + 24_000], "the second file follows the resampled length");
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn a_stereo_file_is_refused_on_a_mono_track_with_a_hint() {
+    let d = dir("width");
+    let wide = wav_at(&d, "wide.wav", 48_000, 2);
+    let mut h = harness();
+    let (p, _) = bass_drop(&h, 300.0);
+    let before = h.state().engine.session().track(track_named(&h, "Bass")).unwrap().clips().len();
+    drop_at(&mut h, p, &[wide]);
+    let s = h.state().engine.session();
+    assert_eq!(s.track(track_named(&h, "Bass")).unwrap().clips().len(), before, "nothing lands on the mono track");
+    assert!(h.state().ui.status.contains("2 channels on the 1-channel track Bass"), "{}", h.state().ui.status);
+    assert!(h.state().ui.status.contains("new track of its width"), "{}", h.state().ui.status);
+    let _ = std::fs::remove_dir_all(d);
+}
