@@ -774,7 +774,7 @@ fn preset_menu(
 mod tests {
     use super::*;
     use soundcraft_dsp::{ParamInfo, Taper, Unit};
-    use soundcraft_model::Insert;
+    use soundcraft_model::{ChannelFormat, Clip, Insert, Session, TrackKind};
 
     #[test]
     fn hosted_plugin_window_shows_reported_defaults_until_a_control_moves() {
