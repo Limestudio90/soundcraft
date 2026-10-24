@@ -1,6 +1,6 @@
 # UI parity
 
-> **Last reviewed:** 2026-10-13 · **Last updated:** 2026-10-13 · **Change:** minor (Import Audio: several files, destination and location; files dropped land where dropped; previously minor: drag across checkboxes, #399; waveforms preview fades during drag; a plugin opens when inserted, #486) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-24 · **Change:** minor (Import Audio: several files, destination and location; dropped files land where dropped, in one undo step; previously minor: Scroll Into View in the track name menu) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 How SoundCraft feels in the hands of a Pro Tools user: tools, modes, modifiers, shortcuts,
 windows, meters. Measured from `crates/model/src/session.rs` (tools, modes), the command
@@ -36,7 +36,7 @@ Legend: ✅ matches · 🟡 partial · ❌ missing.
 | Scroll/zoom: wheel, trackpad pinch | 🟡 | Anchored trackpad zoom in open PRs #112, #137 |
 | Drag and drop: Clip List → tracks, files → tracks | ✅ macOS/Windows (files land where dropped: a track from the time under the pointer, new tracks, or the Clip List only; one undo step); 🟡 Wayland (PR #150) | |
 | Import Audio dialog: several files, destination (new tracks / selected track / Clip List) and location (session start / insertion point) | ✅ | |
-| Context menus (clip, track name, ruler, Clip List) | 🟡 | Clip and track menus exist; depth lower than Pro Tools'; Clip List delete (#4) |
+| Context menus (clip, track name, ruler, Clip List) | 🟡 | Clip and track menus exist; depth lower than Pro Tools'; Clip List delete (#4); track name ▸ Scroll Into View (Edit top, Mix left) |
 | Drag across checkboxes to check or uncheck several | ✅ | #399; every checkbox, as in the other Craft apps |
 
 ## Windows and panels
@@ -70,7 +70,8 @@ Legend: ✅ matches · 🟡 partial · ❌ missing.
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-13 | minor | Import Audio: several files, destination and location; dropped files land where dropped (track, new tracks, Clip List) in one undo step |
+| 2026-10-24 | minor | Import Audio: several files, destination and location; dropped files land where dropped (track, new tracks, Clip List) in one undo step. Drop width mismatch refused with a hint |
+| 2026-10-16 | minor | Track name menu: Scroll Into View brings the track to the top of the Edit window and the left of the Mix. Readiness estimate unchanged |
 | 2026-10-13 | minor | A plugin opens when it's inserted (#486) |
 | 2026-10-13 | minor | Drag across checkboxes (#399) |
 | 2026-10-13 | minor | Waveforms and fade curves share temporary envelopes during drag, without rebuilding media or editing the document before release. Readiness estimate unchanged |
