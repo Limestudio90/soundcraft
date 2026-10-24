@@ -75,6 +75,8 @@ fn audition(app: &mut SoundApp, want: Option<(TrackId, u8, u8)>) {
     if app.midi.audition == want.map(|(t, p, _)| (t, p)) {
         return;
     }
+    // Only what actually reached the player is remembered: with no player (no audio, or one being
+    // recreated by a control request) the note has to be sent when it comes back.
     if let Some(player) = &app.player {
         if let Some((t, p)) = app.midi.audition {
             player.note(t, p, 0);
@@ -82,8 +84,10 @@ fn audition(app: &mut SoundApp, want: Option<(TrackId, u8, u8)>) {
         if let Some((t, p, v)) = want {
             player.note(t, p, v);
         }
+        app.midi.audition = want.map(|(t, p, _)| (t, p));
+    } else {
+        app.midi.audition = None;
     }
-    app.midi.audition = want.map(|(t, p, _)| (t, p));
 }
 
 pub fn show(app: &mut SoundApp, ui: &mut Ui) {
