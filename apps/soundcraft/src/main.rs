@@ -314,24 +314,33 @@ fn main() -> eframe::Result {
 }
 
 /// A saved window size, or the default when the prefs file holds nonsense (NaN, negative, tiny).
+/// Largest startup side, in logical points. `with_inner_size` takes points, not pixels, and the
+/// scale factor is unknown until the native window exists, so the cap assumes 2x: at 2.0 a side of
+/// this many points is exactly [`soundcraft_ui_egui::MAX_WINDOW_SIDE`] physical pixels. A bigger
+/// window than this is larger than any display anyway.
+const STARTUP_SIDE: f32 = soundcraft_ui_egui::MAX_WINDOW_SIDE / 2.0;
+
 fn sane_window_size([w, h]: [f32; 2]) -> [f32; 2] {
     // Capped here as well as per frame: eframe makes the first surface before the app exists, so a
     // restored window wider than the GPU can draw failed at launch, before the guard could shrink it.
-    let max = soundcraft_ui_egui::MAX_WINDOW_SIDE;
+    let max = STARTUP_SIDE;
     if w.is_finite() && h.is_finite() && w >= 960.0 && h >= 600.0 { [w.min(max), h.min(max)] } else { [1600.0, 1000.0] }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{sane_window_size, set_title};
+    use super::{STARTUP_SIDE, sane_window_size, set_title};
 
     #[test]
     fn a_restored_window_never_starts_wider_than_the_gpu_can_draw() {
-        let max = soundcraft_ui_egui::MAX_WINDOW_SIDE;
+        let max = STARTUP_SIDE;
         assert_eq!(sane_window_size([29_423.0, 1200.0]), [max, 1200.0], "a saved size past the limit is cut at launch");
         assert_eq!(sane_window_size([1200.0, 29_423.0]), [1200.0, max]);
         assert_eq!(sane_window_size([1600.0, 1000.0]), [1600.0, 1000.0], "a sane size is left alone");
         assert_eq!(sane_window_size([f32::NAN, 1000.0]), [1600.0, 1000.0], "a broken value falls back");
+        // The size arrives in points: at 2x the largest startup window is exactly what wgpu can draw.
+        assert_eq!(max * 2.0, soundcraft_ui_egui::MAX_WINDOW_SIDE, "a 2.0-scale display stays inside the pixel limit");
+        assert!(max * 2.0 * 1.5 > soundcraft_ui_egui::MAX_WINDOW_SIDE, "so is a 3.0-scale one, where the screen is the limit");
     }
 
     #[test]
