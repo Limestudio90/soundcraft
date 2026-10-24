@@ -103,9 +103,12 @@ impl Purpose {
     }
 }
 
-/// Files picked or dropped, read asynchronously (browsers can only read files that way) and
-/// handled on the next frame. The browser has no paths: files travel as bytes.
-type Inbox = Rc<RefCell<Vec<(Purpose, String, Vec<u8>)>>>;
+/// One picker selection or one drop: its files land as one undo step.
+type Batch = Vec<(String, Vec<u8>)>;
+
+/// Batches read asynchronously (browsers can only read files that way), handled on the next frame.
+/// The browser has no paths: files travel as bytes.
+type Inbox = Rc<RefCell<Vec<(Purpose, Batch)>>>;
 
 /// Audio dropped on an instrument track or a Sampler window, its bytes read, waiting for the
 /// next frame to load into that track's sampler.
@@ -148,12 +151,16 @@ impl WebShell {
                 Purpose::Audio => dialog.pick_files().await.unwrap_or_default(),
                 Purpose::Session | Purpose::Midi => dialog.pick_file().await.into_iter().collect(),
             };
+            let mut batch = Batch::new();
             for file in files {
                 let name = file.file_name();
                 let bytes = file.read().await;
-                inbox.borrow_mut().push((purpose, name, bytes));
+                batch.push((name, bytes));
             }
-            ctx.request_repaint();
+            if !batch.is_empty() {
+                inbox.borrow_mut().push((purpose, batch));
+                ctx.request_repaint();
+            }
         });
     }
 
@@ -176,7 +183,7 @@ impl WebShell {
             wasm_bindgen_futures::spawn_local(async move {
                 match f.bytes_async().await {
                     Ok(bytes) => {
-                        inbox.borrow_mut().push((Purpose::of(&name), name, bytes));
+                        inbox.borrow_mut().push((Purpose::of(&name), vec![(name, bytes)]));
                         ctx.request_repaint();
                     }
                     Err(e) => log::error!("couldn't read dropped file {name}: {e}"),
@@ -185,30 +192,59 @@ impl WebShell {
         }
     }
 
-    fn handle(&mut self, purpose: Purpose, name: String, bytes: Vec<u8>) {
+    fn handle(&mut self, purpose: Purpose, mut files: Batch) {
         let e = &mut self.app.engine;
         let at = e.session().edit.selection.start.max(0);
-        let result = match purpose {
+        let result: Result<String, String> = match purpose {
             // Asks first when the open session has changes: the bytes wait for the answer.
-            Purpose::Session => return soundcraft_ui_egui::dialogs::open_session_bytes(&mut self.app, name, bytes),
-            // Imports are edits: one undo step each, like the import commands.
+            Purpose::Session => {
+                let Some((name, bytes)) = files.pop() else { return };
+                return soundcraft_ui_egui::dialogs::open_session_bytes(&mut self.app, name, bytes);
+            }
+            // One undo step for the whole selection, and the files that failed are named.
             Purpose::Audio => {
                 let before = e.session_arc();
-                io::import_audio_bytes(e, &name, &bytes, None, None, at).map(|_| {
+                let (mut done, mut failed) = (Vec::new(), Vec::new());
+                for (name, bytes) in files {
+                    match io::import_audio_bytes(e, &name, &bytes, None, None, at) {
+                        Ok(_) => done.push(name),
+                        Err(err) => failed.push(format!("{name}: {err}")),
+                    }
+                }
+                if !done.is_empty() {
                     e.push_undo("Import Audio", before);
-                    format!("Imported {name}")
-                })
+                }
+                imported("Imported", done, failed)
             }
             Purpose::Midi => {
                 let before = e.session_arc();
-                io::import_midi_bytes(e, &bytes, at, true).map(|_| {
+                let (mut done, mut failed) = (Vec::new(), Vec::new());
+                for (name, bytes) in files {
+                    match io::import_midi_bytes(e, &bytes, at, true) {
+                        Ok(_) => done.push(name),
+                        Err(err) => failed.push(format!("{name}: {err}")),
+                    }
+                }
+                if !done.is_empty() {
                     e.push_undo("Import MIDI", before);
-                    format!("Imported {name}")
-                })
+                }
+                imported("Imported", done, failed)
             }
         };
-        self.app.ui.status = result.unwrap_or_else(|err| err.to_string());
+        self.app.ui.status = result.unwrap_or_else(|err| err);
     }
+}
+
+/// What a batch did, for the status line: nothing but errors when every file failed.
+fn imported(verb: &str, done: Vec<String>, failed: Vec<String>) -> Result<String, String> {
+    if done.is_empty() {
+        return Err(failed.join("; "));
+    }
+    let mut msg = format!("{verb} {}", done.join(", "));
+    if !failed.is_empty() {
+        msg = format!("{msg}; not imported: {}", failed.join("; "));
+    }
+    Ok(msg)
 }
 
 impl eframe::App for WebShell {
@@ -216,8 +252,8 @@ impl eframe::App for WebShell {
         self.take_drops(ctx);
         self.take_path_prompt(ctx);
         let pending = std::mem::take(&mut *self.inbox.borrow_mut());
-        for (purpose, name, bytes) in pending {
-            self.handle(purpose, name, bytes);
+        for (purpose, files) in pending {
+            self.handle(purpose, files);
         }
         let samples = std::mem::take(&mut *self.samples.borrow_mut());
         for (read, bytes) in samples {

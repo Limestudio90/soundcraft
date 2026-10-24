@@ -268,10 +268,11 @@ impl SoundApp {
         // insertion point, as dropped files always did.
         let target = drop_target(self, pos).unwrap_or(DropTarget::NewTracks(self.engine.session().edit.selection.start.max(0)));
         let paths: Vec<String> = audio.iter().map(|f| f.path().to_string_lossy().into_owned()).collect();
-        let done = target.describe(self.engine.session(), paths.len());
         self.ui.status = match self.run("file.import_audio", target.params(&paths)) {
             Ok(v) => {
-                let mut msg = done.replacen("Import ", "Imported ", 1).replacen("Add ", "Added ", 1);
+                // Count what landed, not what was asked for: a skipped file is named below.
+                let imported = v.get("imported").and_then(Value::as_array).map_or(0, Vec::len);
+                let mut msg = target.describe(self.engine.session(), imported).replacen("Import ", "Imported ", 1).replacen("Add ", "Added ", 1);
                 // Files the command had to skip are named, so a bad one is not silently gone.
                 let failed = v.get("failed").and_then(Value::as_array).cloned().unwrap_or_default();
                 if !failed.is_empty() {
