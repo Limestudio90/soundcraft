@@ -260,6 +260,9 @@ pub struct SoundApp {
     /// When the recent sessions were last checked for existence, which list, and the result.
     recent_checked: Option<(f64, Vec<String>, Vec<bool>)>,
     pub player: Option<Player>,
+    /// Bumped whenever `player` is replaced. Anything that remembers what it already sent to the
+    /// player (the MIDI audition) compares this first: a new player has heard nothing.
+    pub player_gen: u64,
     /// Input capture, opened on first record.
     pub recorder: Option<soundcraft_playback::record::Recorder>,
     record_start: Samples,
@@ -391,6 +394,7 @@ impl SoundApp {
             recent_checked: None,
             engine,
             player,
+            player_gen: 0,
             recorder: None,
             record_start: 0,
             punch: None,
@@ -901,6 +905,7 @@ impl SoundApp {
         let player = soundcraft_playback::Player::with_config(self.engine.session_arc(), &self.ui.audio);
         player.locate(at);
         self.player = Some(player);
+        self.player_gen += 1;
         Ok(())
     }
 
@@ -994,6 +999,7 @@ impl SoundApp {
         self.recorder = None;
         self.recorder_failed = false;
         self.player = Some(Player::with_config(self.engine.session_arc(), &self.ui.audio));
+        self.player_gen += 1;
     }
 
     fn finish_recording(&mut self) {

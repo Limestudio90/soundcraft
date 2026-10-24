@@ -19,8 +19,9 @@ pub struct MidiEditorState {
     pub clip: Option<ClipId>,
     /// Rubber-band selection start (screen position).
     pub band: Option<egui::Pos2>,
-    /// The note sounding on the track's instrument while a key or note is held.
-    pub audition: Option<(TrackId, u8)>,
+    /// The note sounding on the track's instrument while a key or note is held, and which player
+    /// it was sent to: a player rebuilt mid-press has heard nothing, so the note goes again.
+    pub audition: Option<(u64, TrackId, u8)>,
 }
 
 impl MidiEditorState {
@@ -71,20 +72,30 @@ fn is_black(p: i32) -> bool {
 }
 
 /// Sound `want` on the instrument, releasing the note that was sounding.
+/// What the player that is running now is playing: nothing when the note went to an earlier one.
+fn held_on(now: u64, audition: Option<(u64, TrackId, u8)>) -> Option<(TrackId, u8)> {
+    match audition {
+        Some((sent, t, p)) if sent == now => Some((t, p)),
+        _ => None,
+    }
+}
+
 fn audition(app: &mut SoundApp, want: Option<(TrackId, u8, u8)>) {
-    if app.midi.audition == want.map(|(t, p, _)| (t, p)) {
+    let now = app.player_gen;
+    let held = held_on(now, app.midi.audition);
+    if held == want.map(|(t, p, _)| (t, p)) {
         return;
     }
     // Only what actually reached the player is remembered: with no player (no audio, or one being
     // recreated by a control request) the note has to be sent when it comes back.
     if let Some(player) = &app.player {
-        if let Some((t, p)) = app.midi.audition {
+        if let Some((t, p)) = held {
             player.note(t, p, 0);
         }
         if let Some((t, p, v)) = want {
             player.note(t, p, v);
         }
-        app.midi.audition = want.map(|(t, p, _)| (t, p));
+        app.midi.audition = want.map(|(t, p, _)| (now, t, p));
     } else {
         app.midi.audition = None;
     }
@@ -435,6 +446,14 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_note_held_on_a_replaced_player_is_sent_again() {
+        let a = TrackId(1);
+        assert_eq!(held_on(4, Some((4, a, 60))), Some((a, 60)), "the note on the running player stays held");
+        assert_eq!(held_on(5, Some((4, a, 60))), None, "a new player has heard nothing, so the key sounds again");
+        assert_eq!(held_on(5, None), None);
+    }
 
     #[test]
     fn switching_clip_drops_selection_and_gestures() {
