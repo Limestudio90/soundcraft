@@ -384,7 +384,7 @@ pub fn capture(app: &mut SoundApp, ctx: &egui::Context) {
 }
 
 fn window_id() -> egui::Id {
-    egui::Id::new("MIDI Keyboard")
+    egui::Id::unique("MIDI Keyboard")
 }
 
 /// Step lengths offered in Step mode.
@@ -596,7 +596,7 @@ fn controls(app: &mut SoundApp, ui: &mut Ui) {
                 }
                 if p.step {
                     let current = STEPS.iter().find(|(_, t)| *t == p.step_ticks).map_or("1/8", |(n, _)| *n);
-                    egui::ComboBox::from_id_salt("midi-keyboard-step").width(56.0).selected_text(current).show_ui(ui, |ui| {
+                    craft_ui::ComboBox::from_id_salt("midi-keyboard-step").width(56.0).selected_text(current).show_ui(ui, |ui| {
                         for (name, ticks) in STEPS {
                             ui.selectable_value(&mut p.step_ticks, ticks, name);
                         }
@@ -630,7 +630,7 @@ fn readout(app: &mut SoundApp, ui: &mut Ui, width: f32) {
             ui.add_space(14.0);
             label(ui, "Velocity:");
             let mut v = i32::from(p.velocity);
-            if ui.add(egui::DragValue::new(&mut v).range(1..=127)).changed() {
+            if ui.add(egui::DragValue::new(&mut v).range(1..=127)).accessible_name("Velocity").changed() {
                 p.velocity = v.clamp(1, 127) as u8;
             }
             ui.add_space(14.0);
