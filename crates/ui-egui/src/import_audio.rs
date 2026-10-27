@@ -99,7 +99,7 @@ pub fn body(app: &SoundApp, ui: &mut egui::Ui, d: &mut ImportAudio, enter: bool)
         }
         for (i, f) in d.files.iter().enumerate() {
             ui.horizontal(|ui| {
-                if ui.small_button("✕").on_hover_text("Remove from the list").clicked() {
+                if crate::widgets::close_button(ui, "Remove from the list").clicked() {
                     remove = Some(i);
                 }
                 let name = std::path::Path::new(f).file_name().map_or_else(|| f.clone(), |n| n.to_string_lossy().into_owned());
@@ -230,7 +230,7 @@ pub fn paint_drop_hint(app: &SoundApp, ctx: &egui::Context) {
     }
     let Some(target) = drop_target(app, pos) else { return };
     let s = app.engine.session();
-    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("import_drop_hint")));
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("import_drop_hint")));
     let accent = Tokens::current().accent;
     let area = match target {
         DropTarget::Track(t, _) => app.edit_layout.rows.iter().find(|(id, _)| *id == t.0).map(|(_, r)| rect(*r)),

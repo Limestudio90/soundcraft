@@ -540,8 +540,17 @@ mod tests {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
-            // Test modules (which build their own fixtures) come last in each file.
-            let code = text.split("#[cfg(test)]").next().unwrap_or("");
+            // Inline test modules (which build their own fixtures) come last in each file. Cut only
+            // there: `#[cfg(test)]` also marks `use` lines and `mod tests;` declarations above code.
+            let lines: Vec<&str> = text.lines().collect();
+            let test_module =
+                (0..lines.len()).find(|&i| {
+                    lines[i].trim() == "#[cfg(test)]"
+                        && lines[i + 1..].iter().map(|l| l.trim()).find(|l| !l.starts_with("#[")).is_some_and(|l| {
+                            (l.starts_with("mod ") || l.starts_with("pub mod ") || l.starts_with("pub(crate) mod ")) && l.ends_with('{')
+                        })
+                });
+            let code = lines[..test_module.unwrap_or(lines.len())].join("\n");
             for (n, line) in code.lines().enumerate() {
                 let line = line.trim_start();
                 let touches =

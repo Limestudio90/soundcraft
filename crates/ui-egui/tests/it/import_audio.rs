@@ -44,7 +44,8 @@ fn dir(tag: &str) -> PathBuf {
 
 fn step(h: &mut Harness<'_, SoundApp>) {
     let mut raw = std::mem::take(h.input_mut());
-    h.state_mut().raw_input_hook(&mut raw);
+    let ctx = h.ctx.clone();
+    h.state_mut().raw_input_hook(&ctx, &mut raw);
     *h.input_mut() = raw;
     h.step();
 }
@@ -55,7 +56,7 @@ fn harness() -> Harness<'static, SoundApp> {
         |ui, app: &mut SoundApp| {
             let ctx = ui.ctx().clone();
             app.logic(&ctx);
-            let _ = app.take_dropped_files(&ctx);
+            let _ = app.take_dropped_files();
             app.ui(ui);
         },
         app,
