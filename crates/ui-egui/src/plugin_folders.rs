@@ -137,7 +137,7 @@ const NOTICE_DELAY_S: f64 = 0.5;
 /// usable meanwhile, but the plugin menus wait for the list. Skip ends the scan after the file it
 /// is loading; the skipped files are loaded at the next scan.
 pub fn scan_notice(ctx: &egui::Context) {
-    let since_id = egui::Id::new("plugin_scan_since");
+    let since_id = egui::Id::unique("plugin_scan_since");
     let now = ctx.input(|i| i.time);
     let Some((format, (i, n, file))) = [Format::Vst3, Format::Clap].into_iter().find_map(|f| f.progress().map(|p| (f, p))) else {
         ctx.data_mut(|d| d.remove_temp::<f64>(since_id));
@@ -152,9 +152,10 @@ pub fn scan_notice(ctx: &egui::Context) {
         return;
     }
     let name = file.file_stem().map_or_else(|| file.display().to_string(), |s| s.to_string_lossy().into_owned());
-    egui::Area::new(egui::Id::new("plugin_scan_notice")).anchor(egui::Align2::RIGHT_BOTTOM, vec2(-12.0, -30.0)).order(egui::Order::Foreground).show(
-        ctx,
-        |ui| {
+    egui::Area::new(egui::Id::unique("plugin_scan_notice"))
+        .anchor(egui::Align2::RIGHT_BOTTOM, vec2(-12.0, -30.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -169,8 +170,7 @@ pub fn scan_notice(ctx: &egui::Context) {
                     }
                 });
             });
-        },
-    );
+        });
 }
 
 pub fn window(app: &mut SoundApp, ctx: &egui::Context) {
@@ -178,7 +178,7 @@ pub fn window(app: &mut SoundApp, ctx: &egui::Context) {
     if !open {
         return;
     }
-    let tab_id = egui::Id::new("plugin_folders_tab");
+    let tab_id = egui::Id::unique("plugin_folders_tab");
     let mut tab = ctx.data(|d| d.get_temp::<bool>(tab_id)).map_or(Format::Vst3, |clap| if clap { Format::Clap } else { Format::Vst3 });
     let mut changed = false;
     egui::Window::new("Plug-in Folders").open(&mut open).default_size(vec2(560.0, 380.0)).show(ctx, |ui| {
