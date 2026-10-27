@@ -273,8 +273,7 @@ fn hosted_menus(ui: &mut Ui, instruments: bool) -> Option<String> {
     if !instruments {
         ui.menu_button("JSFX", |ui| {
             // Only effects this host can run are offered; the rest are counted, not listed.
-            let (usable, unusable): (Vec<_>, Vec<_>) =
-                soundcraft_jsfx_host::scan().into_iter().partition(|d| d.unsupported.is_none());
+            let (usable, unusable): (Vec<_>, Vec<_>) = soundcraft_jsfx_host::scan().into_iter().partition(|d| d.unsupported.is_none());
             let list = usable.into_iter().map(|d| MenuPlugin { id: d.id, name: d.name, vendor: d.vendor }).collect();
             if let Some(p) = vendor_menus(ui, list, "No JSFX found") {
                 picked = Some(p);
