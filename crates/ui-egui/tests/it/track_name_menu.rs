@@ -13,6 +13,7 @@ fn right_click(h: &mut Harness<SoundApp>, at: Pos2) {
     h.run_steps(3);
 }
 
+/// Right-clicking a track name opens the track menu in both the Edit window and the Mix strip.
 #[test]
 fn right_click_on_a_track_name_opens_the_track_menu() {
     let mut engine = soundcraft_engine::Engine::default();
@@ -36,7 +37,7 @@ fn right_click_on_a_track_name_opens_the_track_menu() {
     assert!(h.query_by_label("Make Inactive").is_none());
     // The name plate at the foot of the strip, above the Mix's always-visible scroll bar (12
     // points plus its 4-point margin).
-    let strip = h.get_by_label("Record enable").rect();
+    let strip = h.get_by_label_contains("Record enable").rect();
     right_click(&mut h, pos2(strip.center().x, 900.0 - 16.0 - 17.0));
     assert!(h.query_by_label("Make Inactive").is_some(), "the Mix strip's name plate");
 }
