@@ -27,7 +27,7 @@ struct App(SoundApp, Option<&'static logging::AppLogger>, #[cfg(target_os = "mac
 
 /// Sends the title only when it changes, remembered here as X11 and Wayland can't read it back.
 fn set_title(ctx: &egui::Context, title: String) {
-    let id = egui::Id::new("window_title");
+    let id = egui::Id::unique("window_title");
     if ctx.data(|d| d.get_temp::<String>(id)).as_deref() != Some(title.as_str()) {
         ctx.data_mut(|d| d.insert_temp(id, title.clone()));
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
@@ -35,6 +35,8 @@ fn set_title(ctx: &egui::Context, title: String) {
 }
 
 impl eframe::App for App {
+    /// Per-frame app logic: report audio-thread logs, run the shared app logic with the macOS menu driven around it,
+    /// then handle dropped paths, quit/close requests, window geometry, recent-list persistence and the window title.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // What the realtime audio thread logged is written here, off that thread.
         if let Some(logger) = self.1 {
@@ -52,7 +54,7 @@ impl eframe::App for App {
         // Files dropped on the window: audio on an instrument track or a Sampler window loads
         // the sampler; otherwise sessions open and audio/MIDI import.
         let dropped: Vec<String> =
-            self.0.take_dropped_files(ctx).iter().map(|f| f.path().to_string_lossy().into_owned()).filter(|s| !s.is_empty()).collect();
+            self.0.take_dropped_files().iter().map(|f| f.path().to_string_lossy().into_owned()).filter(|s| !s.is_empty()).collect();
         for p in dropped {
             open_path(&mut self.0, &p);
         }
@@ -86,8 +88,10 @@ impl eframe::App for App {
         };
         set_title(ctx, title);
     }
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
-        self.0.raw_input_hook(raw);
+    /// Forward raw input to the shared app hook so scripted gestures and host-key protection behave like the desktop
+    /// shell.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        self.0.raw_input_hook(ctx, raw);
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.0.guarded(|app| app.ui(ui));
@@ -206,6 +210,11 @@ fn app_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result {
+    // Windows: the update helper is a copy of this program started with `--finish-update`.
+    #[cfg(windows)]
+    if let Some(result) = craft_update::self_update::finish(&craft_update::suite::SOUNDCRAFT, &std::env::args_os().skip(1).collect::<Vec<_>>()) {
+        std::process::exit(i32::from(result.is_err()));
+    }
     // First, so every start-up record (and the engine's panic hook, installed with the first
     // Engine) is captured; see `logging`.
     let logger = logging::install();
@@ -265,6 +274,16 @@ fn main() -> eframe::Result {
     // Before eframe creates the wgpu instance: default Windows to DirectX 12 with FXC (see graphics.rs).
     #[cfg(target_os = "windows")]
     graphics::configure(&mut options, eframe::wgpu::Backends::from_env(), eframe::wgpu::Dx12Compiler::from_env());
+    #[cfg(all(unix, not(target_os = "macos")))]
+    // winit has no file drag-and-drop on Wayland (only on X11), so dropping files from the file
+    // manager showed a "no" cursor. Run through XWayland when it's there; SOUNDCRAFT_WAYLAND=1
+    // keeps the native Wayland backend.
+    if std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty()) && std::env::var_os("SOUNDCRAFT_WAYLAND").is_none() {
+        options.event_loop_builder = Some(Box::new(|b| {
+            use winit::platform::x11::EventLoopBuilderExtX11;
+            b.with_x11();
+        }));
+    }
     eframe::run_native(
         "SoundCraft",
         options,
@@ -272,6 +291,7 @@ fn main() -> eframe::Result {
             let player =
                 if no_audio { None } else { Some(soundcraft_playback::Player::with_config(Arc::new(engine.session().clone()), &prefs.audio)) };
             let mut app = SoundApp::new(engine, player, services());
+            app.set_startup_update_check(true);
             app.autosave_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Autosave")));
             app.leftovers = app.autosave_dir.as_deref().map(soundcraft_engine::autosave::leftovers).unwrap_or_default();
             app.preset_dir = prefs_path().and_then(|p| p.parent().map(|d| d.join("Presets")));
