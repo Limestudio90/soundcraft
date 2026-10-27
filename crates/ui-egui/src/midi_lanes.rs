@@ -249,7 +249,7 @@ pub fn ctrl_lane(app: &mut SoundApp, ui: &mut Ui, cx: &LaneCtx, li: usize, lane:
             painter.rect_filled(dot, 1.0, if s.index.is_some() { cx.color } else { cx.color.gamma_multiply(0.6) });
         }
     }
-    let resp = ui.interact(r, ui.id().with(("cc_lane", cx.cid.0, li)), Sense::click_and_drag());
+    let resp = ui.interact(r, ui.scope_id().with(("cc_lane", cx.cid.0, li)), Sense::click_and_drag());
     let mods = ui.input(|i| i.modifiers);
     let pointer = ui.ctx().pointer_latest_pos();
     let hit = |p: Pos2| {
@@ -518,9 +518,9 @@ pub fn lane_headers(app: &mut SoundApp, ui: &mut Ui, cx: &LaneCtx, lanes: &[Lane
     let present: HashSet<CtrlKind> = cx.seq.ctrls.iter().map(|c| c.kind).collect();
     let kinds: Vec<CtrlKind> = lanes.iter().map(|l| l.kind).collect();
     let header = |ui: &mut Ui, r: Rect, name: &str, full_name: &str, salt: (u64, usize)| -> Response {
-        let resp = ui.interact(r, ui.id().with(("lane_header", salt)), Sense::click());
+        let resp = ui.interact(r, ui.scope_id().with(("lane_header", salt)), Sense::click());
         let label = format!("{full_name} lane");
-        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &label));
         let fill = if resp.hovered() { t.panel_bg2.lerp_to_gamma(t.accent, 0.15) } else { t.panel_bg2 };
         ui.painter().rect_filled(r, 0.0, fill);
         let p = ui.painter().with_clip_rect(r);

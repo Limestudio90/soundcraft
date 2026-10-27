@@ -1,6 +1,6 @@
 # UI parity
 
-> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-24 · **Change:** minor (MIDI Editor controller lanes and the Pencil’s shapes; Scroll Into View in the track name menu; previously: drag across checkboxes, #399; waveforms preview fades during drag; a plugin opens when inserted, #486) · **Target:** Avid Pro Tools Ultimate 2026.4.1
+> **Last reviewed:** 2026-10-27 · **Last updated:** 2026-10-27 · **Change:** minor (MIDI Editor controller lanes and the Pencil’s shapes; Tracks and Groups and Clips in dock columns; previously: Scroll Into View in the track name menu; drag across checkboxes, #399; waveforms preview fades during drag; a plugin opens when inserted, #486) · **Target:** Avid Pro Tools Ultimate 2026.4.1
 
 How SoundCraft feels in the hands of a Pro Tools user: tools, modes, modifiers, shortcuts,
 windows, meters. Measured from `crates/model/src/session.rs` (tools, modes), the command
@@ -42,7 +42,7 @@ Legend: ✅ matches · 🟡 partial · ❌ missing.
 
 | Window | Status | Notes |
 |---|---|---|
-| Edit window: rulers, track headers, view columns, Clip List, Groups, Tracks list | ✅ | Track Pin (new in 2026.4) ✅ (`track.pin`) |
+| Edit window: rulers, track headers, view columns, Clip List, Groups, Tracks list | ✅ | Track Pin (new in 2026.4) ✅ (`track.pin`); Tracks and Groups and the Clip List sit in full-height dock columns at the window's sides |
 | Mix window: strips, views (inserts, sends, I/O, comments, EQ curve, preamps, instruments, object) | ✅ | Narrow Mix ✅; Mix and Edit on screen at once (Window › Mix in Separate Window, its own native window) ✅; Delay Compensation view and HEAT missing |
 | MIDI Editor, Score Editor, Event List | 🟡 | Dock height bug fixed (#113); controller lanes per track (CC, pitch bend, aftertouch, program change) edited with the Grabber, Trimmer and the Pencil's seven shapes; notation editing shallow |
 | Transport, Big Counter, Memory Locations, Automation, Video, Universe, Renderer, UI Customization | ✅ present | |
@@ -69,7 +69,8 @@ Legend: ✅ matches · 🟡 partial · ❌ missing.
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-21 | minor | MIDI Editor controller lanes (saved per track) and the Pencil's shapes (Free Hand, Line, Triangle, Square, Random, Parabolic, S-Curve) in controller and velocity lanes. Readiness estimate unchanged |
+| 2026-10-27 | minor | MIDI Editor controller lanes (saved per track) and the Pencil's shapes (Free Hand, Line, Triangle, Square, Random, Parabolic, S-Curve) in controller and velocity lanes. Readiness estimate unchanged |
+| 2026-10-25 | minor | Edit and Mix windows: Tracks and Groups and Clips in full-height dock columns. Readiness estimate unchanged |
 | 2026-10-16 | minor | Track name menu: Scroll Into View brings the track to the top of the Edit window and the left of the Mix. Readiness estimate unchanged |
 | 2026-10-13 | minor | A plugin opens when it's inserted (#486) |
 | 2026-10-13 | minor | Drag across checkboxes (#399) |
