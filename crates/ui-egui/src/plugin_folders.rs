@@ -217,7 +217,9 @@ pub fn window(app: &mut SoundApp, ctx: &egui::Context) {
         }
         if let Some(pick) = &app.services.pick_folder
             && ui.add_enabled(!busy, egui::Button::new("Add Folder…")).clicked()
-            && let Some(dir) = pick(mine.last().map_or("", String::as_str))
+            // The dialog hands back a path; the session keeps folders as text.
+            && let Some(dir) = pick(mine.last().map_or(Path::new(""), |d| Path::new(d)))
+            && let Some(dir) = dir.to_str().map(str::to_string)
             && !mine.contains(&dir)
         {
             mine.push(dir);

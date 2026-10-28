@@ -272,7 +272,7 @@ fn main() -> eframe::Result {
             app.extra.ui_scale = prefs.ui_scale;
             app.ui = prefs;
             // Runs without preferences (agents' tests) keep no scan cache and scan when a menu asks.
-            let settings = config_dir().filter(|_| prefs_enabled());
+            let settings = env.config_dir.as_ref().filter(|_| env.prefs_enabled()).cloned();
             soundcraft_ui_egui::plugin_folders::start(&app.ui.plugin_dirs, settings.as_deref(), std::env::current_exe().ok());
             if let Some(port) = control_port {
                 let rx = control_server::start(port, cc.egui_ctx.clone());
