@@ -33,18 +33,21 @@ fn lanes(h: &Harness<SoundApp>) -> Vec<CtrlKind> {
     h.state().engine.session().tracks[0].midi_lanes.clone()
 }
 
+// A menu button announces a trailing arrow glyph after its text, and which glyph it is depends on
+// the fonts the platform has: match the text and let the arrow follow whatever it is. A button also
+// exposes an inner label node, so the first match is taken.
 fn open(h: &mut Harness<SoundApp>, header: &str) {
-    h.get_by_label(header).click();
+    h.query_all_by_label_contains(header).next().expect("the menu opens").click();
     h.run_steps(3);
 }
 
 fn hover(h: &mut Harness<SoundApp>, item: &str) {
-    h.get_by_label(item).hover();
+    h.query_all_by_label_contains(item).next().expect("the item is in the menu").hover();
     h.run_steps(3);
 }
 
 fn pick(h: &mut Harness<SoundApp>, item: &str) {
-    h.get_by_label(item).click();
+    h.query_all_by_label_contains(item).next().expect("the item is in the menu").click();
     h.run_steps(3);
 }
 
@@ -52,7 +55,7 @@ fn pick(h: &mut Harness<SoundApp>, item: &str) {
 fn the_velocity_header_adds_a_lane() {
     let mut h = harness(&[]);
     open(&mut h, "Velocity lane");
-    hover(&mut h, "Add Controller Lane ⏵");
+    hover(&mut h, "Add Controller Lane");
     pick(&mut h, "Mod Wheel (CC 1)");
     assert_eq!(lanes(&h), vec![CtrlKind::Cc(1)]);
     assert!(h.query_by_label("Mod Wheel (CC 1) lane").is_some(), "the new lane has a header");
@@ -83,8 +86,8 @@ fn a_lane_header_changes_its_controller() {
 fn a_lane_header_reaches_every_cc_number() {
     let mut h = harness(&["cc1"]);
     open(&mut h, "Mod Wheel (CC 1) lane");
-    hover(&mut h, "Other Controllers ⏵");
-    hover(&mut h, "CC 0–31 ⏵");
+    hover(&mut h, "Other Controllers");
+    hover(&mut h, "CC 0–31");
     pick(&mut h, "CC 3");
     assert_eq!(lanes(&h), vec![CtrlKind::Cc(3)]);
 }
