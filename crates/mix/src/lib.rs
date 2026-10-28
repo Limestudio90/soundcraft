@@ -72,7 +72,7 @@ mod routing;
 mod strip;
 mod threads;
 
-use automation::{lerp_gain, pan_at, pan_segment, send_level, transport_at, volume_db_at};
+use automation::{GainRamp, pan_at, pan_segment, send_level, transport_at, volume_db_at};
 pub use instances::{INSTRUMENT_SLOT, InstanceSpec, NewInstance, PluginFailures, PreparedInstance, create_instance, instance_specs, is_third_party};
 pub use meter::StripMeter;
 use midi::sync_sample;
@@ -506,10 +506,11 @@ impl MixEngine {
                 let last = pos.saturating_add(frames.saturating_sub(1) as i64);
                 let v0 = volume_db_at(t, pos);
                 let v1 = volume_db_at(t, last);
+                let ramp = GainRamp::new(v0, v1, frames.saturating_sub(1));
                 for (ch, src) in strip.buf.iter().enumerate().take(self.main.len()) {
                     if let Some(m) = self.main.get_mut(ch) {
                         for i in 0..frames {
-                            let g = lerp_gain(v0, v1, i, frames.saturating_sub(1));
+                            let g = ramp.at(i);
                             if let (Some(d), Some(x)) = (m.get_mut(i), src.get(i)) {
                                 *d = x * g;
                             }
