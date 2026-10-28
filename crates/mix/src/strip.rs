@@ -1,4 +1,4 @@
-use super::automation::{lerp_gain, transport_at, volume_db_at};
+use super::automation::{GainRamp, transport_at, volume_db_at};
 use super::clips::{ClipFx, clip_fx_params, render_clip};
 use super::instances::{INSTRUMENT_SLOT, PluginFailures, PreparedInstance, create_instance, is_third_party};
 use super::midi::{chase_controllers, schedule_notes};
@@ -380,11 +380,10 @@ pub(crate) fn process_strip(
         }
     }
     let (g0, g1) = if strip.muted { (-144.0, -144.0) } else { (v0.min(12.0), v1.min(12.0)) };
+    let ramp = GainRamp::new(g0, g1, frames.saturating_sub(1));
     for c in strip.buf.iter_mut() {
-        for i in 0..frames {
-            if let Some(x) = c.get_mut(i) {
-                *x *= lerp_gain(g0, g1, i, frames.saturating_sub(1));
-            }
+        for (i, x) in c.iter_mut().enumerate().take(frames) {
+            *x *= ramp.at(i);
         }
     }
     // Track mute gates the audio and its pre-fader tap without splitting processor blocks.
