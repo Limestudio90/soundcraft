@@ -251,6 +251,33 @@ pub(crate) fn apply_matrix_span(src: &[Vec<f32>], span: std::ops::Range<usize>, 
         if taps.is_empty() {
             continue;
         }
+        let end = span.end.min(out.len());
+        let Some(dst) = out.get_mut(span.start..end) else { continue };
+        let lane = |s: usize| src.get(s).and_then(|c| c.get(span.start..end));
+        match *taps {
+            [(s0, g0)] => {
+                if let Some(x0) = lane(s0) {
+                    for (o, a) in dst.iter_mut().zip(x0) {
+                        let mut acc = 0.0f32;
+                        acc += a * gain * g0;
+                        *o += acc;
+                    }
+                    continue;
+                }
+            }
+            [(s0, g0), (s1, g1)] => {
+                if let (Some(x0), Some(x1)) = (lane(s0), lane(s1)) {
+                    for ((o, a), b) in dst.iter_mut().zip(x0).zip(x1) {
+                        let mut acc = 0.0f32;
+                        acc += a * gain * g0;
+                        acc += b * gain * g1;
+                        *o += acc;
+                    }
+                    continue;
+                }
+            }
+            _ => {}
+        }
         for (i, o) in out.iter_mut().enumerate().take(span.end).skip(span.start) {
             let mut acc = 0.0f32;
             for &(s, g) in taps {
