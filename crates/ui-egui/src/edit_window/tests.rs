@@ -6,7 +6,7 @@ use egui_kittest::{Harness, kittest::Queryable};
 /// they edit, not the short value text ("Read", "Waveform") painted inside them.
 #[test]
 fn track_header_selectors_have_accessible_names() {
-    let mut h = Harness::builder().with_context_setup(crate::fonts::install).build_ui(|ui| {
+    let mut h = Harness::builder().with_context_setup(|ctx| crate::fonts::install(ctx, true)).build_ui(|ui| {
         let view = Rect::from_min_size(Pos2::ZERO, vec2(60.0, 17.0));
         super::header_selector(ui, view, egui::Id::unique("test-view"), "Waveform", Color32::WHITE, true, "Track view");
         let mode = Rect::from_min_size(pos2(0.0, 20.0), vec2(60.0, 17.0));

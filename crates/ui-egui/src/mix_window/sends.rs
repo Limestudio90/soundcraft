@@ -426,7 +426,7 @@ mod tests {
         let mut h = Harness::builder().with_size(vec2(600.0, 800.0)).build_ui_state(
             move |ui, (app, kick): &mut (SoundApp, TrackId)| {
                 if !ready {
-                    crate::fonts::install(ui.ctx());
+                    crate::fonts::install(ui.ctx(), true);
                     crate::theme::apply(ui.ctx(), false);
                     ready = true;
                     return;

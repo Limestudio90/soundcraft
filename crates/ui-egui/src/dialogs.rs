@@ -4,6 +4,7 @@ use crate::SoundApp;
 use crate::theme::{Tokens, bold};
 use egui::{Align2, vec2};
 use serde_json::{Value, json};
+use soundcraft_audio_io::FileFormat;
 use soundcraft_engine::Engine;
 use soundcraft_engine::io::StripNames;
 use soundcraft_model::{ClipId, GroupId, Session, SourceId, TrackId};
@@ -17,8 +18,8 @@ mod strip_silence;
 #[cfg(test)]
 use audiosuite::SPEED_RAMP_CHOICES;
 use audiosuite::audiosuite_window;
+pub use files::{NotUnicode, ask_to_save, open_path, open_session_bytes, run_or_ask, takes_path, unicode};
 use files::{OPEN_PENDING, default_dir, open_pending_session, path_dialog};
-pub use files::{ask_to_save, open_session_bytes, run_or_ask, takes_path};
 use strip_silence::{AUTO_NAME_LABELS, STRIP_NAME_LABELS, StripRectangles, auto_rename_action, strip_name_fields, strip_silence_action};
 pub use strip_silence::{StripRects, strip_silence_rectangles};
 
@@ -31,7 +32,7 @@ pub mod spot;
 pub enum Dialog {
     NewTracks { count: u32, format: String, kind: String, timebase: String, name: String },
     NewSession { name: String, sample_rate: u32, demo: bool },
-    Bounce { path: String, format: String, bit_depth: String, normalize: bool, dither: bool },
+    Bounce { path: String, format: FileFormat, bit_depth: String, normalize: bool, dither: bool },
     RenameTrack { id: TrackId, name: String },
     RenameClip { id: ClipId, name: String },
     RenameMarker { id: soundcraft_model::MarkerId, name: String },
@@ -178,7 +179,7 @@ impl Dialogs {
                     .map_or(home.clone(), |d| d.display().to_string());
                 Dialog::Bounce {
                     path: format!("{dir}/{name} Bounce.wav"),
-                    format: "wav".into(),
+                    format: FileFormat::Wav,
                     bit_depth: "24".into(),
                     normalize: false,
                     dither: false,
@@ -391,21 +392,23 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(path).desired_width(420.0)), "File");
                         if let Some(pick) = &app.services.pick_save
                             && ui.button("Browse…").clicked()
-                            && let Some(p) = pick("file.bounce_mix", path)
+                            && let Some(p) = pick("file.bounce_mix", std::path::Path::new(path.as_str()))
                         {
-                            *path = p;
-                            match std::path::Path::new(path.as_str()).extension().map(|x| x.to_string_lossy().to_lowercase()).as_deref() {
-                                Some("wav") => *format = "wav".into(),
-                                Some("aif" | "aiff") => *format = "aiff".into(),
-                                Some("flac") => *format = "flac".into(),
-                                _ => {}
+                            match unicode(&p) {
+                                Ok(text) => {
+                                    *path = text.to_owned();
+                                    if let Some(picked) = p.extension().and_then(std::ffi::OsStr::to_str).and_then(FileFormat::from_write_extension) {
+                                        *format = picked;
+                                    }
+                                }
+                                Err(e) => app.ui.status = e.to_string(),
                             }
                         }
                     });
                     ui.horizontal(|ui| {
-                        craft_ui::ComboBox::from_label("Format").selected_text(format.to_uppercase()).show_ui(ui, |ui| {
-                            for f in ["wav", "aiff", "flac"] {
-                                ui.selectable_value(format, f.to_string(), f.to_uppercase());
+                        craft_ui::ComboBox::from_label("Format").selected_text(format.name()).show_ui(ui, |ui| {
+                            for &f in FileFormat::WRITE {
+                                ui.selectable_value(format, f, f.name());
                             }
                         });
                         craft_ui::ComboBox::from_label("Bit Depth").selected_text(format!("{bit_depth}-bit")).show_ui(ui, |ui| {
@@ -426,10 +429,10 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                             .color(Tokens::current().text_dim),
                     );
                     if buttons(ui, "Bounce", enter) {
-                        let p = std::path::Path::new(path.as_str()).with_extension(if format == "aiff" { "aif" } else { format.as_str() });
+                        let p = std::path::Path::new(path.as_str()).with_extension(format.default_extension());
                         crate::bounce::start(
                             app,
-                            &json!({"path": p.to_string_lossy(), "format": format, "bit_depth": bit_depth, "normalize": normalize, "dither": *dither && bit_depth.as_str() != "32f"}),
+                            &json!({"path": p.to_string_lossy(), "format": format.default_extension(), "bit_depth": bit_depth, "normalize": normalize, "dither": *dither && bit_depth.as_str() != "32f"}),
                         );
                         keep = false;
                     }
@@ -461,6 +464,7 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                 }
                 Dialog::PathPrompt { cmd, path, key, .. } => {
                     crate::widgets::named_text_field(ui.add(egui::TextEdit::singleline(path).desired_width(420.0)), "Path");
+                    let mut picked = None;
                     if let Some(pick) = &app.services.pick_open
                         && cmd != "session.save_as"
                         && cmd != "session.save_copy"
@@ -468,21 +472,26 @@ pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
                         && ui.button("Browse…").clicked()
                         && let Some(p) = pick(cmd, &[])
                     {
-                        *path = p;
+                        picked = Some(p);
                     }
                     if let Some(pick) = &app.services.pick_folder
                         && key == "dir"
                         && ui.button("Browse…").clicked()
-                        && let Some(p) = pick(path)
+                        && let Some(p) = pick(std::path::Path::new(path.as_str()))
                     {
-                        *path = p;
+                        picked = Some(p);
                     }
                     if let Some(pick) = &app.services.pick_save
                         && (cmd == "session.save_as" || cmd == "session.save_copy")
                         && ui.button("Browse…").clicked()
-                        && let Some(p) = pick(cmd, path)
+                        && let Some(p) = pick(cmd, std::path::Path::new(path.as_str()))
                     {
-                        *path = p;
+                        picked = Some(p);
+                    }
+                    match picked.as_deref().map(unicode) {
+                        Some(Ok(text)) => *path = text.to_owned(),
+                        Some(Err(e)) => app.ui.status = e.to_string(),
+                        None => {}
                     }
                     let file = soundcraft_engine::io::session_file(path);
                     let replaces = soundcraft_engine::io::replaces(&app.engine, cmd, &file);
@@ -859,6 +868,21 @@ fn loop_length(s: &Session, text: &str, format: soundcraft_time::TimeFormat, sta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name that is not valid Unicode is not opened under a lossy rendering (another file): the
+    /// status line names its bytes.
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_paths_are_reported_not_mangled() {
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(unicode(std::path::Path::new("/a/café.wav")), Ok("/a/café.wav"));
+        let latin1 = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/a/caf\xe9.scraft"));
+        assert_eq!(unicode(latin1), Err(NotUnicode(latin1.to_path_buf())));
+        let mut app = SoundApp::new(Engine::default(), None, crate::Services::default());
+        open_path(&mut app, latin1);
+        assert_eq!(app.ui.status, r#""/a/caf\xE9.scraft" is not valid Unicode"#);
+        assert!(app.engine.path.is_none() && app.dialogs.open.is_none());
+    }
 
     #[test]
     fn file_commands_get_path_prompts_with_sensible_names() {
