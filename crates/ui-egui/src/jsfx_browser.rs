@@ -39,7 +39,7 @@ pub struct JsfxBrowser {
 
 /// Asks the browser to open (used by menus that have no access to the app state).
 pub fn request_open(ctx: &egui::Context) {
-    ctx.data_mut(|d| d.insert_temp(egui::Id::new(OPEN_FLAG), true));
+    ctx.data_mut(|d| d.insert_temp(egui::Id::unique(OPEN_FLAG), true));
 }
 
 impl JsfxBrowser {
@@ -96,7 +96,7 @@ impl JsfxBrowser {
 }
 
 pub fn show(app: &mut SoundApp, ctx: &egui::Context) {
-    if ctx.data_mut(|d| d.remove_temp::<bool>(egui::Id::new(OPEN_FLAG))).unwrap_or(false) {
+    if ctx.data_mut(|d| d.remove_temp::<bool>(egui::Id::unique(OPEN_FLAG))).unwrap_or(false) {
         app.jsfx_browser.open = true;
     }
     let b = &mut app.jsfx_browser;
