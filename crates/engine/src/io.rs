@@ -424,11 +424,7 @@ pub fn bounce_stems_with(e: &Engine, dir: &str, r: Range, opts: &EncodeOptions, 
         return Err(EngineError::BadParams("file.bounce_stems".into(), "bounces are limited to 4 hours".into()));
     }
     make_dir(dir)?;
-    let ext = match opts.format {
-        FileFormat::Aiff => "aif",
-        FileFormat::Flac => "flac",
-        _ => "wav",
-    };
+    let ext = opts.format.default_extension();
     let mut out = Vec::new();
     let stems: Vec<(TrackId, String)> = s
         .tracks
