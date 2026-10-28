@@ -535,8 +535,16 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
             }
         });
         if soundcraft_playback::devices::ASIO_CONTROL_PANEL && app.ui.audio.system.as_deref() == Some(soundcraft_playback::devices::ASIO_SYSTEM) {
-            let hint = "The driver's own settings: devices (ASIO4ALL), buffer size, clock. Then use Reconnect audio device below to pick them up.";
-            if ui.button("ASIO Control Panel…").on_hover_text(hint).clicked() {
+            // A change made in the driver's panel can invalidate the running input stream, which ends
+            // the recording early: the same rule as Apply, which refuses to reopen devices while
+            // recording.
+            let recording = app.engine.transport.recording;
+            let hint = if recording {
+                "Finish the recording first: a change in the driver's panel can end the take."
+            } else {
+                "The driver's own settings: devices (ASIO4ALL), buffer size, clock. Then use Reconnect audio device below to pick them up."
+            };
+            if ui.add_enabled(!recording, egui::Button::new("ASIO Control Panel…")).on_hover_text(hint).clicked() {
                 panel = true;
             }
         }
@@ -605,6 +613,11 @@ pub fn playback_engine(app: &mut SoundApp, ctx: &egui::Context) {
 pub fn audio_device_command(app: &mut SoundApp, p: &serde_json::Value) -> Result<serde_json::Value, String> {
     use serde_json::Value;
     if p.get("control_panel").and_then(Value::as_bool).unwrap_or(false) {
+        // The control channel bypasses the button, so the rule lives here too: a driver change can
+        // end a recording that is in progress.
+        if app.engine.transport.recording {
+            return Err("the ASIO control panel stays shut while recording".into());
+        }
         soundcraft_playback::devices::asio_control_panel()?;
     }
     let mut changed = p.get("reopen").and_then(Value::as_bool).unwrap_or(false);
