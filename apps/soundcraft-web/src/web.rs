@@ -227,6 +227,11 @@ impl WebShell {
                 }
                 if !done.is_empty() {
                     e.push_undo("Import MIDI", before);
+                } else if !failed.is_empty() {
+                    // A file can fail after it has added tempos or a track (an SMF whose length is
+                    // past the limit `import_midi_bytes` accepts). With nothing imported there is no
+                    // undo step to take that back, so the document goes back to what it was.
+                    *e.session_mut() = (*before).clone();
                 }
                 imported("Imported", done, failed)
             }

@@ -224,7 +224,13 @@ pub fn drop_target(app: &SoundApp, pos: Option<egui::Pos2>) -> Option<DropTarget
 /// Outlines the drop target and says what a drop would do, while files are dragged over the
 /// window.
 pub fn paint_drop_hint(app: &SoundApp, ctx: &egui::Context) {
-    let (hovered, pos) = ctx.input(|i| (i.raw.hovered_files.len(), i.pointer.latest_pos()));
+    // Only what the drop would import: a MIDI file or a session dragged over the window goes to the
+    // shell, so the hint must not promise an import. Files with no path come from the browser, which
+    // reads them itself.
+    let (hovered, pos) = ctx.input(|i| {
+        let count = i.raw.hovered_files.iter().filter(|f| f.path.as_ref().is_none_or(|p| is_importable_audio(&p.to_string_lossy()))).count();
+        (count, i.pointer.latest_pos())
+    });
     if hovered == 0 {
         return;
     }
