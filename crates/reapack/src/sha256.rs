@@ -1,9 +1,4 @@
 //! SHA-256 (FIPS 180-4), used to check the `hash` of downloaded files.
-//
-// Clippy flags `chunks_exact(64)` etc. because the chunk size is a constant; the standard
-// library itself uses the same pattern in `digest::generic_array`. This is fine — the code is
-// a portable SHA-256 and the sizes are fixed by the algorithm.
-#![allow(clippy::constant_chunks)]
 
 const K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
@@ -25,10 +20,10 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
         msg.push(0);
     }
     msg.extend_from_slice(&((data.len() as u64).wrapping_mul(8)).to_be_bytes());
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (slot, b) in w.iter_mut().zip(chunk.chunks_exact(4)) {
-            *slot = <[u8; 4]>::try_from(b).map_or(0, u32::from_be_bytes);
+        for (slot, b) in w.iter_mut().zip(chunk.as_chunks::<4>().0) {
+            *slot = u32::from_be_bytes(*b);
         }
         for i in 16..64 {
             let (w15, w2) = (w[i - 15], w[i - 2]);
@@ -58,7 +53,7 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
         }
     }
     let mut out = [0u8; 32];
-    for (o, x) in out.chunks_exact_mut(4).zip(h) {
+    for (o, x) in out.as_chunks_mut::<4>().0.iter_mut().zip(h) {
         o.copy_from_slice(&x.to_be_bytes());
     }
     out
