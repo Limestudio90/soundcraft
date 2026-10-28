@@ -16,6 +16,12 @@ pub(crate) use playback::automation_step_due;
 pub(crate) use plugins::{editor_changes, editor_states_due, failed_plugin_status};
 
 impl SoundApp {
+    /// Whether fonts installed from the system are used besides the bundled ones (on by default).
+    /// Takes effect only before the first frame installs the fonts.
+    pub fn set_system_fonts(&mut self, on: bool) {
+        self.system_fonts = on;
+    }
+
     /// Build an app around an engine and optional player, initialising UI, recording, autosave, control and
     /// synthetic-input state.
     pub fn new(engine: Engine, player: Option<Player>, services: Services) -> Self {
@@ -87,6 +93,7 @@ impl SoundApp {
             last_rev: 0,
             fonts_ready: false,
             fonts_installed: false,
+            system_fonts: true,
             theme_applied: None,
             docking_context: None,
             sim: None,
@@ -130,7 +137,7 @@ impl SoundApp {
             if self.fonts_installed {
                 self.fonts_ready = true;
             } else {
-                fonts::install(ctx);
+                fonts::install(ctx, self.system_fonts);
                 self.fonts_installed = true;
                 ctx.request_repaint();
             }
